@@ -168,7 +168,6 @@ jobs:
             exit 1
           fi
 
-      # The manifest URLs must point at your real host, because brainmaker
       # The manifest holds a version and one checksum per platform, and no URL,
       # so printing it here discloses nothing.
       - name: Write the manifest

@@ -1,6 +1,6 @@
 # API
 
-`brainmaker` exposes a command-line surface, and it consumes four HTTP routes. Both are described
+`brainmaker` exposes a command-line surface, and it consumes five HTTP routes. Both are described
 here. The crate is a binary, not a library, so it exports nothing to other Rust code.
 
 ## Command-line surface
@@ -195,6 +195,14 @@ The manifest carries no URL. The client derives the download address from its ow
 `BRAINMAKER_SOFTWARE_BINARY_PATH`, so a published manifest names no host, and a manifest cannot move
 a download to another host.
 
+Because the signature covers the bytes rather than a re-serialization, any proxy that reformats this
+JSON body breaks every client. Serve it as a static file. The client reads the body up to 1 MiB.
+Serve this route with `Cache-Control: no-store`.
+
+Platform keys use `darwin` for macOS and `arm64` for `aarch64`. Run `brainmaker status` to read the
+key a given machine asks for. A machine whose key is absent from the manifest gets an error naming
+the keys that are present.
+
 ### `GET {base}/{software binary route}`
 
 Returns one replacement binary. The client asks for the route with `{version}`, `{platform}`, and
@@ -203,16 +211,6 @@ asks for `software/brainmaker-0.2.0-darwin-arm64`, which is the name the release
 
 The client reads the body up to 128 MiB, checks its SHA-256 against the signed manifest, and runs it
 with `--version` before it swaps.
-
-Because the signature covers the bytes rather than a re-serialization, any proxy that reformats
-this JSON body breaks every client. Serve it as a static file.
-
-The client reads the body up to 1 MiB, and the binary it names up to 128 MiB. Serve this route with
-`Cache-Control: no-store`.
-
-Platform keys use `darwin` for macOS and `arm64` for `aarch64`. Run `brainmaker status` to read the
-key a given machine asks for. A machine whose key is absent from the manifest gets an error naming
-the keys that are present.
 
 ### Error responses
 
@@ -296,7 +294,7 @@ Pass `-` in place of the key file to read the key from `$BRAINMAKER_SIGNING_KEY`
 The release workflow uses that form, so the private key never reaches the runner's disk.
 
 `sign` refuses a manifest that `brainmaker` could not use: one that is not JSON, one whose
-`version` is empty or longer than 64 characters, one with no platform, one whose `url` does not use
-`https://`, or one whose `sha256` is not 64 hexadecimal characters.
+`version` is empty or longer than 64 characters, one with no platform, or one whose `sha256` is not
+64 hexadecimal characters.
 
 Both commands exit 0 on success and 1 on failure.

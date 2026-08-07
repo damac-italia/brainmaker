@@ -251,15 +251,9 @@ fn check_manifest(text: &str) -> Result<()> {
         bail!("the manifest names no platform");
     }
 
+    // A build carries a checksum and nothing else. The client derives the
+    // download address from its own base URL, so a manifest names no URL.
     for (key, build) in platforms {
-        let url = build
-            .get("url")
-            .and_then(serde_json::Value::as_str)
-            .with_context(|| format!("the platform {key} has no \"url\" string"))?;
-        if !url.starts_with("https://") {
-            bail!("the platform {key} names {url:?}, which does not use https://");
-        }
-
         let sum = build
             .get("sha256")
             .and_then(serde_json::Value::as_str)

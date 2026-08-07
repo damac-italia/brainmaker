@@ -173,7 +173,7 @@ for an access token at `POST {jwt_endpoint}/oauth2/token`, and the server expire
 it by hand.
 
 The token lives in `TokenCache`, which one `Config` owns, so one run fetches one token and reuses it
-for up to four requests. The cache never reaches the disk, so nothing on disk holds a usable bearer
+for up to three requests. The cache never reaches the disk, so nothing on disk holds a usable bearer
 token between runs. The client stops using a token 30 seconds before it expires, so a request that
 starts near the boundary does not arrive with an expired token.
 

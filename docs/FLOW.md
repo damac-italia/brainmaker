@@ -36,7 +36,7 @@ sequenceDiagram
 Steps:
 
 1. [`config.rs:264`](../src/config.rs) resolves the root: `--dir`, else `~/.brainmaker`.
-2. [`provision.rs:251`](../src/provision.rs) searches four locations in order and returns the first
+2. [`provision.rs:314`](../src/provision.rs) searches four locations in order and returns the first
    hit. A `--config` or `$BRAINMAKER_CONFIG` path that is not a file fails the run.
 3. On a hit, [`config.rs:277`](../src/config.rs) seals the parsed settings and writes
    `confidential/config.enc` with mode `0600` inside a `0700` directory.
@@ -98,7 +98,7 @@ Steps:
    and reads the response body up to 64 KiB.
 4. [`auth.rs:190`](../src/auth.rs) refuses a token that is empty, longer than 8192 bytes, or holds a
    character we cannot send in a header.
-5. [`auth.rs:139`](../src/auth.rs) caches the token for `expires_in` less 30 seconds. The cache
+5. [`auth.rs:138`](../src/auth.rs) caches the token for `expires_in` less 30 seconds. The cache
    never reaches the disk.
 
 A failed token request fails the command that asked for it. During `sync`, that happens before any
@@ -226,7 +226,7 @@ Steps:
 13. [`selfupdate.rs:239`](../src/selfupdate.rs) renames the running binary to `.brainmaker-old`,
     then renames the staged file into place. A failure on the second rename restores the old
     binary. A running process keeps its open image, so the swap is safe while `brainmaker` runs.
-14. [`selfupdate.rs:223`](../src/selfupdate.rs) removes the staged file on failure, and removes the
+14. [`selfupdate.rs:226`](../src/selfupdate.rs) removes the staged file on failure, and removes the
     backup either way.
 
 `--check` stops after step 6 and installs nothing.

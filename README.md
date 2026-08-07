@@ -53,7 +53,7 @@ gone. Later runs read the sealed copy and need no file.
 | No compiled endpoint | A unit test fails the build if a URL with a host enters `src/config.rs` |
 | TLS-only base URL | Refuses a plain-HTTP base URL, except one whose host is this machine |
 | Signed updates | Refuses a software manifest without an Ed25519 signature from a compiled-in key |
-| Self-update | Verifies origin, SHA-256, and `--version` output before it swaps the binary |
+| Self-update | Verifies the SHA-256 and the `--version` output before it swaps the binary |
 | Static Linux builds | `x86_64` and `arm64` link against musl, so there is no glibc version floor |
 
 ## Usage
@@ -238,7 +238,7 @@ that file still holds the client secret.
 
 - [Architecture](docs/ARCHITECTURE.md) — modules, boundaries, data model, decisions
 - [Flow](docs/FLOW.md) — the sync, provisioning, and self-update paths
-- [API](docs/API.md) — the CLI surface and the four HTTP routes the server must serve
+- [API](docs/API.md) — the CLI surface and the five HTTP routes the server must serve
 - [Security](docs/SECURITY.md) — trust model, secret handling, input validation
 
 ## Build and release
@@ -363,7 +363,7 @@ against glibc, so it will not run on an older distribution.
 <summary>Directory layout</summary>
 
 ```text
-src/                     the crate, one module per concern (13 files)
+src/                     the crate, one module per concern (14 files)
 tools/                   sign.rs, the signing tool; builds only under the sign feature
 scripts/                 make-manifest.sh, which writes the software manifest
 .github/workflows/       release.yml, the five-platform build
@@ -382,7 +382,7 @@ cargo clippy --all-targets --features sign
 cargo fmt --check
 ```
 
-The test suite is 87 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
+The test suite is 106 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
 `--features sign` to clippy so that the signing tool is linted too; a plain `cargo build` skips it.
 
 A local `cargo build` uses the development key, so a locally built binary cannot open a store

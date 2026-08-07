@@ -2,10 +2,11 @@
 
 //! The URL parsing that brainmaker needs, and the base-URL policy.
 //!
-//! Two decisions need the scheme, the host, and the port of a URL: whether a
-//! manifest build URL stays on the API host, and whether a plain-HTTP base URL
-//! points at this machine. Both read one parser here, so that neither decision
-//! rests on a string prefix.
+//! One decision needs the scheme, the host, and the port of a URL: whether a
+//! plain-HTTP base URL points at this machine. It reads one parser here, so
+//! that the decision rests on a parsed origin rather than on a string prefix.
+//! Both base URLs, `BRAINMAKER_API_BASE` and `SWETSI_JWT_ENDPOINT`, take the
+//! same rule.
 
 use anyhow::{Result, bail};
 

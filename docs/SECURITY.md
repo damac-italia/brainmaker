@@ -177,23 +177,21 @@ continues with the entries that pass.
 
 ### Self-update
 
-`self-update` replaces the running executable, so it applies six controls in this order:
+`self-update` replaces the running executable, so it applies five controls in this order:
 
 1. The manifest must carry an Ed25519 signature from a key in `PUBLIC_KEYS`. The check runs over
    the served bytes, before any parse, so an untrusted manifest never reaches the version logic or
    the platform lookup. A build whose key list is empty refuses every manifest.
-2. The `url` in the manifest must carry the same scheme, host, and port as the base URL. Comparison
-   is case-insensitive, discards any userinfo, and fills in the scheme's default port, so
-   `https://api.example.test@evil.example/` is refused and `https://api.example.test:443/` is
-   accepted against `https://api.example.test/`. This also blocks a downgrade from `https` to
-   `http`.
-3. The install directory must be writable, checked with a probe file before any download.
-4. The download must match the `sha256` in the manifest, which must itself be 64 hexadecimal
+2. The install directory must be writable, checked with a probe file before any download.
+3. The download must match the `sha256` in the manifest, which must itself be 64 hexadecimal
    characters.
-5. The staged binary must run and must report the manifest's version. This catches a build for the
+4. The staged binary must run and must report the manifest's version. This catches a build for the
    wrong architecture and a manifest that points at the wrong file.
-6. Only then does the swap run, through two renames. A failure on the second rename restores the
+5. Only then does the swap run, through two renames. A failure on the second rename restores the
    previous binary.
+
+The download address is not a control that can fail: `Config::binary_url` derives it from the base
+URL in the provisioning file, so a manifest cannot name another host at all.
 
 ### Size caps
 
@@ -215,7 +213,7 @@ truncated. The caps are constants in [`src/config.rs`](../src/config.rs).
 |---|---|---|
 | `anyhow` | 1.0.104 | Error context |
 | `dirs` | 6.0.0 | Home directory lookup |
-| `ring` | 0.17 | AES-256-GCM and HKDF-SHA256 |
+| `ring` | 0.17 | AES-256-GCM, HKDF-SHA256, and Ed25519 verification |
 | `serde`, `serde_json` | 1.0.229, 1.0.151 | Manifest and state parsing |
 | `sha2` | 0.11.0 | Download checksum |
 | `ureq` | 3.3.0 | HTTP client |
