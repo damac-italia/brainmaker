@@ -1,6 +1,6 @@
 # API
 
-`brainmaker` exposes a command-line surface, and it consumes three HTTP routes. Both are described
+`brainmaker` exposes a command-line surface, and it consumes four HTTP routes. Both are described
 here. The crate is a binary, not a library, so it exports nothing to other Rust code.
 
 ## Command-line surface
@@ -58,7 +58,8 @@ already in place. `--quiet` suppresses that notice.
 | `store` | Path of `config.enc` |
 | `settings` | `imported from <path>`, `read from the sealed store`, or `read from the environment` |
 | `api base` | The base URL in use |
-| `token` | `absent`, or `present, N characters`. Never the token itself. |
+| `token url` | The token endpoint in use, or `<none>` |
+| `auth` | `absent`, or `client-credentials grant, scope sync, client id N characters, secret N characters`. Never a credential itself. |
 | `key` | `release` or `development`, naming which build key this binary carries |
 | `signing` | How many manifest signing keys this binary trusts. `0` means it installs no update. |
 | `installed` | The hash in `state.json`, or `<none>` |
@@ -72,14 +73,62 @@ already in place. `--quiet` suppresses that notice.
 
 ## HTTP routes the server must serve
 
-All three sit under one base URL, which comes from `SWETSI_API_BASE`. Serve them over TLS:
-`brainmaker` refuses a plain-HTTP base URL unless its host is this machine. `brainmaker` sends
-`Authorization: Bearer <token>` on every request when a token is configured, and sends the
-`User-Agent` `brainmaker/<version>`.
+Four routes sit under `BRAINMAKER_API_BASE`. One further route, the token endpoint, sits under
+`SWETSI_JWT_ENDPOINT`. The two hosts may differ. Serve them all over TLS: `brainmaker` refuses a
+plain-HTTP URL unless its host is this machine. `brainmaker` sends `Authorization: Bearer <token>`
+on every request under the base URL when a credential is configured, and sends the `User-Agent`
+`brainmaker/<version>`.
+
+Every route name below is the default. Each one has a key in the provisioning file, so a deployment
+can serve these five requests at any path it likes:
+
+| Route | Key | Default |
+|---|---|---|
+| Token | `SWETSI_TOKEN_PATH` | `oauth2/token` |
+| Latest hash | `BRAINMAKER_CONTENT_LATEST_PATH` | `content/latest` |
+| Content archive | `BRAINMAKER_CONTENT_ARCHIVE_PATH` | `content/{hash}.zip` |
+| Software manifest | `BRAINMAKER_SOFTWARE_MANIFEST_PATH` | `software/brainmaker` |
+| Replacement binary | `BRAINMAKER_SOFTWARE_BINARY_PATH` | `software/brainmaker-{version}-{platform}{ext}` |
+
+`brainmaker` substitutes `{hash}`, `{version}`, `{platform}`, and `{ext}`. `{ext}` is `.exe` on
+Windows and empty everywhere else. A route is a path under its base URL: a value holding `://`, a
+`..` segment, or a space fails at load, and a leading `/` is stripped.
 
 Timeouts: 10 s to connect; 20 s total for a text request; 300 s total for a download.
 
-### `GET {base}/content/latest`
+### `POST {jwt_endpoint}/{token route}`
+
+Returns an access token for the client-credentials grant.
+
+```text
+Authorization: Basic base64(client_id:client_secret)
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&scope=sync
+```
+
+`brainmaker` names the scope in every request rather than relying on a server default.
+
+```json
+{ "access_token": "…", "token_type": "Bearer", "expires_in": 600, "scope": "sync" }
+```
+
+| Field | Rule |
+|---|---|
+| `access_token` | Required. 1 to 8192 bytes of printable ASCII. A control character fails the run, because the value goes into a header. |
+| `token_type` | Optional. `Bearer` in any case. Any other value fails the run. |
+| `expires_in` | Optional, in seconds. It defaults to 600. The client stops using the token 30 seconds before it expires. |
+
+The response body is read up to 64 KiB. One run gets one token and reuses it, so a server that
+issues a 10-minute token serves one token request per run.
+
+| Status | Message the client prints |
+|---|---|
+| 400, 401 | `the token endpoint rejected the client credentials with HTTP <code>; check SWETSI_CLIENT_ID and SWETSI_CLIENT_SECRET, and check that the client may ask for the scope sync` |
+| 404 | `the token endpoint returned HTTP 404 Not Found; check SWETSI_JWT_ENDPOINT and SWETSI_TOKEN_PATH` |
+| other | `the token endpoint returned HTTP <code>` |
+
+### `GET {base}/{latest hash route}`
 
 Returns the hash of the current content.
 
@@ -94,9 +143,9 @@ Returns the hash of the current content.
 The response body is read up to 1 MiB. Serve this route with `Cache-Control: no-store`; a cached
 response makes the client skip an update that is already published.
 
-### `GET {base}/content/<hash>.zip`
+### `GET {base}/{content archive route}`
 
-Returns the zip archive for that hash. `<hash>` is the validated value from the route above.
+Returns the zip archive for one hash. `{hash}` is the validated value from the route above.
 
 | Condition | Client behavior |
 |---|---|
@@ -104,7 +153,7 @@ Returns the zip archive for that hash. `<hash>` is the validated value from the 
 | Empty body | The file is deleted and the run fails |
 | Not a zip archive | The run fails; `content/` is untouched |
 
-### `GET {base}/software/brainmaker`
+### `GET {base}/{software manifest route}`
 
 Returns the signed software manifest. Serve the file that `brainmaker-sign` produces, unchanged,
 byte for byte. The client checks the signature before it parses anything.
@@ -128,11 +177,10 @@ The manifest inside `payload` is:
   "version": "0.2.0",
   "platforms": {
     "darwin-arm64": {
-      "url": "https://api.example.test/v1/brainmaker/software/brainmaker-0.2.0-darwin-arm64",
       "sha256": "e2959e4c4f210dbdfe848f49776a32279362a52760bbd0b26e3effb6cd0df350"
     },
-    "darwin-x86_64": { "url": "...", "sha256": "..." },
-    "linux-x86_64":  { "url": "...", "sha256": "..." }
+    "darwin-x86_64": { "sha256": "..." },
+    "linux-x86_64":  { "sha256": "..." }
   }
 }
 ```
@@ -141,8 +189,20 @@ The manifest inside `payload` is:
 |---|---|
 | `version` | 1 to 64 characters of digits, dots, hyphens, plus signs, and ASCII letters |
 | `platforms` | One key per platform, spelled `<os>-<arch>`. The client reads only its own key. |
-| `url` | Must carry the same scheme, host, and port as the base URL, compared case-insensitively, with any userinfo discarded and the scheme's default port filled in |
 | `sha256` | 64 hexadecimal characters, in either case |
+
+The manifest carries no URL. The client derives the download address from its own base URL and
+`BRAINMAKER_SOFTWARE_BINARY_PATH`, so a published manifest names no host, and a manifest cannot move
+a download to another host.
+
+### `GET {base}/{software binary route}`
+
+Returns one replacement binary. The client asks for the route with `{version}`, `{platform}`, and
+`{ext}` filled in, so the served file names must match the route you configure. The default route
+asks for `software/brainmaker-0.2.0-darwin-arm64`, which is the name the release workflow produces.
+
+The client reads the body up to 128 MiB, checks its SHA-256 against the signed manifest, and runs it
+with `--version` before it swaps.
 
 Because the signature covers the bytes rather than a re-serialization, any proxy that reformats
 this JSON body breaks every client. Serve it as a static file.
@@ -158,7 +218,7 @@ the keys that are present.
 
 | Status | Message the client prints |
 |---|---|
-| 401, 403 | `the server rejected the request with HTTP <code>; set SWETSI_TOKEN to a valid bearer token` |
+| 401, 403 | `the server rejected the request with HTTP <code>; check that SWETSI_CLIENT_ID is configured, and that the client may read this route with the scope sync` |
 | 404 | `the server returned HTTP 404 Not Found` |
 | other | `the server returned HTTP <code>` |
 | timeout | `the request timed out` |
@@ -180,22 +240,36 @@ the keys that are present.
 
 | Key | Rule |
 |---|---|
-| `SWETSI_API_BASE` | Required. Must be an `https://` URL with a host, and carry no surrounding whitespace. `http://` is accepted only for `localhost` or a loopback address. |
-| `SWETSI_TOKEN` | Optional. An empty value counts as absent. |
+| `BRAINMAKER_API_BASE` | Required. Must be an `https://` URL with a host, and carry no surrounding whitespace. `http://` is accepted only for `localhost` or a loopback address. |
+| `SWETSI_JWT_ENDPOINT` | Base of the OAuth2 routes. The same URL rule applies. A trailing slash is accepted and stripped. |
+| `SWETSI_CLIENT_ID` | Client identifier. Printable ASCII, and no colon. |
+| `SWETSI_CLIENT_SECRET` | Client secret. Printable ASCII. |
+| The five `*_PATH` keys | Optional. Each is a route under its base URL. A value holding `://`, a `..` segment, or a space fails. A leading `/` is stripped. |
+| `SWETSI_TOKEN` | Refused. The key names the static token that earlier versions read. A file that carries it, and none of the three credential keys, fails. |
+| `SWETSI_API_BASE` | Refused. The key is now `BRAINMAKER_API_BASE`. A file that carries the old name and not the new one fails. |
+
+Key names carry two prefixes, because the two hosts can differ. `SWETSI_` names the service that
+issues the token: `SWETSI_JWT_ENDPOINT`, `SWETSI_CLIENT_ID`, `SWETSI_CLIENT_SECRET`, and
+`SWETSI_TOKEN_PATH`. `BRAINMAKER_` names the service that serves the content and the software.
+
+The three credential keys are supplied together or not at all. An empty value counts as absent, so
+`SWETSI_CLIENT_SECRET=` is the same as an absent line. None of the three means `brainmaker` sends
+no `Authorization` header.
 
 ## `scripts/make-manifest.sh`
 
 Writes the unsigned software manifest for a directory of built binaries.
 
 ```bash
-scripts/make-manifest.sh <dist-dir> <version> [base-url]
+scripts/make-manifest.sh <dist-dir> <version>
 ```
 
-| Argument | Required | Default |
-|---|---|---|
-| `<dist-dir>` | yes | — |
-| `<version>` | yes | — |
-| `[base-url]` | no | `https://api.example.test/v1/brainmaker/software` |
+| Argument | Required |
+|---|---|
+| `<dist-dir>` | yes |
+| `<version>` | yes |
+
+The script takes no URL, and the manifest it writes holds none.
 
 The script reads every file named `brainmaker-<version>-<platform-key>[.exe]` in `<dist-dir>`,
 computes each SHA-256, and writes `<dist-dir>/manifest.json`. It exits 2 on a wrong argument count,

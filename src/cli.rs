@@ -41,11 +41,27 @@ FIRST RUN:
     ~/.brainmaker/confidential/, and removes the file.
 
 ENVIRONMENT:
-    SWETSI_API_BASE       Base of every API route. It overrides the stored
-                          value.
-    SWETSI_TOKEN          Bearer token for the API. It overrides the stored
-                          value. Unset means no Authorization header.
+    The keys carry two prefixes, because the two hosts can differ. SWETSI_
+    names the service that issues the token. BRAINMAKER_ names the service
+    that serves the content and the software.
+
+    BRAINMAKER_API_BASE   Base of every content and software route.
+    SWETSI_JWT_ENDPOINT   Base of the OAuth2 routes. brainmaker asks it for an
+                          access token before every run.
+    SWETSI_CLIENT_ID      Client identifier for the token request.
+    SWETSI_CLIENT_SECRET  Client secret for the token request.
     BRAINMAKER_CONFIG     Path of the provisioning file to import.
+
+    Five more variables name the routes, and each one has a default:
+
+    SWETSI_TOKEN_PATH                  under SWETSI_JWT_ENDPOINT
+    BRAINMAKER_CONTENT_LATEST_PATH     under BRAINMAKER_API_BASE
+    BRAINMAKER_CONTENT_ARCHIVE_PATH    the same
+    BRAINMAKER_SOFTWARE_MANIFEST_PATH  the same
+    BRAINMAKER_SOFTWARE_BINARY_PATH    the same
+
+    Each variable overrides the stored value. Supply all three credential
+    variables, or none of them. None of them means no Authorization header.
 
 EXIT CODES:
     0    The content is up to date, or the update succeeded

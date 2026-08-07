@@ -279,14 +279,14 @@ mod tests {
 
     #[test]
     fn seals_then_opens_the_same_bytes() {
-        let plaintext = b"SWETSI_API_BASE=https://example.test/v1\n";
+        let plaintext = b"BRAINMAKER_API_BASE=https://example.test/v1\n";
         let sealed = seal(plaintext).unwrap();
         assert_eq!(open(&sealed).unwrap(), plaintext);
     }
 
     #[test]
     fn the_sealed_bytes_do_not_expose_the_plaintext() {
-        let plaintext = b"SWETSI_TOKEN=super-secret-value";
+        let plaintext = b"SWETSI_CLIENT_SECRET=super-secret-value";
         let sealed = seal(plaintext).unwrap();
         let window = sealed.windows(b"super-secret-value".len());
         assert!(!window.into_iter().any(|w| w == b"super-secret-value"));
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn rejects_an_altered_file() {
-        let mut sealed = seal(b"SWETSI_API_BASE=https://example.test/v1").unwrap();
+        let mut sealed = seal(b"BRAINMAKER_API_BASE=https://example.test/v1").unwrap();
         let last = sealed.len() - 1;
         sealed[last] ^= 0xff;
         assert!(open(&sealed).is_err());

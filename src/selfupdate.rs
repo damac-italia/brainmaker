@@ -14,8 +14,10 @@
 //! binary, because an attacker who cannot forge the manifest cannot choose the
 //! checksum either.
 //!
-//! Two further checks narrow the exposure. [`Build::check_origin`] refuses a
-//! download URL whose scheme, host, or port differs from the base URL, and
+//! Two further rules narrow the exposure. The manifest carries no URL at all:
+//! [`crate::config::Config::binary_url`] derives the download address from the
+//! base URL in the provisioning file, so a manifest cannot move the download to
+//! another host, and a published manifest discloses no endpoint. And
 //! [`version::is_newer`] installs only a strictly newer version, so a replayed
 //! older manifest installs nothing.
 
@@ -31,16 +33,17 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, MAX_BINARY_BYTES, MAX_MANIFEST_BYTES};
 use crate::remote;
 use crate::signature;
-use crate::url;
 use crate::version;
 
 /// Version of this binary.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// One platform's build in the manifest.
+///
+/// The struct carries no URL. The client derives the download address from its
+/// own base URL, so a manifest that a release publishes names no host.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Build {
-    pub url: String,
     pub sha256: String,
 }
 
@@ -163,27 +166,6 @@ pub fn check(config: &Config) -> Result<Check> {
 }
 
 impl Build {
-    /// Refuses a download URL that leaves the base URL's scheme, host, and
-    /// port.
-    ///
-    /// The manifest arrives from the network, so it can name any URL. We accept
-    /// only the origin we already trust. The comparison fills in the default
-    /// port for each scheme, so an explicit `:443` matches an implicit one.
-    pub fn check_origin(&self, base_url: &str) -> Result<()> {
-        let expected = url::parse(base_url)
-            .with_context(|| format!("cannot read the origin of the base URL {base_url}"))?;
-        let actual = url::parse(&self.url)
-            .with_context(|| format!("cannot read the origin of the build URL {}", self.url))?;
-
-        if expected != actual {
-            bail!(
-                "the manifest points at {actual}, but the API base is {expected}; \
-                 brainmaker downloads a replacement binary only from the base URL host"
-            );
-        }
-        Ok(())
-    }
-
     /// Rejects a checksum that is not 64 hexadecimal characters.
     fn checksum(&self) -> Result<String> {
         let value = self.sha256.trim().to_ascii_lowercase();
@@ -203,8 +185,8 @@ impl Build {
 /// The function verifies the SHA-256 and runs the new binary with `--version`
 /// before it swaps. Returns the path it replaced.
 pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -> Result<PathBuf> {
-    build.check_origin(config.base_url())?;
     let expected_sum = build.checksum()?;
+    let url = config.binary_url(latest, &platform_key());
 
     let exe = current_exe()?;
     let directory = exe
@@ -222,8 +204,8 @@ pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -
     check_writable(directory, &exe)?;
 
     let result = (|| -> Result<()> {
-        log(&format!("Downloading {}", build.url));
-        let bytes = remote::download(config, &build.url, &staged, MAX_BINARY_BYTES)?;
+        log(&format!("Downloading {url}"));
+        let bytes = remote::download(config, &url, &staged, MAX_BINARY_BYTES)?;
         log(&format!("Downloaded {bytes} bytes."));
 
         let actual_sum = sha256_of(&staged)?;
@@ -373,9 +355,8 @@ fn verify_runs(staged: &Path, expected_version: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn build(url: &str) -> Build {
+    fn build() -> Build {
         Build {
-            url: url.to_string(),
             sha256: "0".repeat(64),
         }
     }
@@ -389,84 +370,28 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_build_url_on_the_base_host() {
-        let base = "https://api.example.test/v1/brainmaker";
+    fn the_manifest_type_carries_no_url() {
+        // The download address is derived from the base URL, so a published
+        // manifest names no host. This test fails if a `url` field returns.
+        let source = include_str!("selfupdate.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("selfupdate.rs has a non-test section");
+        let build_struct = production
+            .split("pub struct Build {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("selfupdate.rs declares Build");
         assert!(
-            build("https://api.example.test/v1/brainmaker/software/brainmaker-0.2.0-darwin-arm64")
-                .check_origin(base)
-                .is_ok()
-        );
-        assert!(
-            build("https://API.EXAMPLE.TEST/other/path")
-                .check_origin(base)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn rejects_a_build_url_on_another_host_or_scheme() {
-        let base = "https://api.example.test/v1/brainmaker";
-        assert!(
-            build("https://evil.example/brainmaker")
-                .check_origin(base)
-                .is_err()
-        );
-        assert!(
-            build("http://api.example.test/brainmaker")
-                .check_origin(base)
-                .is_err()
-        );
-        assert!(
-            build("https://api.example.test.evil.example/brainmaker")
-                .check_origin(base)
-                .is_err()
-        );
-        assert!(build("not a url").check_origin(base).is_err());
-    }
-
-    #[test]
-    fn accepts_a_build_url_whose_port_is_written_out() {
-        // The default port for the scheme is filled in on both sides, so the
-        // two spellings of one origin must match.
-        assert!(
-            build("https://api.example.test:443/software/brainmaker")
-                .check_origin("https://api.example.test/v1/brainmaker")
-                .is_ok()
-        );
-        assert!(
-            build("https://api.example.test/software/brainmaker")
-                .check_origin("https://api.example.test:443/v1/brainmaker")
-                .is_ok()
-        );
-        assert!(
-            build("https://api.example.test:8443/software/brainmaker")
-                .check_origin("https://api.example.test:8443/v1/brainmaker")
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn rejects_a_build_url_on_another_port() {
-        assert!(
-            build("https://api.example.test:8443/software/brainmaker")
-                .check_origin("https://api.example.test/v1/brainmaker")
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_userinfo_that_hides_the_real_host() {
-        let base = "https://api.example.test/v1/brainmaker";
-        assert!(
-            build("https://api.example.test@evil.example/brainmaker")
-                .check_origin(base)
-                .is_err()
+            !build_struct.contains("url"),
+            "Build must carry no URL, got {build_struct:?}"
         );
     }
 
     #[test]
     fn accepts_only_a_well_formed_checksum() {
-        let mut b = build("https://api.example.test/x");
+        let mut b = build();
         b.sha256 = "A".repeat(64);
         assert_eq!(b.checksum().unwrap(), "a".repeat(64));
 
@@ -507,7 +432,6 @@ mod tests {
             "version": "0.2.0",
             "platforms": {
                 "darwin-arm64": {
-                    "url": "https://api.example.test/v1/brainmaker/software/brainmaker-0.2.0-darwin-arm64",
                     "sha256": "9f2c0000000000000000000000000000000000000000000000000000000000ab"
                 }
             }

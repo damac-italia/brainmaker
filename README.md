@@ -10,7 +10,7 @@ with the extracted result. It also replaces itself with a newer published build 
 `self-update`. It is not a content editor and not a sync daemon: it runs once per invocation and
 exits.
 
-The binary carries no endpoint and no token. Both arrive in a provisioning file that you issue.
+The binary carries no endpoint and no credential. Both arrive in a provisioning file that you issue.
 
 ## Quick start
 
@@ -43,11 +43,13 @@ gone. Later runs read the sealed copy and need no file.
 
 | Feature | What it does |
 |---|---|
-| Hash comparison | Skips the download when `state.json` matches `GET {base}/content/latest` |
+| Hash comparison | Skips the download when `state.json` matches the hash the content route reports |
+| No endpoint anywhere but the file | The binary, this repository, and every release asset name no host and no route of yours |
 | Atomic swap | Extracts to `.staging`, then replaces `content/` with two renames |
 | Rollback | Restores the previous `content/` when the second rename fails |
 | Zip hardening | Rejects escaping paths and symbolic links; caps one entry at 256 MiB |
-| Sealed settings | Stores the endpoint and token AES-256-GCM encrypted, bound to the machine |
+| Sealed settings | Stores the endpoints and the client secret AES-256-GCM encrypted, bound to the machine |
+| Short-lived tokens | Exchanges the client credentials for a token that the server expires after 10 minutes |
 | No compiled endpoint | A unit test fails the build if a URL with a host enters `src/config.rs` |
 | TLS-only base URL | Refuses a plain-HTTP base URL, except one whose host is this machine |
 | Signed updates | Refuses a software manifest without an Ed25519 signature from a compiled-in key |
@@ -70,9 +72,9 @@ brainmaker sync
 brainmaker status
 ```
 
-`status` prints the root, the store path, the settings source, the API base, the token length, the
-key class, the number of trusted signing keys, the installed hash, the latest hash, the platform
-key, and the published version. It changes nothing.
+`status` prints the root, the store path, the settings source, the API base, the token URL, the
+credential lengths, the key class, the number of trusted signing keys, the installed hash, the
+latest hash, the platform key, and the published version. It changes nothing.
 
 ### Replace the binary
 
@@ -120,14 +122,49 @@ written for a later version survives the round trip through the sealed store.
 
 ```text
 # brainmaker.env - issued by IT, do not share
-SWETSI_API_BASE=https://api.example.test/v1/brainmaker
-SWETSI_TOKEN=the-token-you-issued
+BRAINMAKER_API_BASE=https://api.example.test/v1/brainmaker
+SWETSI_JWT_ENDPOINT=https://api.example.test/swetsi/v1/
+SWETSI_CLIENT_ID=the-client-id-you-issued
+SWETSI_CLIENT_SECRET=the-client-secret-you-issued
 ```
 
 | Key | Default | Description |
 |---|---|---|
-| `SWETSI_API_BASE` | none | Required. Base of every API route. Must use `https://`, unless the host is `localhost` or a loopback address. |
-| `SWETSI_TOKEN` | none | Optional. Sent as `Authorization: Bearer <value>`. |
+| `BRAINMAKER_API_BASE` | none | Required. Base of every API route. Must use `https://`, unless the host is `localhost` or a loopback address. |
+| `SWETSI_JWT_ENDPOINT` | none | Base of the OAuth2 routes. The same TLS rule applies. |
+| `SWETSI_CLIENT_ID` | none | Client identifier for the token request. It must hold no colon, because HTTP Basic separates the two values with one. |
+| `SWETSI_CLIENT_SECRET` | none | Client secret for the token request. |
+
+Supply all three credential keys, or none of them. None of them means `brainmaker` sends no
+`Authorization` header, which suits a local test server. A half-configured file fails and names the
+missing keys.
+
+`SWETSI_TOKEN`, the static token that earlier versions read, is refused. A file that still carries
+it fails with a message that asks for a new file.
+
+### Route names
+
+Five more keys name the routes. Each one is optional, and an absent key takes the generic default
+below. Set all five when you do not want your route names in this public repository.
+
+| Key | Default | Joins |
+|---|---|---|
+| `SWETSI_TOKEN_PATH` | `oauth2/token` | `SWETSI_JWT_ENDPOINT` |
+| `BRAINMAKER_CONTENT_LATEST_PATH` | `content/latest` | `BRAINMAKER_API_BASE` |
+| `BRAINMAKER_CONTENT_ARCHIVE_PATH` | `content/{hash}.zip` | `BRAINMAKER_API_BASE` |
+| `BRAINMAKER_SOFTWARE_MANIFEST_PATH` | `software/brainmaker` | `BRAINMAKER_API_BASE` |
+| `BRAINMAKER_SOFTWARE_BINARY_PATH` | `software/brainmaker-{version}-{platform}{ext}` | `BRAINMAKER_API_BASE` |
+
+`brainmaker` substitutes `{hash}`, `{version}`, `{platform}`, and `{ext}`. `{ext}` is `.exe` on
+Windows and empty everywhere else.
+
+A route is a path under its base URL, never a whole URL. A value that holds `://`, a `..` segment,
+or a space fails at load. A leading `/` is accepted and stripped.
+
+```text
+BRAINMAKER_CONTENT_LATEST_PATH=state/current
+BRAINMAKER_SOFTWARE_BINARY_PATH=releases/bm-{version}-{platform}{ext}
+```
 
 `brainmaker` searches for the file in this order, and imports the first hit:
 
@@ -146,12 +183,35 @@ next run imports it, overwrites the sealed store, and removes the file.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SWETSI_API_BASE` | the sealed value | Base of every API route. Overrides the sealed value. The TLS rule above applies to it. |
-| `SWETSI_TOKEN` | the sealed value | Bearer token. Overrides the sealed value. Unset means no `Authorization` header. |
+| `BRAINMAKER_API_BASE` | the sealed value | Base of every API route. The TLS rule above applies to it. |
+| `SWETSI_JWT_ENDPOINT` | the sealed value | Base of the OAuth2 routes. The TLS rule above applies to it. |
+| `SWETSI_CLIENT_ID` | the sealed value | Client identifier for the token request. |
+| `SWETSI_CLIENT_SECRET` | the sealed value | Client secret for the token request. |
+| The five `SWETSI_*_PATH` keys | the sealed value, else the default | One route each. The same rules as above apply. |
 | `BRAINMAKER_CONFIG` | unset | Path of the provisioning file to import. |
 | `BRAINMAKER_CONFIG_KEY` | a development key | Build-time only. Seals the stored settings. |
 
+Each variable overrides the sealed value for its own key. `brainmaker` checks the merged set, so an
+environment variable can complete a stored credential, and an environment variable alone cannot
+leave one half configured.
+
 Precedence for the base URL, strongest first: `--url`, then the environment, then the sealed store.
+
+### Authentication
+
+`brainmaker` gets an access token before its first API request:
+
+```text
+POST {SWETSI_JWT_ENDPOINT}/{SWETSI_TOKEN_PATH}
+Authorization: Basic base64(client_id:client_secret)
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&scope=sync
+```
+
+The token lasts 10 minutes. `brainmaker` asks for the scope `sync` explicitly, keeps the token in
+memory for the run, and stops using it 30 seconds before it expires. The token never reaches the
+disk. Every API request then carries `Authorization: Bearer <token>`.
 
 ### Options
 
@@ -172,13 +232,13 @@ Precedence for the base URL, strongest first: `--url`, then the environment, the
 obeys the same TLS rule as the provisioning file, so a local test server needs an address such as
 `http://localhost:8080`.
 `--keep-config` leaves the provisioning file in place and prints a warning on every run, because
-that file still holds the token.
+that file still holds the client secret.
 
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md) — modules, boundaries, data model, decisions
 - [Flow](docs/FLOW.md) — the sync, provisioning, and self-update paths
-- [API](docs/API.md) — the CLI surface and the three HTTP routes the server must serve
+- [API](docs/API.md) — the CLI surface and the four HTTP routes the server must serve
 - [Security](docs/SECURITY.md) — trust model, secret handling, input validation
 
 ## Build and release
@@ -224,10 +284,14 @@ one. A manifest verifies when any listed key accepts it.
 |---|---|---|
 | Secret | `BRAINMAKER_CONFIG_KEY` | Seals each employee's stored settings. The workflow fails without it. |
 | Secret | `BRAINMAKER_SIGNING_KEY` | Signs the software manifest. The manifest job fails without it. |
-| Variable | `SOFTWARE_BASE_URL` | Where you serve the binaries. The manifest URLs come from it. The manifest job fails while it holds the `example.test` placeholder. |
 
 The build job also fails when `PUBLIC_KEYS` in `src/signature.rs` is empty, because such a binary
 could never install an update.
+
+The workflow needs no URL of yours, and it publishes none. The manifest carries a version and one
+SHA-256 per platform. Each client derives the download address from the base URL and the routes in
+its own provisioning file, so the workflow logs, the release notes, and the release assets disclose
+nothing about where your API lives.
 
 ### Release steps
 
@@ -236,9 +300,11 @@ could never install an update.
 2. Push a matching tag: `git tag v0.2.0 && git push origin v0.2.0`. The manifest job fails if the
    tag and `Cargo.toml` disagree.
 3. Download the release assets.
-4. Upload the five binaries to `{base}/software/`.
-5. Upload `manifest.signed.json` to `{base}/software/brainmaker` **last**. A manifest that names
-   binaries you have not uploaded makes every `self-update` fail.
+4. Upload the five binaries to your software binary route, named exactly as the release names them.
+   The client asks for `BRAINMAKER_SOFTWARE_BINARY_PATH` with `{version}`, `{platform}`, and `{ext}`
+   filled in, so the served name must match that route.
+5. Upload `manifest.signed.json` to your software manifest route **last**. A manifest whose version
+   has no binary uploaded yet makes every `self-update` fail.
 
 Serve `manifest.signed.json` byte for byte. The signature covers the exact bytes, so a proxy that
 reformats the JSON breaks every client. `manifest.json` is the unsigned copy, kept for reading; do
@@ -266,8 +332,9 @@ the manifest:
 scripts/make-manifest.sh dist 0.2.0
 ```
 
-The script computes each SHA-256 and writes `dist/manifest.json`. A third argument sets the base
-URL; it defaults to `https://api.example.test/v1/brainmaker/software`.
+The script computes each SHA-256 and writes `dist/manifest.json`. It takes no URL, and the manifest
+holds none: each client derives the download address from the base URL and
+`BRAINMAKER_SOFTWARE_BINARY_PATH` in its own provisioning file.
 
 That manifest is unsigned, and `brainmaker` refuses an unsigned manifest. Sign it, then check the
 result against the keys this revision compiles in:

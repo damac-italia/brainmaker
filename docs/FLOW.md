@@ -1,13 +1,13 @@
 # Flow
 
-Three runtime paths matter: loading the settings, the `sync` command, and the `self-update`
-command. `status` reuses the first path and then reads both remote endpoints without writing
-anything.
+Four runtime paths matter: loading the settings, getting an access token, the `sync` command, and
+the `self-update` command. `status` reuses the first two paths and then reads both remote endpoints
+without writing anything.
 
 ## Settings load
 
 Every command starts here. `Config::load` runs before the dispatch in
-[`src/main.rs:85`](../src/main.rs).
+[`src/main.rs:86`](../src/main.rs).
 
 ```mermaid
 sequenceDiagram
@@ -28,26 +28,81 @@ sequenceDiagram
         secretstore-->>config: KEY=VALUE text
     end
     config->>config: apply the environment, then --url
-    config->>url: check_base_url(base)
+    config->>url: check_base_url(base), then check_base_url(jwt endpoint)
+    config->>provision: check_credential_set(the merged keys)
     config-->>main: Config
 ```
 
 Steps:
 
-1. [`config.rs:85`](../src/config.rs) resolves the root: `--dir`, else `~/.brainmaker`.
-2. [`provision.rs:163`](../src/provision.rs) searches four locations in order and returns the first
+1. [`config.rs:264`](../src/config.rs) resolves the root: `--dir`, else `~/.brainmaker`.
+2. [`provision.rs:251`](../src/provision.rs) searches four locations in order and returns the first
    hit. A `--config` or `$BRAINMAKER_CONFIG` path that is not a file fails the run.
-3. On a hit, [`config.rs:98`](../src/config.rs) seals the parsed settings and writes
+3. On a hit, [`config.rs:277`](../src/config.rs) seals the parsed settings and writes
    `confidential/config.enc` with mode `0600` inside a `0700` directory.
-4. [`config.rs:107`](../src/config.rs) removes the plain file. A failed removal logs a warning and
+4. [`config.rs:286`](../src/config.rs) removes the plain file. A failed removal logs a warning and
    the run continues, because the settings are already stored.
-5. With no hit and an existing store, [`config.rs:135`](../src/config.rs) decrypts it. A store from
+5. With no hit and an existing store, [`config.rs:315`](../src/config.rs) decrypts it. A store from
    another machine or another build fails here with a message that tells you to reimport.
-6. [`config.rs:144`](../src/config.rs) lets `SWETSI_API_BASE` and `SWETSI_TOKEN` override the
-   stored values, then `--url` overrides both.
-7. [`config.rs:156`](../src/config.rs) fails when no source supplied a base URL.
-8. [`config.rs:171`](../src/config.rs) fails when the base URL is not `https://`, unless its host is
+6. [`config.rs:329`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
+   `SWETSI_CLIENT_ID`, `SWETSI_CLIENT_SECRET`, and the five route keys override the stored
+   values, then `--url` overrides the base URL again.
+7. [`config.rs:349`](../src/config.rs) fails when no source supplied a base URL.
+8. [`config.rs:364`](../src/config.rs) fails when the base URL is not `https://`, unless its host is
    this machine.
+9. [`config.rs:368`](../src/config.rs) checks the merged credential set. Three keys, or none of
+   them, passes. Any other count fails and names the missing keys. A configuration that still
+   carries `SWETSI_TOKEN` and none of the three fails here.
+10. [`config.rs:380`](../src/config.rs) builds the `Credentials`. It applies the TLS rule to
+    `SWETSI_JWT_ENDPOINT`, and it refuses a credential value that cannot go into a header.
+11. [`config.rs:388`](../src/config.rs) reads the five routes. Each absent key takes its default.
+    A route that holds `://`, a `..` segment, or a space fails here, because it would leave the
+    base URL.
+
+[`config.rs:324`](../src/config.rs) runs before all of this and fails when a configuration still
+carries a key under its old name, such as `SWETSI_API_BASE`.
+
+## Access token
+
+`remote.rs` calls [`auth::bearer`](../src/auth.rs) before each request. The first call fetches, and
+every later call in the same run reads the cache.
+
+```mermaid
+sequenceDiagram
+    participant remote
+    participant auth
+    participant cache as TokenCache
+    participant JWT as token endpoint
+    remote->>auth: bearer(config)
+    alt no credential is configured
+        auth-->>remote: None, so no Authorization header
+    else the cache holds a usable token
+        auth->>cache: get()
+        cache-->>auth: token
+        auth-->>remote: Bearer token
+    else
+        auth->>JWT: POST {jwt_endpoint}/{token route}
+        JWT-->>auth: {"access_token": "…", "expires_in": 600}
+        auth->>auth: check_token(token)
+        auth->>cache: put(token, expires_in - 30 s)
+        auth-->>remote: Bearer token
+    end
+```
+
+Steps:
+
+1. [`auth.rs:127`](../src/auth.rs) returns `Ok(None)` when no credential is configured. The request
+   then carries no `Authorization` header.
+2. [`auth.rs:132`](../src/auth.rs) returns the cached token while it stays usable.
+3. [`auth.rs:147`](../src/auth.rs) posts `grant_type=client_credentials&scope=sync` with HTTP Basic,
+   and reads the response body up to 64 KiB.
+4. [`auth.rs:190`](../src/auth.rs) refuses a token that is empty, longer than 8192 bytes, or holds a
+   character we cannot send in a header.
+5. [`auth.rs:139`](../src/auth.rs) caches the token for `expires_in` less 30 seconds. The cache
+   never reaches the disk.
+
+A failed token request fails the command that asked for it. During `sync`, that happens before any
+file changes, so `content/` stays as it was.
 
 ## Sync
 
@@ -61,14 +116,14 @@ sequenceDiagram
     participant state
     main->>sync: sync(config, force, log)
     sync->>remote: latest_hash(config)
-    remote->>API: GET {base}/content/latest
+    remote->>API: GET {base}/{latest hash route}
     API-->>remote: {"hash": "a1b2c3d4"}
     remote-->>sync: hash
     alt hash matches state.json and content/ exists and not --force
         sync-->>main: UpToDate
     else
         sync->>remote: download_archive(hash, .download.zip)
-        remote->>API: GET {base}/content/<hash>.zip
+        remote->>API: GET {base}/{content archive route}
         sync->>archive: extract(.download.zip, .staging)
         sync->>sync: swap(content, .staging, .trash)
         sync->>state: write(state.json, hash)
@@ -93,7 +148,7 @@ Steps:
 8. [`sync.rs:95`](../src/sync.rs) removes the three temporary paths, on success and on failure
    alike.
 9. [`sync.rs:101`](../src/sync.rs) writes `state.json`, only after the swap succeeded.
-10. [`main.rs:93`](../src/main.rs) runs the software check unless `--no-update-check` was given.
+10. [`main.rs:94`](../src/main.rs) runs the software check unless `--no-update-check` was given.
 
 ### The swap and its rollback
 
@@ -127,14 +182,14 @@ sequenceDiagram
     participant signature
     participant staged as staged binary
     main->>selfupdate: check(config)
-    selfupdate->>remote: fetch_text({base}/software/brainmaker)
-    remote->>API: GET {base}/software/brainmaker
+    selfupdate->>remote: fetch_text(the software manifest route)
+    remote->>API: GET {base}/{software manifest route}
     API-->>selfupdate: {"payload": "...", "signature": "..."}
     selfupdate->>signature: verify(payload, signature)
     selfupdate->>selfupdate: parse payload, validate version, pick platform key
-    selfupdate->>selfupdate: check_origin(build.url vs base_url)
+    selfupdate->>selfupdate: binary_url(version, platform) from the base URL
     selfupdate->>selfupdate: check_writable(install directory)
-    selfupdate->>remote: download(build.url, .brainmaker-update-<pid>)
+    selfupdate->>remote: download(the derived URL, .brainmaker-update-<pid>)
     selfupdate->>selfupdate: sha256_of(staged) == manifest sha256
     selfupdate->>staged: run --version
     staged-->>selfupdate: brainmaker <latest>
@@ -143,34 +198,35 @@ sequenceDiagram
 
 Steps:
 
-1. [`selfupdate.rs:115`](../src/selfupdate.rs) reads the envelope, stopping at 1 MiB.
-2. [`selfupdate.rs:124`](../src/selfupdate.rs) checks the Ed25519 signature over the `payload`
+1. [`selfupdate.rs:118`](../src/selfupdate.rs) reads the envelope, stopping at 1 MiB.
+2. [`selfupdate.rs:127`](../src/selfupdate.rs) checks the Ed25519 signature over the `payload`
    bytes, against the keys in `signature::PUBLIC_KEYS`. A manifest that no key accepts stops here,
    so nothing below ever sees it. A build with no key stops here too.
-3. [`selfupdate.rs:127`](../src/selfupdate.rs) parses the verified `payload` into the manifest.
-4. [`selfupdate.rs:134`](../src/selfupdate.rs) rejects a version string that is empty, longer than
+3. [`selfupdate.rs:130`](../src/selfupdate.rs) parses the verified `payload` into the manifest.
+4. [`selfupdate.rs:137`](../src/selfupdate.rs) rejects a version string that is empty, longer than
    64 characters, or holds a character outside `[A-Za-z0-9.+-]`.
-5. [`selfupdate.rs:143`](../src/selfupdate.rs) returns `UpToDate` when the manifest version is not
+5. [`selfupdate.rs:146`](../src/selfupdate.rs) returns `UpToDate` when the manifest version is not
    newer. `--force` then reinstalls the same version, if the manifest has a build for this
    platform. A replayed older manifest therefore installs nothing, even with a valid signature.
-6. [`selfupdate.rs:151`](../src/selfupdate.rs) looks up `<os>-<arch>`, for example `darwin-arm64`.
+6. [`selfupdate.rs:154`](../src/selfupdate.rs) looks up `<os>-<arch>`, for example `darwin-arm64`.
    A missing key yields `NewerElsewhere`, whose error names the keys that are present.
-7. [`selfupdate.rs:206`](../src/selfupdate.rs) refuses a build URL whose scheme, host, or port
-   differs from the base URL, before any download.
-8. [`selfupdate.rs:207`](../src/selfupdate.rs) rejects a checksum that is not 64 hexadecimal
+7. [`selfupdate.rs:189`](../src/selfupdate.rs) derives the download URL from the base URL and
+   `BRAINMAKER_SOFTWARE_BINARY_PATH`, filling in `{version}`, `{platform}`, and `{ext}`. The
+   manifest names no URL, so it cannot move the download to another host.
+8. [`selfupdate.rs:188`](../src/selfupdate.rs) rejects a checksum that is not 64 hexadecimal
    characters.
-9. [`selfupdate.rs:222`](../src/selfupdate.rs) writes a probe file in the install directory, so a
+9. [`selfupdate.rs:204`](../src/selfupdate.rs) writes a probe file in the install directory, so a
    permission problem fails in about a second rather than after a large download.
-10. [`selfupdate.rs:226`](../src/selfupdate.rs) downloads to `.brainmaker-update-<pid>`, stopping at
+10. [`selfupdate.rs:208`](../src/selfupdate.rs) downloads to `.brainmaker-update-<pid>`, stopping at
     128 MiB.
-11. [`selfupdate.rs:229`](../src/selfupdate.rs) streams the SHA-256 and compares it to the manifest.
-12. [`selfupdate.rs:238`](../src/selfupdate.rs) runs the staged file with `--version` and requires
+11. [`selfupdate.rs:211`](../src/selfupdate.rs) streams the SHA-256 and compares it to the manifest.
+12. [`selfupdate.rs:220`](../src/selfupdate.rs) runs the staged file with `--version` and requires
     the output to contain the manifest version. This catches a build for the wrong architecture and
     a manifest that points at the wrong file.
-13. [`selfupdate.rs:257`](../src/selfupdate.rs) renames the running binary to `.brainmaker-old`,
+13. [`selfupdate.rs:239`](../src/selfupdate.rs) renames the running binary to `.brainmaker-old`,
     then renames the staged file into place. A failure on the second rename restores the old
     binary. A running process keeps its open image, so the swap is safe while `brainmaker` runs.
-14. [`selfupdate.rs:244`](../src/selfupdate.rs) removes the staged file on failure, and removes the
+14. [`selfupdate.rs:223`](../src/selfupdate.rs) removes the staged file on failure, and removes the
     backup either way.
 
 `--check` stops after step 6 and installs nothing.

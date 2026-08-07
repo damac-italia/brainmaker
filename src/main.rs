@@ -19,6 +19,7 @@
 //! brainmaker keeps `~/.brainmaker/content/` in step with the content API.
 
 mod archive;
+mod auth;
 mod cli;
 mod config;
 mod provision;
@@ -122,7 +123,8 @@ fn status(config: &Config) -> Result<()> {
         }
     );
     println!("api base  {}", config.base_url());
-    println!("token     {}", config.token_summary());
+    println!("token url {}", config.token_url_summary());
+    println!("auth      {}", config.credentials_summary());
     println!("key       {}", secretstore::key_class());
     println!("signing   {} trusted key(s)", signature::key_count());
     println!(

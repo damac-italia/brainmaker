@@ -15,13 +15,9 @@ on:
 permissions:
   contents: write
 
-env:
-  # Where the binaries will be served from. The manifest URLs are built from
-  # this value, and brainmaker refuses a build URL on another host, so it must
-  # match the API base. Override it with a repository variable of the same
-  # name.
-  SOFTWARE_BASE_URL: >-
-    ${{ vars.SOFTWARE_BASE_URL || 'https://api.example.test/v1/brainmaker/software' }}
+# This workflow learns no customer endpoint, and it publishes none. The manifest
+# carries a version and one SHA-256 per platform. Each client derives the
+# download address from the base URL in its own provisioning file.
 
 jobs:
   build:
@@ -173,24 +169,14 @@ jobs:
           fi
 
       # The manifest URLs must point at your real host, because brainmaker
-      # refuses a build URL whose host differs from the provisioned API base.
-      - name: Check that the software base URL is configured
-        run: |
-          case "$SOFTWARE_BASE_URL" in
-            *example.test*)
-              echo "SOFTWARE_BASE_URL is still the placeholder $SOFTWARE_BASE_URL" >&2
-              echo "set the repository variable SOFTWARE_BASE_URL to your real host" >&2
-              exit 1
-              ;;
-          esac
-          echo "the software base URL is $SOFTWARE_BASE_URL"
-
+      # The manifest holds a version and one checksum per platform, and no URL,
+      # so printing it here discloses nothing.
       - name: Write the manifest
         run: |
           mkdir -p dist
           cp staging/brainmaker-* dist/
           chmod +x scripts/make-manifest.sh
-          ./scripts/make-manifest.sh dist "$VERSION" "$SOFTWARE_BASE_URL"
+          ./scripts/make-manifest.sh dist "$VERSION"
           cat dist/manifest.json
 
       # brainmaker refuses an unsigned manifest, so a release without this
@@ -243,4 +229,4 @@ jobs:
         run: |
           gh release create "v$VERSION" dist/* \
             --title "brainmaker $VERSION" \
-            --notes "Upload every binary and manifest.json to $SOFTWARE_BASE_URL/. Publish manifest.json last."
+            --notes "Put every binary on the software binary route of your API host, then publish manifest.signed.json on the software manifest route. Publish the manifest last."

@@ -10,10 +10,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::auth;
 use crate::config::{Config, MAX_ARCHIVE_BYTES, validate_hash};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const TEXT_TIMEOUT: Duration = Duration::from_secs(20);
+pub const TEXT_TIMEOUT: Duration = Duration::from_secs(20);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const USER_AGENT: &str = concat!("brainmaker/", env!("CARGO_PKG_VERSION"));
 
@@ -54,7 +55,7 @@ pub fn download_archive(config: &Config, hash: &str, dest: &Path) -> Result<u64>
 pub fn fetch_text(config: &Config, url: &str, limit: u64) -> Result<String> {
     let agent = build_agent(TEXT_TIMEOUT);
     let mut request = agent.get(url);
-    if let Some(token) = config.token() {
+    if let Some(token) = auth::bearer(config)? {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
 
@@ -78,7 +79,7 @@ pub fn fetch_text(config: &Config, url: &str, limit: u64) -> Result<String> {
 pub fn download(config: &Config, url: &str, dest: &Path, limit: u64) -> Result<u64> {
     let agent = build_agent(DOWNLOAD_TIMEOUT);
     let mut request = agent.get(url);
-    if let Some(token) = config.token() {
+    if let Some(token) = auth::bearer(config)? {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
 
@@ -120,7 +121,8 @@ pub fn download(config: &Config, url: &str, dest: &Path, limit: u64) -> Result<u
     Ok(written)
 }
 
-fn build_agent(total_timeout: Duration) -> ureq::Agent {
+/// Builds an agent with this client's timeouts and user agent.
+pub fn build_agent(total_timeout: Duration) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_global(Some(total_timeout))
@@ -133,10 +135,11 @@ fn build_agent(total_timeout: Duration) -> ureq::Agent {
 fn describe(error: ureq::Error) -> anyhow::Error {
     match error {
         ureq::Error::StatusCode(401) | ureq::Error::StatusCode(403) => anyhow::anyhow!(
-            "the server rejected the request with HTTP {}; \
-             set {} to a valid bearer token",
+            "the server rejected the request with HTTP {}; check that {} is configured, and \
+             that the client may read this route with the scope {}",
             status_of(&error),
-            crate::config::TOKEN_ENV
+            crate::config::CLIENT_ID_ENV,
+            auth::SCOPE
         ),
         ureq::Error::StatusCode(404) => {
             anyhow::anyhow!("the server returned HTTP 404 Not Found")

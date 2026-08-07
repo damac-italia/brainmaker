@@ -12,11 +12,67 @@ use anyhow::{Context, Result, bail};
 
 use crate::url;
 
-/// Required. Base of every API route, with no trailing slash.
-pub const KEY_API_BASE: &str = "SWETSI_API_BASE";
+/// Required. Base of every content and software route, with no trailing slash.
+///
+/// The keys carry two prefixes, because the two hosts can differ. `SWETSI_`
+/// names the authorisation service that issues the token. `BRAINMAKER_` names
+/// the service that serves the content and the software.
+pub const KEY_API_BASE: &str = "BRAINMAKER_API_BASE";
 
-/// Optional. Sent as `Authorization: Bearer <value>`.
-pub const KEY_TOKEN: &str = "SWETSI_TOKEN";
+/// Base of the OAuth2 routes on the authorisation service.
+pub const KEY_JWT_ENDPOINT: &str = "SWETSI_JWT_ENDPOINT";
+
+/// Client identifier for the client-credentials grant.
+pub const KEY_CLIENT_ID: &str = "SWETSI_CLIENT_ID";
+
+/// Client secret for the client-credentials grant.
+pub const KEY_CLIENT_SECRET: &str = "SWETSI_CLIENT_SECRET";
+
+/// The static bearer token that earlier versions read.
+///
+/// The server now issues a short-lived token instead, so a file that still
+/// carries this key is refused rather than silently ignored.
+pub const KEY_LEGACY_TOKEN: &str = "SWETSI_TOKEN";
+
+/// The three keys that together configure the client-credentials grant.
+///
+/// A file supplies all three or none of them.
+pub const CREDENTIAL_KEYS: [&str; 3] = [KEY_JWT_ENDPOINT, KEY_CLIENT_ID, KEY_CLIENT_SECRET];
+
+/// Route of the token endpoint, relative to [`KEY_JWT_ENDPOINT`].
+pub const KEY_TOKEN_PATH: &str = "SWETSI_TOKEN_PATH";
+
+/// Route that returns the latest content hash, relative to [`KEY_API_BASE`].
+pub const KEY_CONTENT_LATEST_PATH: &str = "BRAINMAKER_CONTENT_LATEST_PATH";
+
+/// Route that returns one content archive, relative to [`KEY_API_BASE`].
+pub const KEY_CONTENT_ARCHIVE_PATH: &str = "BRAINMAKER_CONTENT_ARCHIVE_PATH";
+
+/// Route that returns the signed software manifest, relative to
+/// [`KEY_API_BASE`].
+pub const KEY_SOFTWARE_MANIFEST_PATH: &str = "BRAINMAKER_SOFTWARE_MANIFEST_PATH";
+
+/// Route that returns one replacement binary, relative to [`KEY_API_BASE`].
+pub const KEY_SOFTWARE_BINARY_PATH: &str = "BRAINMAKER_SOFTWARE_BINARY_PATH";
+
+/// Keys that an earlier version read, each with the key that replaces it.
+///
+/// A configuration that still carries the old name fails, rather than falling
+/// back to a default and reaching the wrong host.
+pub const RENAMED_KEYS: [(&str, &str); 1] = [("SWETSI_API_BASE", KEY_API_BASE)];
+
+/// The five route keys, in the order the documents list them.
+///
+/// Each one is optional. An absent key takes the generic default in
+/// [`crate::config`], so a customer who does not want their route names in a
+/// public repository sets all five.
+pub const ROUTE_KEYS: [&str; 5] = [
+    KEY_TOKEN_PATH,
+    KEY_CONTENT_LATEST_PATH,
+    KEY_CONTENT_ARCHIVE_PATH,
+    KEY_SOFTWARE_MANIFEST_PATH,
+    KEY_SOFTWARE_BINARY_PATH,
+];
 
 /// Names we look for when no path is given.
 ///
@@ -45,9 +101,36 @@ impl Settings {
         self.values.get(KEY_API_BASE).map(String::as_str)
     }
 
-    pub fn token(&self) -> Option<&str> {
+    pub fn jwt_endpoint(&self) -> Option<&str> {
+        self.value(KEY_JWT_ENDPOINT)
+    }
+
+    pub fn client_id(&self) -> Option<&str> {
+        self.value(KEY_CLIENT_ID)
+    }
+
+    pub fn client_secret(&self) -> Option<&str> {
+        self.value(KEY_CLIENT_SECRET)
+    }
+
+    /// The static token that versions before 0.2.0 read. Only the credential
+    /// check reads it, and only to name the reason a stale file fails.
+    pub fn legacy_token(&self) -> Option<&str> {
+        self.value(KEY_LEGACY_TOKEN)
+    }
+
+    /// Any key by name. An empty value counts as absent.
+    ///
+    /// The route keys and the renamed-key check read this, because both work
+    /// over a list of key names rather than over named fields.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.value(key)
+    }
+
+    /// Reads one key. An empty value counts as absent.
+    fn value(&self, key: &str) -> Option<&str> {
         self.values
-            .get(KEY_TOKEN)
+            .get(key)
             .map(String::as_str)
             .filter(|v| !v.is_empty())
     }
@@ -69,14 +152,82 @@ impl Settings {
 
     /// Fails when a required key is absent or unusable.
     pub fn validate(&self) -> Result<()> {
+        check_renamed_keys(|key| self.value(key).is_some())?;
+
         let Some(base) = self.api_base() else {
             bail!("the provisioning file has no {KEY_API_BASE} line");
         };
         if base.trim() != base {
             bail!("{KEY_API_BASE} has leading or trailing whitespace");
         }
-        url::check_base_url(KEY_API_BASE, base)
+        url::check_base_url(KEY_API_BASE, base)?;
+
+        if let Some(endpoint) = self.jwt_endpoint() {
+            if endpoint.trim() != endpoint {
+                bail!("{KEY_JWT_ENDPOINT} has leading or trailing whitespace");
+            }
+            url::check_base_url(KEY_JWT_ENDPOINT, endpoint)?;
+        }
+
+        check_credential_set(
+            |key| self.value(key).is_some(),
+            self.value(KEY_LEGACY_TOKEN),
+        )
     }
+}
+
+/// Fails when a source still carries a key under its old name.
+///
+/// `present` reports whether one key holds a non-empty value.
+pub fn check_renamed_keys(present: impl Fn(&str) -> bool) -> Result<()> {
+    for (old, new) in RENAMED_KEYS {
+        if present(old) && !present(new) {
+            bail!(
+                "{old} is now called {new}. Rename the key, or ask your administrator for a new brainmaker.env file."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Fails when the credential keys are half configured.
+///
+/// `present` reports whether one key holds a non-empty value. `legacy` holds
+/// the value of [`KEY_LEGACY_TOKEN`], when a source still supplies it.
+///
+/// All three keys, or none of them, is usable. None of them means brainmaker
+/// sends no `Authorization` header, which suits a local test server.
+pub fn check_credential_set(present: impl Fn(&str) -> bool, legacy: Option<&str>) -> Result<()> {
+    let missing: Vec<&str> = CREDENTIAL_KEYS
+        .into_iter()
+        .filter(|key| !present(key))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    if missing.len() == CREDENTIAL_KEYS.len() {
+        if legacy.is_some() {
+            bail!(
+                "{KEY_LEGACY_TOKEN} is no longer read. The server now issues a short-lived \
+                 token, so the configuration needs {}. Ask your administrator for a new \
+                 brainmaker.env file.",
+                CREDENTIAL_KEYS.join(", ")
+            );
+        }
+        return Ok(());
+    }
+
+    bail!(
+        "the configuration has {} but not {}. Supply all three keys, or none of them.",
+        CREDENTIAL_KEYS
+            .into_iter()
+            .filter(|key| present(key))
+            .collect::<Vec<_>>()
+            .join(", "),
+        missing.join(", ")
+    )
 }
 
 /// Parses `KEY=VALUE` text.
@@ -207,15 +358,22 @@ mod tests {
     #[test]
     fn parses_a_plain_file() {
         let settings = parse(
-            "SWETSI_API_BASE=https://api.example.test/v1/brainmaker\n\
-             SWETSI_TOKEN=abc123\n",
+            "BRAINMAKER_API_BASE=https://api.example.test/v1/brainmaker\n\
+             SWETSI_JWT_ENDPOINT=https://api.example.test/swetsi/v1/\n\
+             SWETSI_CLIENT_ID=the-client-id\n\
+             SWETSI_CLIENT_SECRET=abc123\n",
         )
         .unwrap();
         assert_eq!(
             settings.api_base(),
             Some("https://api.example.test/v1/brainmaker")
         );
-        assert_eq!(settings.token(), Some("abc123"));
+        assert_eq!(
+            settings.jwt_endpoint(),
+            Some("https://api.example.test/swetsi/v1/")
+        );
+        assert_eq!(settings.client_id(), Some("the-client-id"));
+        assert_eq!(settings.client_secret(), Some("abc123"));
         settings.validate().unwrap();
     }
 
@@ -224,30 +382,30 @@ mod tests {
         let settings = parse(
             "# the endpoint\n\
              \n\
-             SWETSI_API_BASE=https://api.example.test/v1\n\
+             BRAINMAKER_API_BASE=https://api.example.test/v1\n\
              \n\
-             # SWETSI_TOKEN=commented-out\n",
+             # SWETSI_CLIENT_SECRET=commented-out\n",
         )
         .unwrap();
         assert_eq!(settings.api_base(), Some("https://api.example.test/v1"));
-        assert_eq!(settings.token(), None);
+        assert_eq!(settings.client_secret(), None);
     }
 
     #[test]
     fn accepts_export_and_quotes() {
         let settings = parse(
-            "export SWETSI_API_BASE=\"https://api.example.test/v1\"\n\
-             SWETSI_TOKEN='quoted token'\n",
+            "export BRAINMAKER_API_BASE=\"https://api.example.test/v1\"\n\
+             SWETSI_CLIENT_SECRET='quoted secret'\n",
         )
         .unwrap();
         assert_eq!(settings.api_base(), Some("https://api.example.test/v1"));
-        assert_eq!(settings.token(), Some("quoted token"));
+        assert_eq!(settings.client_secret(), Some("quoted secret"));
     }
 
     #[test]
     fn keeps_an_unknown_key_for_a_later_version() {
         let settings = parse(
-            "SWETSI_API_BASE=https://api.example.test/v1\n\
+            "BRAINMAKER_API_BASE=https://api.example.test/v1\n\
              SWETSI_FUTURE_SETTING=42\n",
         )
         .unwrap();
@@ -258,7 +416,8 @@ mod tests {
     #[test]
     fn survives_a_round_trip_through_text() {
         let settings =
-            parse("SWETSI_API_BASE=https://api.example.test/v1\nSWETSI_TOKEN=abc\n").unwrap();
+            parse("BRAINMAKER_API_BASE=https://api.example.test/v1\nSWETSI_CLIENT_SECRET=abc\n")
+                .unwrap();
         assert_eq!(parse(&settings.to_text()).unwrap(), settings);
     }
 
@@ -273,15 +432,20 @@ mod tests {
 
     #[test]
     fn rejects_a_file_without_a_usable_api_base() {
-        assert!(parse("SWETSI_TOKEN=abc\n").unwrap().validate().is_err());
         assert!(
-            parse("SWETSI_API_BASE=ftp://api.example.test\n")
+            parse("SWETSI_CLIENT_SECRET=abc\n")
                 .unwrap()
                 .validate()
                 .is_err()
         );
         assert!(
-            parse("SWETSI_API_BASE=api.example.test\n")
+            parse("BRAINMAKER_API_BASE=ftp://api.example.test\n")
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse("BRAINMAKER_API_BASE=api.example.test\n")
                 .unwrap()
                 .validate()
                 .is_err()
@@ -289,10 +453,100 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_token_counts_as_absent() {
+    fn an_empty_client_secret_counts_as_absent() {
         let settings =
-            parse("SWETSI_API_BASE=https://api.example.test/v1\nSWETSI_TOKEN=\n").unwrap();
-        assert_eq!(settings.token(), None);
+            parse("BRAINMAKER_API_BASE=https://api.example.test/v1\nSWETSI_CLIENT_SECRET=\n")
+                .unwrap();
+        assert_eq!(settings.client_secret(), None);
+    }
+
+    #[test]
+    fn accepts_a_file_with_no_credential_key() {
+        // A local test server needs no credential, so an unauthenticated
+        // configuration stays usable.
+        parse("BRAINMAKER_API_BASE=http://localhost:8080/v1\n")
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_a_half_configured_credential() {
+        let settings = parse(
+            "BRAINMAKER_API_BASE=https://api.example.test/v1\n\
+             SWETSI_CLIENT_ID=the-client-id\n",
+        )
+        .unwrap();
+        let error = settings.validate().unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("SWETSI_CLIENT_SECRET"), "got {message}");
+        assert!(message.contains("SWETSI_JWT_ENDPOINT"), "got {message}");
+    }
+
+    #[test]
+    fn rejects_a_key_under_its_old_name() {
+        // A silent fall-back would leave the client with no base URL, or with
+        // one that names the wrong service.
+        let settings = parse("SWETSI_API_BASE=https://api.example.test/v1\n").unwrap();
+        let error = settings.validate().unwrap_err();
+        assert!(
+            format!("{error}").contains("SWETSI_API_BASE is now called BRAINMAKER_API_BASE"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn the_two_prefixes_split_the_two_services() {
+        // SWETSI_ names the authorisation service. BRAINMAKER_ names the
+        // service that serves the content and the software.
+        for key in [
+            KEY_JWT_ENDPOINT,
+            KEY_CLIENT_ID,
+            KEY_CLIENT_SECRET,
+            KEY_TOKEN_PATH,
+        ] {
+            assert!(key.starts_with("SWETSI_"), "got {key}");
+        }
+        for key in [
+            KEY_API_BASE,
+            KEY_CONTENT_LATEST_PATH,
+            KEY_CONTENT_ARCHIVE_PATH,
+            KEY_SOFTWARE_MANIFEST_PATH,
+            KEY_SOFTWARE_BINARY_PATH,
+        ] {
+            assert!(key.starts_with("BRAINMAKER_"), "got {key}");
+        }
+    }
+
+    #[test]
+    fn rejects_the_legacy_token_key() {
+        // A file that predates the client-credentials grant must fail loudly.
+        // Silent acceptance would send no Authorization header and produce an
+        // HTTP 401 that names the wrong cause.
+        let settings = parse(
+            "BRAINMAKER_API_BASE=https://api.example.test/v1\n\
+             SWETSI_TOKEN=an-old-static-token\n",
+        )
+        .unwrap();
+        let error = settings.validate().unwrap_err();
+        assert!(
+            format!("{error}").contains("SWETSI_TOKEN is no longer read"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_plain_jwt_endpoint_that_leaves_this_machine() {
+        // The client secret travels to this endpoint, so the TLS rule applies
+        // to it as it applies to the base URL.
+        let settings = parse(
+            "BRAINMAKER_API_BASE=https://api.example.test/v1\n\
+             SWETSI_JWT_ENDPOINT=http://api.example.test/swetsi/v1/\n\
+             SWETSI_CLIENT_ID=the-client-id\n\
+             SWETSI_CLIENT_SECRET=abc123\n",
+        )
+        .unwrap();
+        assert!(settings.validate().is_err());
     }
 
     #[test]
@@ -300,13 +554,13 @@ mod tests {
         // The token travels on every request, so a plain base URL must not
         // reach the network.
         assert!(
-            parse("SWETSI_API_BASE=http://api.example.test/v1\n")
+            parse("BRAINMAKER_API_BASE=http://api.example.test/v1\n")
                 .unwrap()
                 .validate()
                 .is_err()
         );
         assert!(
-            parse("SWETSI_API_BASE=http://localhost:8080/v1\n")
+            parse("BRAINMAKER_API_BASE=http://localhost:8080/v1\n")
                 .unwrap()
                 .validate()
                 .is_ok()

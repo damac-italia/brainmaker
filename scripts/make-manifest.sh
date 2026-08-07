@@ -5,29 +5,27 @@
 # Writes the brainmaker software manifest for a directory of built binaries.
 #
 # Usage:
-#   scripts/make-manifest.sh <dist-dir> <version> [base-url]
+#   scripts/make-manifest.sh <dist-dir> <version>
 #
 # The script reads every file in <dist-dir> named
 #   brainmaker-<version>-<platform-key>[.exe]
 # computes its SHA-256, and writes <dist-dir>/manifest.json.
 #
-# <base-url> is where the binaries will be served from. It defaults to
-# https://api.example.test/v1/brainmaker/software and must match the API base
-# that brainmaker uses, because brainmaker refuses a build URL on another host.
+# The manifest carries no URL. Each client derives the download address from
+# the base URL in its own provisioning file, so this manifest names no host and
+# a public release discloses no endpoint.
 #
 # Example:
 #   scripts/make-manifest.sh dist 0.2.0
 set -euo pipefail
 
-if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-    echo "usage: $0 <dist-dir> <version> [base-url]" >&2
+if [ "$#" -ne 2 ]; then
+    echo "usage: $0 <dist-dir> <version>" >&2
     exit 2
 fi
 
 DIST=$1
 VERSION=$2
-BASE_URL=${3:-https://api.example.test/v1/brainmaker/software}
-BASE_URL=${BASE_URL%/}
 
 if [ ! -d "$DIST" ]; then
     echo "error: $DIST is not a directory" >&2
@@ -72,7 +70,6 @@ for path in "$DIST"/brainmaker-"$VERSION"-*; do
     [ -n "$entries" ] && entries="$entries,"
     entries="$entries
     \"$key\": {
-      \"url\": \"$BASE_URL/$name\",
       \"sha256\": \"$sum\"
     }"
     count=$((count + 1))
@@ -99,4 +96,5 @@ echo >&2
 echo "  cargo run --features sign --bin brainmaker-sign -- \\" >&2
 echo "      sign signing.key $DIST/manifest.json $DIST/manifest.signed.json" >&2
 echo >&2
-echo "Then serve $DIST/manifest.signed.json as {base}/software/brainmaker." >&2
+echo "Then serve $DIST/manifest.signed.json as your software manifest route," >&2
+echo "and put every binary on the software binary route of the same host." >&2

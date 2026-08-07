@@ -98,11 +98,12 @@ fn split_host_port(authority: &str, default_port: u16) -> Option<(&str, u16)> {
     }
 }
 
-/// Fails when a base URL must not carry a bearer token.
+/// Fails when a base URL must not carry a credential.
 ///
-/// brainmaker sends `Authorization: Bearer <token>` on every request, so it
-/// requires `https://`. It accepts `http://` only when the host is this
-/// machine, because the token then never reaches the network.
+/// brainmaker sends the client secret to the OAuth2 endpoint, and
+/// `Authorization: Bearer <token>` on every API request, so it requires
+/// `https://`. It accepts `http://` only when the host is this machine, because
+/// the credential then never reaches the network.
 pub fn check_base_url(key: &str, value: &str) -> Result<()> {
     let Some(origin) = parse(value) else {
         bail!("{key} must be a URL that starts with a scheme and names a host, got {value:?}");
@@ -110,7 +111,7 @@ pub fn check_base_url(key: &str, value: &str) -> Result<()> {
 
     if origin.scheme == "http" && !origin.is_loopback() {
         bail!(
-            "{key} must use TLS, got {value:?}. brainmaker sends the bearer token on \
+            "{key} must use TLS, got {value:?}. brainmaker sends a credential on \
              every request, and a plain connection would send it in clear text. A plain \
              connection is accepted only for localhost."
         );

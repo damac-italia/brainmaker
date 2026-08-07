@@ -10,7 +10,7 @@ exist, and how to report a vulnerability.
 |---|---|
 | The holder of the manifest signing key | Which binary `brainmaker` installs over itself |
 | The API host, over TLS | The content hash and the content archive |
-| The administrator who issues the provisioning file | The endpoint and the token |
+| The administrator who issues the provisioning file | The endpoints and the client credentials |
 | The employee who runs the binary | Nothing beyond their own account; they already hold the binary |
 
 The two paths have different anchors.
@@ -36,12 +36,14 @@ time, and an identifier of the machine. That combination covers these cases:
 - A copy of `config.enc` taken from a backup, a cloud-sync folder, or a stolen disk does not decrypt
   on another machine, even with the binary.
 - A reader who holds the file but not the binary learns nothing.
-- A `grep` over the home directory finds no URL and no token.
+- A `grep` over the home directory finds no URL and no credential.
 
 **It hides nothing from the employee who runs the binary.** They hold the binary, so they hold the
 compiled-in secret, and they run on the bound machine. Anyone who receives the distribution zip can
-recover the endpoint and the token. Treat both as known to every employee you ship to, issue one
-token per person where you can, and revoke the token on the server when someone leaves.
+recover the endpoints and the client credentials. Treat all four as known to every employee you
+ship to, issue one client identifier per person where you can, and revoke that client on the server
+when someone leaves. Revoking the client stops the next token request; a token already issued stays
+valid for the rest of its 10 minutes.
 
 ## Trust boundaries
 
@@ -49,34 +51,74 @@ token per person where you can, and revoke the token on the server when someone 
 |---|---|---|
 | Content API to disk | The hash string | Exactly 8 ASCII alphanumeric characters, checked before it enters a URL or a path |
 | Content API to disk | The zip archive | Path containment, symbolic-link rejection, permission stripping, size caps |
-| Software API to the binary | The manifest | Ed25519 signature over the served bytes, checked before the parse; then version character set and length, platform key lookup, origin check, checksum format |
+| Software API to the binary | The manifest | Ed25519 signature over the served bytes, checked before the parse; then version character set and length, platform key lookup, checksum format. The manifest names no URL, so it cannot direct a download. |
 | Software API to the binary | The replacement binary | SHA-256 match, then a `--version` run before the swap |
-| Provisioning file to the store | `KEY=VALUE` text | Size cap, key character set, TLS rule on the base URL |
+| Provisioning file to the store | `KEY=VALUE` text | Size cap, key character set, TLS rule on both URLs, all-or-none credential check, character rule on both credential values, route rule on all five routes |
+| Token endpoint to a header | The access token | Length cap, printable-ASCII rule, and a `token_type` that must read `Bearer` |
 | Store to the process | `config.enc` | AES-256-GCM authenticates the header and the ciphertext before any byte is used |
 
 ## Authentication and authorization
 
-`brainmaker` sends `Authorization: Bearer <token>` on every request when a token is configured, and
-sends no header when none is. It performs no authorization of its own: the server decides what a
-token may read.
+`brainmaker` holds a client identifier and a client secret, and exchanges them for an access token
+at `POST {SWETSI_JWT_ENDPOINT}/oauth2/token`, with HTTP Basic and the `client_credentials` grant. It
+asks for the scope `sync` explicitly, so a client that the server grants more than one scope still
+requests the one scope a sync needs. It then sends `Authorization: Bearer <token>` on every request
+under the base URL. With no credential configured it sends no header. It performs no authorization
+of its own: the server decides what the token may read.
 
-Because the token travels on every request, `url::check_base_url` requires the base URL to use
-`https://`. It accepts `http://` only when the host is `localhost` or a loopback address, where the
-request never reaches the network. The rule applies to every source of the base URL: the
-provisioning file, `SWETSI_API_BASE`, and `--url`. Userinfo does not change the decision, so
+The server expires the token after 10 minutes. That bounds what a token taken from a laptop is
+worth: the client secret stays valuable, and it stays sealed. The token lives in memory for one run
+and never reaches the disk, so nothing on the disk holds a usable bearer token between runs.
+`brainmaker` stops using a token 30 seconds before it expires, so a request that starts near the
+boundary does not arrive with an expired token.
+
+Because a credential travels on every request, `url::check_base_url` requires `https://`. It accepts
+`http://` only when the host is `localhost` or a loopback address, where the request never reaches
+the network. The rule applies to every source of both URLs: the provisioning file,
+`BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`, and `--url`. Userinfo does not change the decision, so
 `http://localhost@evil.example/` is refused.
 
-The token is never printed. `status` reports it as `absent` or as `present, N characters`. The unit
-test `config::tests::the_token_summary_never_shows_the_token` enforces that.
+The access token arrives from the network and goes into a header, so `auth::check_token` refuses a
+token that is empty, longer than 8192 bytes, or holds a character outside printable ASCII. A
+carriage return inside a token would otherwise let the server write further request headers. The
+client identifier and the client secret face the same character rule in `Credentials::new`, which
+also refuses an identifier that holds a colon, because HTTP Basic separates the two values with one.
 
-HTTP 401 and HTTP 403 produce a message that names the token variable and nothing else.
+No credential is printed. `status` reports the credentials as `absent`, or as their scope and their
+two lengths. The unit tests `config::tests::the_credentials_summary_never_shows_the_secret`,
+`config::tests::the_credentials_debug_output_never_shows_the_secret`, and
+`auth::tests::the_cache_debug_output_never_shows_the_token` enforce that.
+
+HTTP 401 and HTTP 403 produce a message that names the credential variables and nothing else.
+
+## Endpoint confidentiality
+
+Nothing in this repository, in the built binary, or in a published release names the API host or
+any route of a deployment.
+
+| Place | Why it holds no endpoint |
+|---|---|
+| The binary | Only `BRAINMAKER_CONFIG_KEY` and `CARGO_PKG_VERSION` are read at compile time. Two unit tests, `config::tests::no_endpoint_is_compiled_into_this_module` and `auth::tests::no_endpoint_is_compiled_into_this_module`, fail the build if a URL with a host enters either module. `cli::tests::the_help_text_names_no_endpoint` does the same for the help text. |
+| The repository | Every document uses `api.example.test`. The five route keys let a deployment replace every default route name, so even the route layout need not appear here. |
+| The workflow logs | The release workflow takes no URL as input. It builds, checksums, and signs. |
+| The release notes and assets | The manifest carries a version and one SHA-256 per platform. `selfupdate::tests::the_manifest_type_carries_no_url` fails the build if a `url` field returns to the manifest type. |
+
+The base URL, the OAuth2 endpoint, and any custom routes reach a machine only in the provisioning
+file, and that file is sealed on first use and then deleted. A public release therefore discloses
+which versions exist, and nothing about where they are served.
+
+The five routes are checked before use. A route that holds `://` would move a request to another
+host, and a `..` segment would climb out of the base path; `config::check_route` refuses both, along
+with a space or any other character that cannot go into a URL.
 
 ## Secret handling
 
 | Secret | Where it lives | Protection |
 |---|---|---|
-| `SWETSI_TOKEN` | `~/.brainmaker/confidential/config.enc` | AES-256-GCM, mode `0600` in a `0700` directory |
-| `SWETSI_API_BASE` | the same file | the same |
+| `SWETSI_CLIENT_SECRET` | `~/.brainmaker/confidential/config.enc` | AES-256-GCM, mode `0600` in a `0700` directory |
+| `SWETSI_CLIENT_ID` | the same file | the same |
+| `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT` | the same file | the same |
+| The access token | process memory only | Never written to disk. It expires 10 minutes after the server issues it. |
 | `BRAINMAKER_CONFIG_KEY` | a repository secret, read at build time | Never in the repository. `build.rs` declares `cargo:rerun-if-env-changed`, so a cached build cannot ship a stale key. |
 | `BRAINMAKER_SIGNING_KEY` | a repository secret, read at release time | Never in the repository, and never on a machine that serves the API. The signing step reads it from the environment, so it never reaches the runner's disk. |
 
@@ -92,7 +134,7 @@ The store is written through a temporary file and a rename, so a crash never lea
 The temporary file gets mode `0600` before the rename.
 
 After a successful import, `brainmaker` deletes the plain provisioning file. `--keep-config` skips
-the deletion and prints a warning on every run, because the file still holds the token. A deletion
+the deletion and prints a warning on every run, because the file still holds the client secret. A deletion
 that fails also prints a warning telling you to delete the file yourself.
 
 Both names that `brainmaker` searches for carry the word `brainmaker`: `brainmaker.env` and
