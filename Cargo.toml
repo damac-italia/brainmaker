@@ -1,0 +1,40 @@
+[package]
+name = "brainmaker"
+version = "0.1.0"
+edition = "2024"
+description = "Keeps ~/.brainmaker/content in step with the content API"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/damac-italia/brainmaker"
+
+# The binary runs at the start of every Claude session, so keep it small and
+# make it start fast.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[[bin]]
+name = "brainmaker"
+path = "src/main.rs"
+
+# The signing tool. It is not part of the shipped binary, and a plain
+# `cargo build` skips it. Build it with:
+#   cargo run --features sign --bin brainmaker-sign -- --help
+[[bin]]
+name = "brainmaker-sign"
+path = "tools/sign.rs"
+required-features = ["sign"]
+
+[features]
+sign = []
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "6.0.0"
+ring = "0.17"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+ureq = "3.3.0"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

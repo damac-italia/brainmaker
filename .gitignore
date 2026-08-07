@@ -1,0 +1,15 @@
+/target
+.DS_Store
+
+# the backup that docsgen wrote before it rewrote README.md
+README.bak.md
+
+# never commit a provisioning file: it holds the token
+brainmaker.env
+.brainmaker.env
+*.env
+dist/
+
+# never commit the manifest signing key: it decides what every client installs
+signing.key
+*.key

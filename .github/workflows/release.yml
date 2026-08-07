@@ -1,0 +1,246 @@
+name: release
+
+# Builds brainmaker for every supported platform and writes the software
+# manifest. Each target is built on its own native runner, so nothing is
+# cross-compiled.
+#
+# Push a tag such as v0.2.0 to build and to create a GitHub release, or start
+# the workflow by hand to build without releasing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Where the binaries will be served from. The manifest URLs are built from
+  # this value, and brainmaker refuses a build URL on another host, so it must
+  # match the API base. Override it with a repository variable of the same
+  # name.
+  SOFTWARE_BASE_URL: >-
+    ${{ vars.SOFTWARE_BASE_URL || 'https://api.example.test/v1/brainmaker/software' }}
+
+jobs:
+  build:
+    name: build ${{ matrix.key }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - key: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - key: darwin-x86_64
+            runner: macos-13
+            target: x86_64-apple-darwin
+          - key: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          # GitHub's arm64 Linux runners are free for public repositories and
+          # need a paid plan for private ones. If this job cannot start, see
+          # "Building linux-arm64 without an arm64 runner" in README.md.
+          - key: linux-arm64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+          - key: windows-x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # A build without the key would ship the published development key, and
+      # every employee's sealed configuration would be readable with a stock
+      # build. Fail here rather than release such a binary.
+      - name: Check that the configuration key is set
+        shell: bash
+        env:
+          BRAINMAKER_CONFIG_KEY: ${{ secrets.BRAINMAKER_CONFIG_KEY }}
+        run: |
+          if [ -z "${BRAINMAKER_CONFIG_KEY:-}" ]; then
+            echo "the repository secret BRAINMAKER_CONFIG_KEY is not set" >&2
+            echo "set it before you release, or every build ships the development key" >&2
+            exit 1
+          fi
+          echo "the configuration key is set"
+
+      # A binary with no signing key in src/signature.rs refuses every software
+      # manifest, so it can never self-update. Catch that here rather than at a
+      # user's self-update.
+      - name: Check that a manifest signing key is compiled in
+        shell: bash
+        run: |
+          if ! grep -Eq '^[[:space:]]*"[0-9a-fA-F]{64}",' src/signature.rs; then
+            echo "PUBLIC_KEYS in src/signature.rs holds no public key" >&2
+            echo "run: cargo run --features sign --bin brainmaker-sign -- keygen signing.key" >&2
+            echo "then paste the printed key into src/signature.rs and commit it" >&2
+            exit 1
+          fi
+          echo "a manifest signing key is compiled in"
+
+      # musl gives a fully static Linux binary, so it runs on any distribution
+      # of that architecture and has no glibc version floor.
+      - name: Install the musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Add the Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        # ring compiles C, so cc-rs must find a compiler that targets musl.
+        # For x86_64-unknown-linux-musl, cc-rs tries "x86_64-linux-musl-gcc"
+        # and then falls back to "musl-gcc". For aarch64-unknown-linux-musl it
+        # tries "aarch64-linux-musl-gcc" with no musl fallback, and then drops
+        # to plain "gcc", which targets glibc. Name the compiler here so that
+        # neither target relies on that guess.
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          # Seals each employee's stored configuration. It lives only in this
+          # secret, never in the repository. Rotating it makes every existing
+          # stored configuration unreadable, so every employee must reimport
+          # their brainmaker.env file.
+          BRAINMAKER_CONFIG_KEY: ${{ secrets.BRAINMAKER_CONFIG_KEY }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # An unsigned binary that arrives over the network does not run on Apple
+      # Silicon. An ad-hoc signature is enough to let it start.
+      - name: Sign the macOS build
+        if: startsWith(matrix.key, 'darwin')
+        run: codesign -s - -f target/${{ matrix.target }}/release/brainmaker
+
+      - name: Name the binary
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/brainmaker${{ matrix.exe }}" \
+             "dist/brainmaker-$version-${{ matrix.key }}${{ matrix.exe }}"
+
+      - name: Check that the binary runs and reports the right version
+        # A cross-architecture binary cannot run on its build runner. Every
+        # target here is native, so this check always applies.
+        shell: bash
+        run: |
+          reported=$("dist/brainmaker-$VERSION-${{ matrix.key }}${{ matrix.exe }}" --version | tr -d '\r')
+          echo "$reported"
+          test "$reported" = "brainmaker $VERSION"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brainmaker-${{ matrix.key }}
+          path: dist/brainmaker-*
+          if-no-files-found: error
+          retention-days: 7
+
+  manifest:
+    name: manifest
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+          pattern: brainmaker-*
+          merge-multiple: true
+
+      - name: Read the version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # A tag must name the version in Cargo.toml. A mismatch would publish a
+      # manifest whose binaries carry a different version, and every
+      # self-update would then fail its version check.
+      - name: Check the tag against Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          if [ "$tag" != "$VERSION" ]; then
+            echo "tag v$tag does not match version $VERSION in Cargo.toml" >&2
+            exit 1
+          fi
+
+      # The manifest URLs must point at your real host, because brainmaker
+      # refuses a build URL whose host differs from the provisioned API base.
+      - name: Check that the software base URL is configured
+        run: |
+          case "$SOFTWARE_BASE_URL" in
+            *example.test*)
+              echo "SOFTWARE_BASE_URL is still the placeholder $SOFTWARE_BASE_URL" >&2
+              echo "set the repository variable SOFTWARE_BASE_URL to your real host" >&2
+              exit 1
+              ;;
+          esac
+          echo "the software base URL is $SOFTWARE_BASE_URL"
+
+      - name: Write the manifest
+        run: |
+          mkdir -p dist
+          cp staging/brainmaker-* dist/
+          chmod +x scripts/make-manifest.sh
+          ./scripts/make-manifest.sh dist "$VERSION" "$SOFTWARE_BASE_URL"
+          cat dist/manifest.json
+
+      # brainmaker refuses an unsigned manifest, so a release without this
+      # secret would publish a manifest that every client rejects.
+      - name: Check that the signing key is set
+        env:
+          BRAINMAKER_SIGNING_KEY: ${{ secrets.BRAINMAKER_SIGNING_KEY }}
+        run: |
+          if [ -z "${BRAINMAKER_SIGNING_KEY:-}" ]; then
+            echo "the repository secret BRAINMAKER_SIGNING_KEY is not set" >&2
+            echo "generate a key with the brainmaker-sign tool, store the private half here," >&2
+            echo "and put the public half in PUBLIC_KEYS in src/signature.rs" >&2
+            exit 1
+          fi
+          echo "the signing key is set"
+
+      # The private key reaches the tool through the environment and never
+      # touches the runner's disk. The tool refuses to sign a manifest that
+      # brainmaker could not use.
+      - name: Sign the manifest
+        env:
+          BRAINMAKER_SIGNING_KEY: ${{ secrets.BRAINMAKER_SIGNING_KEY }}
+        run: |
+          cargo build --release --locked --features sign --bin brainmaker-sign
+          ./target/release/brainmaker-sign sign - dist/manifest.json dist/manifest.signed.json
+
+      # The signed manifest must verify against the keys that this revision
+      # compiles into the binaries. A key mismatch here would otherwise stop
+      # every self-update in the field.
+      - name: Check that the signed manifest verifies
+        run: |
+          keys=$(grep -Eo '"[0-9a-fA-F]{64}"' src/signature.rs | tr -d '"')
+          if [ -z "$keys" ]; then
+            echo "PUBLIC_KEYS in src/signature.rs holds no public key" >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          ./target/release/brainmaker-sign verify dist/manifest.signed.json $keys
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brainmaker-release
+          path: dist/
+          if-no-files-found: error
+
+      - name: Create the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --title "brainmaker $VERSION" \
+            --notes "Upload every binary and manifest.json to $SOFTWARE_BASE_URL/. Publish manifest.json last."
