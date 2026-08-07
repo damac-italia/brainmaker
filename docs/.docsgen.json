@@ -13,11 +13,11 @@
         "src/config.rs": "63399590aac21e95",
         "src/provision.rs": "c340749a3c8a1d3a",
         "src/auth.rs": "29056965369ec0ea",
-        "src/url.rs": "e04ae09a5d09e5f5",
+        "src/url.rs": "27ad1cf4025280af",
         "src/signature.rs": "aa330924241fea10",
         "src/selfupdate.rs": "3341e1d3f15ff074",
         "tools/sign.rs": "3c572be4942adda8",
-        ".github/workflows/release.yml": "4af551650e733c4e",
+        ".github/workflows/release.yml": "46b93b6215d0805c",
         "scripts/make-manifest.sh": "4883c40694dc1312"
       }
     },
@@ -34,10 +34,10 @@
         "src/signature.rs": "aa330924241fea10",
         "src/state.rs": "a53e89c3aa1e37ed",
         "src/sync.rs": "c55e3ba34ddbecdc",
-        "src/url.rs": "e04ae09a5d09e5f5",
+        "src/url.rs": "27ad1cf4025280af",
         "src/version.rs": "6bfa971eabf2a0fe",
         "src/selfupdate.rs": "3341e1d3f15ff074",
-        ".github/workflows/release.yml": "4af551650e733c4e"
+        ".github/workflows/release.yml": "46b93b6215d0805c"
       }
     },
     "docs/FLOW.md": {
@@ -53,7 +53,7 @@
         "src/selfupdate.rs": "3341e1d3f15ff074",
         "src/signature.rs": "aa330924241fea10",
         "src/state.rs": "a53e89c3aa1e37ed",
-        "src/url.rs": "e04ae09a5d09e5f5"
+        "src/url.rs": "27ad1cf4025280af"
       }
     },
     "docs/API.md": {
@@ -67,7 +67,7 @@
         "src/selfupdate.rs": "3341e1d3f15ff074",
         "src/signature.rs": "aa330924241fea10",
         "src/provision.rs": "c340749a3c8a1d3a",
-        "src/url.rs": "e04ae09a5d09e5f5",
+        "src/url.rs": "27ad1cf4025280af",
         "scripts/make-manifest.sh": "4883c40694dc1312",
         "tools/sign.rs": "3c572be4942adda8"
       }
@@ -83,10 +83,10 @@
         "src/config.rs": "63399590aac21e95",
         "src/provision.rs": "c340749a3c8a1d3a",
         "src/remote.rs": "f39d81f266fa479d",
-        "src/url.rs": "e04ae09a5d09e5f5",
+        "src/url.rs": "27ad1cf4025280af",
         "build.rs": "3301704cc0f88c5e",
         "Cargo.toml": "fa306fa419bdd9f7",
-        ".github/workflows/release.yml": "4af551650e733c4e"
+        ".github/workflows/release.yml": "46b93b6215d0805c"
       }
     }
   }
