@@ -40,10 +40,10 @@ time, and an identifier of the machine. That combination covers these cases:
 
 **It hides nothing from the employee who runs the binary.** They hold the binary, so they hold the
 compiled-in secret, and they run on the bound machine. Anyone who receives the distribution zip can
-recover the endpoints and the client credentials. Treat all four as known to every employee you
-ship to, issue one client identifier per person where you can, and revoke that client on the server
-when someone leaves. Revoking the client stops the next token request; a token already issued stays
-valid for the rest of its 10 minutes.
+recover the endpoints and the client credentials. Treat all four as known to every employee who
+receives the distribution. Issue one client identifier per person where that is possible, and revoke
+that client on the server when someone leaves. Revoking the client stops the next token request; a
+token already issued stays valid for the rest of its 10 minutes.
 
 ## Trust boundaries
 

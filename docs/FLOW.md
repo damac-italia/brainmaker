@@ -97,7 +97,7 @@ Steps:
 3. [`auth.rs:147`](../src/auth.rs) posts `grant_type=client_credentials&scope=sync` with HTTP Basic,
    and reads the response body up to 64 KiB.
 4. [`auth.rs:190`](../src/auth.rs) refuses a token that is empty, longer than 8192 bytes, or holds a
-   character we cannot send in a header.
+   character outside printable ASCII.
 5. [`auth.rs:138`](../src/auth.rs) caches the token for `expires_in` less 30 seconds. The cache
    never reaches the disk.
 

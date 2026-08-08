@@ -10,7 +10,7 @@ with the extracted result. It also replaces itself with a newer published build 
 `self-update`. It is not a content editor and not a sync daemon: it runs once per invocation and
 exits.
 
-The binary carries no endpoint and no credential. Both arrive in a provisioning file that you issue.
+The binary carries no endpoint and no credential. Both arrive in a provisioning file.
 
 ## Quick start
 
@@ -44,7 +44,7 @@ gone. Later runs read the sealed copy and need no file.
 | Feature | What it does |
 |---|---|
 | Hash comparison | Skips the download when `state.json` matches the hash the content route reports |
-| No endpoint anywhere but the file | The binary, this repository, and every release asset name no host and no route of yours |
+| No endpoint anywhere but the file | The binary, this repository, and every release asset name no host and no route of a deployment |
 | Atomic swap | Extracts to `.staging`, then replaces `content/` with two renames |
 | Rollback | Restores the previous `content/` when the second rename fails |
 | Zip hardening | Rejects escaping paths and symbolic links; caps one entry at 256 MiB |
@@ -124,8 +124,8 @@ written for a later version survives the round trip through the sealed store.
 # brainmaker.env - issued by IT, do not share
 BRAINMAKER_API_BASE=https://api.example.test/v1/brainmaker
 SWETSI_JWT_ENDPOINT=https://api.example.test/swetsi/v1/
-SWETSI_CLIENT_ID=the-client-id-you-issued
-SWETSI_CLIENT_SECRET=the-client-secret-you-issued
+SWETSI_CLIENT_ID=the-issued-client-id
+SWETSI_CLIENT_SECRET=the-issued-client-secret
 ```
 
 | Key | Default | Description |
@@ -145,7 +145,7 @@ it fails with a message that asks for a new file.
 ### Route names
 
 Five more keys name the routes. Each one is optional, and an absent key takes the generic default
-below. Set all five when you do not want your route names in this public repository.
+below. Set all five to keep the route names of a deployment out of this public repository.
 
 | Key | Default | Joins |
 |---|---|---|
@@ -261,7 +261,7 @@ own binary with `--version` and compares the output against `Cargo.toml`.
 ### Signing keys
 
 `brainmaker` installs only a software manifest signed with an Ed25519 key it trusts. Set this up
-once, before your first release.
+once, before the first release.
 
 ```bash
 cargo run --features sign --bin brainmaker-sign -- keygen signing.key
@@ -288,10 +288,10 @@ one. A manifest verifies when any listed key accepts it.
 The build job also fails when `PUBLIC_KEYS` in `src/signature.rs` is empty, because such a binary
 could never install an update.
 
-The workflow needs no URL of yours, and it publishes none. The manifest carries a version and one
+The workflow takes no URL as input, and it publishes none. The manifest carries a version and one
 SHA-256 per platform. Each client derives the download address from the base URL and the routes in
 its own provisioning file, so the workflow logs, the release notes, and the release assets disclose
-nothing about where your API lives.
+nothing about where the API is served.
 
 ### Release steps
 
@@ -300,10 +300,10 @@ nothing about where your API lives.
 2. Push a matching tag: `git tag v0.2.0 && git push origin v0.2.0`. The manifest job fails if the
    tag and `Cargo.toml` disagree.
 3. Download the release assets.
-4. Upload the five binaries to your software binary route, named exactly as the release names them.
+4. Upload the five binaries to the software binary route, named exactly as the release names them.
    The client asks for `BRAINMAKER_SOFTWARE_BINARY_PATH` with `{version}`, `{platform}`, and `{ext}`
    filled in, so the served name must match that route.
-5. Upload `manifest.signed.json` to your software manifest route **last**. A manifest whose version
+5. Upload `manifest.signed.json` to the software manifest route **last**. A manifest whose version
    has no binary uploaded yet makes every `self-update` fail.
 
 Serve `manifest.signed.json` byte for byte. The signature covers the exact bytes, so a proxy that
