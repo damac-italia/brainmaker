@@ -183,10 +183,10 @@ fn machine_id() -> String {
 #[cfg(target_os = "linux")]
 fn platform_machine_id() -> Option<String> {
     for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if !text.trim().is_empty() {
-                return Some(text);
-            }
+        if let Ok(text) = std::fs::read_to_string(path)
+            && !text.trim().is_empty()
+        {
+            return Some(text);
         }
     }
     None
