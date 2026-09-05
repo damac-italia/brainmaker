@@ -228,4 +228,4 @@ jobs:
         run: |
           gh release create "v$VERSION" dist/* \
             --title "brainmaker $VERSION" \
-            --notes "Put every binary on the software binary route of your API host, then publish manifest.signed.json on the software manifest route. Publish the manifest last."
+            --notes ""

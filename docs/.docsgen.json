@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "head": "babe1a9",
+  "head": "9d86f8c",
   "docs": {
     "README.md": {
       "doc_hash": "f5ebeab32cb2bbf2",
       "sources": {
-        ".github/workflows/release.yml": "cb228537b22e5b28",
+        ".github/workflows/release.yml": "4c96d3dafdb44efd",
         "Cargo.lock": "6d821b06a9e90576",
         "Cargo.toml": "fa306fa419bdd9f7",
         "LICENSE": "3972dc9744f6499f",
@@ -24,7 +24,7 @@
     "docs/ARCHITECTURE.md": {
       "doc_hash": "72e73d6201ceb33d",
       "sources": {
-        ".github/workflows/release.yml": "cb228537b22e5b28",
+        ".github/workflows/release.yml": "4c96d3dafdb44efd",
         "Cargo.toml": "fa306fa419bdd9f7",
         "build.rs": "3301704cc0f88c5e",
         "src/auth.rs": "29056965369ec0ea",
@@ -75,7 +75,7 @@
     "docs/SECURITY.md": {
       "doc_hash": "060c32e2158eac42",
       "sources": {
-        ".github/workflows/release.yml": "cb228537b22e5b28",
+        ".github/workflows/release.yml": "4c96d3dafdb44efd",
         "Cargo.toml": "fa306fa419bdd9f7",
         "build.rs": "3301704cc0f88c5e",
         "src/archive.rs": "a98d173402f543d6",
