@@ -48,7 +48,7 @@ jobs:
             exe: .exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # A build without the key would ship the published development key, and
       # every employee's sealed configuration would be readable with a stock
@@ -143,7 +143,7 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v4
         with:
