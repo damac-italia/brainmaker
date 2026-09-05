@@ -28,9 +28,21 @@ jobs:
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
+          # dtolnay/rust-toolchain installs the minimal profile, which
+          # carries neither rustfmt nor clippy. Name them here.
+          components: rustfmt, clippy
+
+      - name: Check the formatting
+        # Runs before the cache step, because it compiles nothing.
+        run: cargo fmt --all --check
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run clippy
+        # -D warnings makes a lint an error, so a warning cannot reach
+        # master unnoticed. --features sign covers tools/sign.rs too.
+        run: cargo clippy --workspace --all-targets --locked --features sign -- -D warnings
 
       - name: Run tests
         # --features sign also compiles tools/sign.rs, which a plain
