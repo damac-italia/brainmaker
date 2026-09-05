@@ -1,12 +1,12 @@
 {
   "version": 1,
-  "head": "9d86f8c",
+  "head": "cae6929",
   "docs": {
     "README.md": {
       "doc_hash": "f5ebeab32cb2bbf2",
       "sources": {
-        ".github/workflows/release.yml": "4c96d3dafdb44efd",
-        "Cargo.lock": "6d821b06a9e90576",
+        ".github/workflows/release.yml": "d42ce6d184ef165b",
+        "Cargo.lock": "84ec2648f5aebdc5",
         "Cargo.toml": "fa306fa419bdd9f7",
         "LICENSE": "3972dc9744f6499f",
         "scripts/make-manifest.sh": "4883c40694dc1312",
@@ -24,14 +24,14 @@
     "docs/ARCHITECTURE.md": {
       "doc_hash": "72e73d6201ceb33d",
       "sources": {
-        ".github/workflows/release.yml": "4c96d3dafdb44efd",
+        ".github/workflows/release.yml": "d42ce6d184ef165b",
         "Cargo.toml": "fa306fa419bdd9f7",
         "build.rs": "3301704cc0f88c5e",
         "src/auth.rs": "29056965369ec0ea",
         "src/config.rs": "63399590aac21e95",
         "src/main.rs": "71c6e865fc5f58a2",
         "src/provision.rs": "c340749a3c8a1d3a",
-        "src/secretstore.rs": "61ce255e4a8bf4b9",
+        "src/secretstore.rs": "4855746c677a7b49",
         "src/selfupdate.rs": "3341e1d3f15ff074",
         "src/signature.rs": "f2d5983d196a7245",
         "src/state.rs": "a53e89c3aa1e37ed",
@@ -73,9 +73,9 @@
       }
     },
     "docs/SECURITY.md": {
-      "doc_hash": "060c32e2158eac42",
+      "doc_hash": "3a4ccf4033decfb2",
       "sources": {
-        ".github/workflows/release.yml": "4c96d3dafdb44efd",
+        ".github/workflows/release.yml": "d42ce6d184ef165b",
         "Cargo.toml": "fa306fa419bdd9f7",
         "build.rs": "3301704cc0f88c5e",
         "src/archive.rs": "a98d173402f543d6",
@@ -83,7 +83,7 @@
         "src/config.rs": "63399590aac21e95",
         "src/provision.rs": "c340749a3c8a1d3a",
         "src/remote.rs": "f39d81f266fa479d",
-        "src/secretstore.rs": "61ce255e4a8bf4b9",
+        "src/secretstore.rs": "4855746c677a7b49",
         "src/selfupdate.rs": "3341e1d3f15ff074",
         "src/signature.rs": "f2d5983d196a7245",
         "src/url.rs": "27ad1cf4025280af"

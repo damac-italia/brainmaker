@@ -209,7 +209,7 @@ truncated. The caps are constants in [`src/config.rs`](../src/config.rs).
 
 ## Dependency policy
 
-| Crate | Version | Role |
+| Crate | Requirement | Role |
 |---|---|---|
 | `anyhow` | 1.0.104 | Error context |
 | `dirs` | 6.0.0 | Home directory lookup |
@@ -219,8 +219,10 @@ truncated. The caps are constants in [`src/config.rs`](../src/config.rs).
 | `ureq` | 3.3.0 | HTTP client |
 | `zip` | 8.6.0 | Archive extraction, `deflate` only, default features off |
 
-The release workflow runs `cargo build --release --locked`, so a release builds only from the
-committed `Cargo.lock`. Adding a dependency therefore requires a lock-file commit and a review.
+The requirement column is the one in `Cargo.toml`. The release workflow runs
+`cargo build --release --locked`, so a release builds the versions in the committed `Cargo.lock`,
+which a Dependabot bump can raise inside a requirement without changing it. Adding a dependency
+therefore requires a lock-file commit and a review.
 
 ## Reporting a vulnerability
 
