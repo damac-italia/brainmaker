@@ -48,8 +48,13 @@ const SIGNATURE_LEN: usize = 64;
 /// holds the new one. A manifest verifies when any key in this list accepts it.
 ///
 /// An empty list means this build trusts no key and installs no update.
+// Kept one key per line: the release workflow checks for a key with a grep that
+// anchors to the start of a line, so that a commented-out placeholder cannot
+// satisfy it. See "Check that a manifest signing key is compiled in" in
+// .github/workflows/release.yml.
+#[rustfmt::skip]
 pub const PUBLIC_KEYS: &[&str] = &[
-    // "0000000000000000000000000000000000000000000000000000000000000000",
+    "ce8e1071de31dc8df324a296bdcca1beebabfc17f9f2b2d9a1f874b7bc45a2e7",
 ];
 
 /// Number of signing keys this binary trusts. `status` prints it.

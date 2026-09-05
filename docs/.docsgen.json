@@ -1,92 +1,92 @@
 {
   "version": 1,
-  "head": "bb82776",
+  "head": "2af75b7",
   "docs": {
     "README.md": {
       "doc_hash": "a9f7a3211201ceb2",
       "sources": {
-        "Cargo.toml": "fa306fa419bdd9f7",
-        "Cargo.lock": "6d821b06a9e90576",
-        "LICENSE": "3972dc9744f6499f",
-        "src/cli.rs": "0ddcc552ed39b702",
-        "src/main.rs": "71c6e865fc5f58a2",
-        "src/config.rs": "63399590aac21e95",
-        "src/provision.rs": "c340749a3c8a1d3a",
-        "src/auth.rs": "29056965369ec0ea",
-        "src/url.rs": "27ad1cf4025280af",
-        "src/signature.rs": "aa330924241fea10",
-        "src/selfupdate.rs": "3341e1d3f15ff074",
-        "tools/sign.rs": "3c572be4942adda8",
         ".github/workflows/release.yml": "46b93b6215d0805c",
-        "scripts/make-manifest.sh": "4883c40694dc1312"
+        "Cargo.lock": "6d821b06a9e90576",
+        "Cargo.toml": "fa306fa419bdd9f7",
+        "LICENSE": "3972dc9744f6499f",
+        "scripts/make-manifest.sh": "4883c40694dc1312",
+        "src/auth.rs": "29056965369ec0ea",
+        "src/cli.rs": "0ddcc552ed39b702",
+        "src/config.rs": "63399590aac21e95",
+        "src/main.rs": "71c6e865fc5f58a2",
+        "src/provision.rs": "c340749a3c8a1d3a",
+        "src/selfupdate.rs": "3341e1d3f15ff074",
+        "src/signature.rs": "f2d5983d196a7245",
+        "src/url.rs": "27ad1cf4025280af",
+        "tools/sign.rs": "3c572be4942adda8"
       }
     },
     "docs/ARCHITECTURE.md": {
       "doc_hash": "72e73d6201ceb33d",
       "sources": {
+        ".github/workflows/release.yml": "46b93b6215d0805c",
         "Cargo.toml": "fa306fa419bdd9f7",
         "build.rs": "3301704cc0f88c5e",
-        "src/main.rs": "71c6e865fc5f58a2",
-        "src/config.rs": "63399590aac21e95",
         "src/auth.rs": "29056965369ec0ea",
+        "src/config.rs": "63399590aac21e95",
+        "src/main.rs": "71c6e865fc5f58a2",
         "src/provision.rs": "c340749a3c8a1d3a",
         "src/secretstore.rs": "61ce255e4a8bf4b9",
-        "src/signature.rs": "aa330924241fea10",
+        "src/selfupdate.rs": "3341e1d3f15ff074",
+        "src/signature.rs": "f2d5983d196a7245",
         "src/state.rs": "a53e89c3aa1e37ed",
         "src/sync.rs": "c55e3ba34ddbecdc",
         "src/url.rs": "27ad1cf4025280af",
-        "src/version.rs": "6bfa971eabf2a0fe",
-        "src/selfupdate.rs": "3341e1d3f15ff074",
-        ".github/workflows/release.yml": "46b93b6215d0805c"
+        "src/version.rs": "6bfa971eabf2a0fe"
       }
     },
     "docs/FLOW.md": {
       "doc_hash": "6d675bc4824f1e1c",
       "sources": {
-        "src/main.rs": "71c6e865fc5f58a2",
-        "src/config.rs": "63399590aac21e95",
-        "src/auth.rs": "29056965369ec0ea",
-        "src/provision.rs": "c340749a3c8a1d3a",
-        "src/sync.rs": "c55e3ba34ddbecdc",
         "src/archive.rs": "a98d173402f543d6",
+        "src/auth.rs": "29056965369ec0ea",
+        "src/config.rs": "63399590aac21e95",
+        "src/main.rs": "71c6e865fc5f58a2",
+        "src/provision.rs": "c340749a3c8a1d3a",
         "src/remote.rs": "f39d81f266fa479d",
         "src/selfupdate.rs": "3341e1d3f15ff074",
-        "src/signature.rs": "aa330924241fea10",
+        "src/signature.rs": "f2d5983d196a7245",
         "src/state.rs": "a53e89c3aa1e37ed",
+        "src/sync.rs": "c55e3ba34ddbecdc",
         "src/url.rs": "27ad1cf4025280af"
       }
     },
     "docs/API.md": {
       "doc_hash": "397768b70e925aa0",
       "sources": {
-        "src/cli.rs": "0ddcc552ed39b702",
-        "src/main.rs": "71c6e865fc5f58a2",
-        "src/config.rs": "63399590aac21e95",
+        "scripts/make-manifest.sh": "4883c40694dc1312",
         "src/auth.rs": "29056965369ec0ea",
+        "src/cli.rs": "0ddcc552ed39b702",
+        "src/config.rs": "63399590aac21e95",
+        "src/main.rs": "71c6e865fc5f58a2",
+        "src/provision.rs": "c340749a3c8a1d3a",
         "src/remote.rs": "f39d81f266fa479d",
         "src/selfupdate.rs": "3341e1d3f15ff074",
-        "src/signature.rs": "aa330924241fea10",
-        "src/provision.rs": "c340749a3c8a1d3a",
+        "src/signature.rs": "f2d5983d196a7245",
         "src/url.rs": "27ad1cf4025280af",
-        "scripts/make-manifest.sh": "4883c40694dc1312",
         "tools/sign.rs": "3c572be4942adda8"
       }
     },
     "docs/SECURITY.md": {
       "doc_hash": "060c32e2158eac42",
       "sources": {
-        "src/secretstore.rs": "61ce255e4a8bf4b9",
+        ".github/workflows/release.yml": "46b93b6215d0805c",
+        "Cargo.toml": "fa306fa419bdd9f7",
+        "build.rs": "3301704cc0f88c5e",
         "src/archive.rs": "a98d173402f543d6",
         "src/auth.rs": "29056965369ec0ea",
-        "src/selfupdate.rs": "3341e1d3f15ff074",
-        "src/signature.rs": "aa330924241fea10",
         "src/config.rs": "63399590aac21e95",
         "src/provision.rs": "c340749a3c8a1d3a",
         "src/remote.rs": "f39d81f266fa479d",
-        "src/url.rs": "27ad1cf4025280af",
-        "build.rs": "3301704cc0f88c5e",
-        "Cargo.toml": "fa306fa419bdd9f7",
-        ".github/workflows/release.yml": "46b93b6215d0805c"
+        "src/secretstore.rs": "61ce255e4a8bf4b9",
+        "src/selfupdate.rs": "3341e1d3f15ff074",
+        "src/signature.rs": "f2d5983d196a7245",
+        "src/url.rs": "27ad1cf4025280af"
       }
     }
   }

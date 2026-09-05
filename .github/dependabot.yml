@@ -1,0 +1,23 @@
+version: 2
+updates:
+  # Cargo dependencies — ring, ureq, zip, serde, sha2, anyhow, dirs.
+  # Security updates are raised regardless of this schedule.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # serde and serde_json bump together, and the derive feature ties them
+      # to one another; group them so the whole pair resolves in one review.
+      serde:
+        patterns:
+          - "serde*"
+
+  # Keep the GitHub Actions used in CI patched too. release.yml still pins its
+  # actions by tag, and test.yml and dependency-review.yml pin them by SHA;
+  # dependabot updates both forms.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

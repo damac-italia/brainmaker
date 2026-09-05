@@ -1,0 +1,44 @@
+name: test
+
+# Runs the unit tests on every push to master and on every pull request.
+#
+# The tests need no network and no database: every module tests against a
+# temporary directory or an in-memory value. The release workflow builds the
+# five platform binaries; this one only proves that the code is correct.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    # arm64 Linux runners are free for public repositories, and this one is
+    # public. See the linux-arm64 note in release.yml.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Rust toolchain
+        # Pinned to a SHA, so the channel can no longer come from the ref name
+        # (@stable) — select it explicitly via the toolchain input.
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run tests
+        # --features sign also compiles tools/sign.rs, which a plain
+        # `cargo test` skips because the brainmaker-sign binary requires that
+        # feature. The release workflow depends on that tool, so a break in it
+        # must fail here rather than at a release.
+        #
+        # BRAINMAKER_CONFIG_KEY stays unset on purpose: the tests seal and open
+        # their own values with the development key, and the release workflow
+        # is the only place that needs the real one.
+        run: cargo test --workspace --all-targets --locked --features sign
