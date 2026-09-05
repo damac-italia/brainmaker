@@ -249,7 +249,7 @@ builds on its own native runner, so nothing is cross-compiled.
 | Platform key | Runner | Rust target | Linking |
 |---|---|---|---|
 | `darwin-arm64` | `macos-14` | `aarch64-apple-darwin` | dynamic, system libraries |
-| `darwin-x86_64` | `macos-13` | `x86_64-apple-darwin` | dynamic, system libraries |
+| `darwin-x86_64` | `macos-15-intel` | `x86_64-apple-darwin` | dynamic, system libraries |
 | `linux-x86_64` | `ubuntu-22.04` | `x86_64-unknown-linux-musl` | static |
 | `linux-arm64` | `ubuntu-22.04-arm` | `aarch64-unknown-linux-musl` | static |
 | `windows-x86_64` | `windows-2022` | `x86_64-pc-windows-msvc` | dynamic, system libraries |
