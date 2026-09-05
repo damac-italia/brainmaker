@@ -48,7 +48,7 @@ jobs:
             exe: .exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # A build without the key would ship the published development key, and
       # every employee's sealed configuration would be readable with a stock
@@ -131,7 +131,7 @@ jobs:
           echo "$reported"
           test "$reported" = "brainmaker $VERSION"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: brainmaker-${{ matrix.key }}
           path: dist/brainmaker-*
@@ -143,9 +143,9 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: staging
           pattern: brainmaker-*
@@ -215,7 +215,7 @@ jobs:
           # shellcheck disable=SC2086
           ./target/release/brainmaker-sign verify dist/manifest.signed.json $keys
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: brainmaker-release
           path: dist/
