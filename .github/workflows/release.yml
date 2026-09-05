@@ -131,7 +131,7 @@ jobs:
           echo "$reported"
           test "$reported" = "brainmaker $VERSION"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: brainmaker-${{ matrix.key }}
           path: dist/brainmaker-*
@@ -215,7 +215,7 @@ jobs:
           # shellcheck disable=SC2086
           ./target/release/brainmaker-sign verify dist/manifest.signed.json $keys
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: brainmaker-release
           path: dist/
