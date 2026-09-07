@@ -137,7 +137,7 @@ Steps:
 2. [`sync.rs:39`](../src/sync.rs) reads the latest hash. `remote::latest_hash` runs
    `config::validate_hash` on the response, so an out-of-range value fails before it reaches a URL
    or a path.
-3. [`sync.rs:44`](../src/sync.rs) returns `UpToDate` when the local hash matches, `content/` is a
+3. [`sync.rs:46`](../src/sync.rs) returns `UpToDate` when the local hash matches, `content/` is a
    directory, and `--force` was not given. No archive is downloaded.
 4. [`sync.rs:70`](../src/sync.rs) clears `.staging`, `.trash`, and `.download.zip` left by a run
    that failed between steps.
@@ -152,7 +152,7 @@ Steps:
 
 ### The swap and its rollback
 
-[`sync.rs:112`](../src/sync.rs):
+[`sync.rs:131`](../src/sync.rs):
 
 1. Rename `content/` to `.trash/`, when `content/` exists.
 2. Rename `.staging/` to `content/`.
@@ -199,7 +199,7 @@ sequenceDiagram
 Steps:
 
 1. [`selfupdate.rs:118`](../src/selfupdate.rs) reads the envelope, stopping at 1 MiB.
-2. [`selfupdate.rs:127`](../src/selfupdate.rs) checks the Ed25519 signature over the `payload`
+2. [`selfupdate.rs:125`](../src/selfupdate.rs) checks the Ed25519 signature over the `payload`
    bytes, against the keys in `signature::PUBLIC_KEYS`. A manifest that no key accepts stops here,
    so nothing below ever sees it. A build with no key stops here too.
 3. [`selfupdate.rs:130`](../src/selfupdate.rs) parses the verified `payload` into the manifest.
@@ -217,13 +217,13 @@ Steps:
    characters.
 9. [`selfupdate.rs:204`](../src/selfupdate.rs) writes a probe file in the install directory, so a
    permission problem fails in about a second rather than after a large download.
-10. [`selfupdate.rs:208`](../src/selfupdate.rs) downloads to `.brainmaker-update-<pid>`, stopping at
+10. [`selfupdate.rs:198`](../src/selfupdate.rs) downloads to `.brainmaker-update-<pid>`, stopping at
     128 MiB.
 11. [`selfupdate.rs:211`](../src/selfupdate.rs) streams the SHA-256 and compares it to the manifest.
-12. [`selfupdate.rs:220`](../src/selfupdate.rs) runs the staged file with `--version` and requires
+12. [`selfupdate.rs:287`](../src/selfupdate.rs) runs the staged file with `--version` and requires
     the output to contain the manifest version. This catches a build for the wrong architecture and
     a manifest that points at the wrong file.
-13. [`selfupdate.rs:239`](../src/selfupdate.rs) renames the running binary to `.brainmaker-old`,
+13. [`selfupdate.rs:229`](../src/selfupdate.rs) renames the running binary to `.brainmaker-old`,
     then renames the staged file into place. A failure on the second rename restores the old
     binary. A running process keeps its open image, so the swap is safe while `brainmaker` runs.
 14. [`selfupdate.rs:226`](../src/selfupdate.rs) removes the staged file on failure, and removes the

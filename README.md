@@ -53,6 +53,9 @@ gone. Later runs read the sealed copy and need no file.
 | No compiled endpoint | A unit test fails the build if a URL with a host enters `src/config.rs` |
 | TLS-only base URL | Refuses a plain-HTTP base URL, except one whose host is this machine |
 | Signed updates | Refuses a software manifest without an Ed25519 signature from a compiled-in key |
+| Signed content | Refuses a content release that no key in `CONTENT_KEYS` signed, and checks the archive digest before it extracts |
+| Two key lists | Content and software verify against separate lists, so a content signer cannot sign a manifest |
+| Claude bridge | `link` puts the shared skills and the session briefing into `~/.claude`, for every project |
 | Self-update | Verifies the SHA-256 and the `--version` output before it swaps the binary |
 | Static Linux builds | `x86_64` and `arm64` link against musl, so there is no glibc version floor |
 
@@ -73,8 +76,9 @@ brainmaker status
 ```
 
 `status` prints the root, the store path, the settings source, the API base, the token URL, the
-credential lengths, the key class, the number of trusted signing keys, the installed hash, the
-latest hash, the platform key, and the published version. It changes nothing.
+credential lengths, the key class, the number of trusted software keys, the number of trusted
+content keys, the installed hash, the latest hash, the platform key, and the published version. It
+changes nothing.
 
 ### Replace the binary
 
@@ -85,6 +89,33 @@ brainmaker self-update
 `self-update` installs only a manifest signed by a key in `PUBLIC_KEYS` in
 [src/signature.rs](src/signature.rs). A build with an empty list installs nothing, and
 `brainmaker status` reports `signing   0 trusted key(s)`. See [Signing keys](#signing-keys).
+
+`sync` applies the same rule to the content, against `CONTENT_KEYS`. A release that no listed key
+signed stops before the archive is extracted, and the archive's SHA-256 and size are checked
+against the signed values first.
+
+### Let Claude read the content in every session
+
+```bash
+brainmaker link
+```
+
+The content ships its own `.claude` directory, and Claude reads a project's `.claude` only when
+that project is open. `link` bridges it to user scope, so it applies everywhere:
+
+- One symbolic link per shipped skill, under `~/.claude/skills`.
+- A `SessionStart` hook in `~/.claude/settings.json` that runs `sync`, then `session-context`.
+- A marked block in `~/.claude/CLAUDE.md` naming the content directory.
+
+`session-context` prints the JSON that hook returns: the shared briefing and the working notes, each
+file capped so one growing file cannot crowd out the rest. It is registered by `link` and is not
+meant to be run by hand.
+
+`brainmaker unlink` removes all three. Both commands are idempotent, and neither touches a file it
+did not write: a skill name that already exists as a real directory is reported and skipped.
+
+`link` installs only the `SessionStart` hook. The content's other hooks are written for the vault
+as a project, and at user scope they would run on every tool call in every project.
 
 ### Run it at the start of every Claude session
 
@@ -278,6 +309,32 @@ To rotate the key, generate a new pair, put the new public key **first** in `PUB
 old one, and release. Remove the old key only once every client runs a binary that holds the new
 one. A manifest verifies when any listed key accepts it.
 
+#### The content key is a second, separate key
+
+Content carries a signature too, and it verifies against `CONTENT_KEYS` rather than `PUBLIC_KEYS`.
+Generate it the same way, and put the public half in that second list:
+
+```bash
+cargo run --features sign --bin brainmaker-sign -- keygen content-signing.key
+```
+
+The two lists exist so that one capability is not the other. The software key signs what replaces
+the running executable, and it stays off every server. The content key signs what lands in
+`content/`, so whoever publishes content holds it — a deploy host, in practice. With one shared
+list, that host could sign a software manifest and replace every binary in the fleet. A unit test
+fails the build if a key ever appears in both lists.
+
+Sign an archive after it is built, and publish the envelope with it:
+
+```bash
+cargo run --features sign --bin brainmaker-sign -- \
+  sign-content content-signing.key content.zip <hash> latest.json
+```
+
+`brainmaker-sign verify` accepts either shape and names which one it read, so the same command
+checks a manifest and a content release. The release also publishes
+`brainmaker-sign-<version>-linux-x86_64`, so a deploy host can sign without a Rust toolchain.
+
 ### Repository settings the workflow needs
 
 | Kind | Name | Purpose |
@@ -286,7 +343,9 @@ one. A manifest verifies when any listed key accepts it.
 | Secret | `BRAINMAKER_SIGNING_KEY` | Signs the software manifest. The manifest job fails without it. |
 
 The build job also fails when `PUBLIC_KEYS` in `src/signature.rs` is empty, because such a binary
-could never install an update.
+could never install an update, and when `CONTENT_KEYS` is empty, because such a binary could never
+install content. The manifest job verifies the signed manifest against `PUBLIC_KEYS` alone, so a
+manifest signed with the content key cannot pass that check.
 
 The workflow takes no URL as input, and it publishes none. The manifest carries a version and one
 SHA-256 per platform. Each client derives the download address from the base URL and the routes in
@@ -363,10 +422,10 @@ against glibc, so it will not run on an older distribution.
 <summary>Directory layout</summary>
 
 ```text
-src/                     the crate, one module per concern (14 files)
+src/                     the crate, one module per concern (16 files)
 tools/                   sign.rs, the signing tool; builds only under the sign feature
 scripts/                 make-manifest.sh, which writes the software manifest
-.github/workflows/       release.yml, the five-platform build
+.github/workflows/       release.yml, plus the test and dependency-review checks
 build.rs                 declares the BRAINMAKER_CONFIG_KEY rebuild dependency
 docs/                    architecture, flow, API, and security documents
 ```
@@ -382,7 +441,7 @@ cargo clippy --all-targets --features sign
 cargo fmt --check
 ```
 
-The test suite is 106 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
+The test suite is 138 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
 `--features sign` to clippy so that the signing tool is linted too; a plain `cargo build` skips it.
 
 A local `cargo build` uses the development key, so a locally built binary cannot open a store

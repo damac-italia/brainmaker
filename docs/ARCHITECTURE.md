@@ -1,6 +1,6 @@
 # Architecture
 
-`brainmaker` is one Rust binary with fourteen modules. It has no background process, no plugin
+`brainmaker` is one Rust binary with sixteen modules. It has no background process, no plugin
 system, and no local database. One invocation loads settings, gets one access token, makes at most
 three further HTTP requests, writes the filesystem, and exits.
 
@@ -18,12 +18,14 @@ under the `sign` feature and never ships.
 | [`src/url.rs`](../src/url.rs) | URL origin parsing, and the rule that a base URL must use TLS | none |
 | [`src/provision.rs`](../src/provision.rs) | Provisioning file discovery, parsing, validation | `url` |
 | [`src/secretstore.rs`](../src/secretstore.rs) | Seal and open the stored settings, restrict file modes | `ring`, `dirs` |
-| [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, and streamed download to a file | `auth`, `config`, `ureq` |
-| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `remote`, `state` |
+| [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, and the signed content release | `auth`, `config`, `digest`, `signature`, `ureq` |
+| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `digest`, `remote`, `state` |
 | [`src/archive.rs`](../src/archive.rs) | Zip extraction and its safety checks | `config`, `zip` |
 | [`src/state.rs`](../src/state.rs) | `state.json` read and atomic write | `serde_json` |
-| [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `remote`, `signature`, `version`, `sha2` |
-| [`src/signature.rs`](../src/signature.rs) | Ed25519 check of the manifest, and the trusted public keys | `ring` |
+| [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `remote`, `signature`, `version` |
+| [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `ring` |
+| [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `sha2` |
+| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, and the session context | `config`, `dirs`, `serde_json` |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
 
 ## Module graph
@@ -205,6 +207,42 @@ so the comparison has nothing left to reject.
 
 The tradeoffs: the served file names must match the configured route, and moving the binaries to a
 different path means issuing a new provisioning file rather than editing one manifest.
+
+### The content key and the software key are two separate lists
+
+`PUBLIC_KEYS` verifies a software manifest. `CONTENT_KEYS` verifies a content release. Both live in
+[`src/signature.rs`](../src/signature.rs), and both are checked by the same `verify_with`.
+
+They are separate because they protect different things and are held by different people. The
+software key signs what replaces the running executable, so it stays off every server and reaches
+CI only as a repository secret. The content key signs what lands in `content/`, which changes
+whenever the shared vault does, so whoever publishes content must hold it — a deploy host, in
+practice.
+
+One list would collapse those into a single capability: the machine that publishes a note could
+sign a manifest and replace every binary in the fleet. A unit test fails the build if a key ever
+appears in both lists, and the release workflow reads each block on its own so that a manifest
+signed with the content key cannot pass the manifest check.
+
+The tradeoff: two keys to generate, two to rotate, and two ways for a build to be inert. A build
+with an empty `PUBLIC_KEYS` installs no update; one with an empty `CONTENT_KEYS` installs no
+content. Both fail closed, and `brainmaker status` prints each count.
+
+### The content archive is checked before it is extracted
+
+`sync` reads `content/latest` as the envelope the software manifest already uses, verifies the
+signature over the served bytes, and takes the hash from the signed payload rather than from the
+unsigned field beside it. A server therefore cannot point a client at one archive while signing
+another.
+
+After the download, the size and the SHA-256 are compared against the signed values before
+`archive::extract` opens the file. The extractor's own rules — no escaping path, no symbolic link,
+a cap per entry and per archive — still apply, but they now guard content that a trusted key
+already vouched for rather than content that only TLS vouched for.
+
+This matters more than it would for inert data. The content ships a `.claude` directory whose
+hooks `link` registers, so an archive that reached a machine unchecked would be code that runs at
+every session start.
 
 ### The stored settings are bound to the machine
 

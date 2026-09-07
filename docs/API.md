@@ -16,6 +16,9 @@ brainmaker [COMMAND] [OPTIONS]
 | `sync` | Update the content when the server has a newer version. The default when no command is given. | `content/`, `state.json` |
 | `status` | Print the installed hash, the latest hash, and both software versions | nothing |
 | `self-update` | Replace this binary with the newest build for this platform | the binary |
+| `link` | Bridge the synced content into `~/.claude` | `~/.claude/skills`, `settings.json`, `CLAUDE.md` |
+| `unlink` | Remove what `link` wrote, and nothing else | the same three |
+| `session-context` | Print the `SessionStart` JSON the linked hook returns | nothing |
 
 The parser accepts one command. A second command is an error, and so is any unrecognised argument.
 
@@ -30,11 +33,12 @@ The parser accepts one command. A second command is an error, and so is any unre
 | `--keep-config` | none | all | Do not remove the provisioning file after the import |
 | `--dir` | `<PATH>` | all | Use `PATH` as the root instead of `~/.brainmaker` |
 | `--url` | `<URL>` | all | Use `URL` as the API base |
+| `--claude-dir` | `<PATH>` | `link`, `unlink` | Write to `PATH` instead of `~/.claude` |
 | `-q`, `--quiet` | none | all | Print errors only |
 | `-h`, `--help` | none | — | Print the help text and exit 0 |
 | `-V`, `--version` | none | — | Print `brainmaker <version>` and exit 0 |
 
-`--config`, `--dir`, and `--url` fail when their value is absent.
+`--config`, `--dir`, `--url`, and `--claude-dir` fail when their value is absent.
 
 ### Exit codes
 
@@ -61,7 +65,8 @@ already in place. `--quiet` suppresses that notice.
 | `token url` | The token endpoint in use, or `<none>` |
 | `auth` | `absent`, or `client-credentials grant, scope sync, client id N characters, secret N characters`. Never a credential itself. |
 | `key` | `release` or `development`, naming which build key this binary carries |
-| `signing` | How many manifest signing keys this binary trusts. `0` means it installs no update. |
+| `signing` | How many software signing keys this binary trusts. `0` means it installs no update. |
+| `content` | How many content signing keys this binary trusts. `0` means it installs no content. This key repeats the label of the content directory row above; both are printed. |
 | `installed` | The hash in `state.json`, or `<none>` |
 | `present` | `yes` when `content/` is a directory |
 | `latest` | The hash the server reports |
@@ -70,6 +75,33 @@ already in place. `--quiet` suppresses that notice.
 | `platform` | This machine's manifest key, for example `darwin-arm64` |
 | `published` | The manifest version, or `<unknown>` |
 | `update` | `none`, `available; run brainmaker self-update`, or a reason |
+
+### `session-context` output
+
+One JSON object on `stdout`, in the shape a Claude `SessionStart` hook returns:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart",
+    "additionalContext": "# Shared content, synced by brainmaker\n\n..."
+  }
+}
+```
+
+The context carries these files from the content directory, each capped on its own so that one
+growing file cannot crowd out the rest. A missing or empty file is skipped, and a cut is announced
+in the text with the path to read for the rest.
+
+| File | Cap |
+|---|---|
+| `CLAUDE.md` | 24 KiB |
+| `wiki/hot.md` | 8 KiB |
+| `agent-memory/OPEN-THREADS.md` | 8 KiB |
+| `agent-memory/PREFERENCES.md` | 8 KiB |
+
+With no content, or with every file empty, the command prints `{}` and the session is unchanged.
+The command always prints, even under `--quiet`, because the hook reads its `stdout`.
 
 ## HTTP routes the server must serve
 
@@ -135,15 +167,35 @@ stands. Either way the text is collapsed onto one line and stops at 200 characte
 
 ### `GET {base}/{latest hash route}`
 
-Returns the hash of the current content.
+Returns the signed description of the current content.
 
 ```json
-{ "hash": "a1b2c3d4" }
+{
+  "hash": "a1b2c3d4",
+  "payload": "{\"hash\":\"a1b2c3d4\",\"sha256\":\"<64 hex>\",\"size_bytes\":1152430}",
+  "signature": "<128 hex>"
+}
 ```
 
 | Field | Rule |
 |---|---|
-| `hash` | Exactly 8 ASCII alphanumeric characters. Any other value fails the run. |
+| `hash` | Exactly 8 ASCII alphanumeric characters. The client ignores it and reads the hash inside `payload`. |
+| `payload` | Required. The signed document, byte for byte. |
+| `signature` | Required. Ed25519 over the `payload` bytes, as 128 hexadecimal characters. |
+
+The client verifies `signature` over `payload` against `CONTENT_KEYS` before it parses anything,
+then reads these fields from the payload:
+
+| Field | Rule |
+|---|---|
+| `hash` | Exactly 8 ASCII alphanumeric characters. |
+| `sha256` | 64 hexadecimal characters, the digest of the archive. |
+| `size_bytes` | Above 0 and at or below 512 MiB. |
+
+A response with no `payload` or no `signature` fails the run. The bare `hash` is kept beside them
+so a client older than the signing change keeps working, which is what lets a deployment publish
+signatures before its fleet updates. The payload carries no URL: the client derives the download
+address from its own base URL, so a signed document cannot move the download to another host.
 
 The response body is read up to 1 MiB. Serve this route with `Cache-Control: no-store`; a cached
 response makes the client skip an update that is already published.
@@ -300,6 +352,7 @@ cargo build --features sign --bin brainmaker-sign
 |---|---|
 | `keygen <KEY-FILE>` | Write a new PKCS#8 Ed25519 key with mode `0600`, and print its public key. Fails when the file exists. |
 | `sign <KEY-FILE\|-> <MANIFEST-FILE> <ENVELOPE-FILE>` | Check the manifest, sign it, and write the envelope |
+| `sign-content <KEY-FILE\|-> <ARCHIVE> <HASH> <ENVELOPE-FILE>` | Digest the archive, sign `hash`, `sha256` and `size_bytes`, and write the envelope |
 | `verify <ENVELOPE-FILE> <PUBLIC-KEY>...` | Check an envelope against one or more public keys, the way `brainmaker` checks it |
 
 Pass `-` in place of the key file to read the key from `$BRAINMAKER_SIGNING_KEY` as hexadecimal.
@@ -309,4 +362,12 @@ The release workflow uses that form, so the private key never reaches the runner
 `version` is empty or longer than 64 characters, one with no platform, or one whose `sha256` is not
 64 hexadecimal characters.
 
-Both commands exit 0 on success and 1 on failure.
+`sign-content` refuses a hash that is not 8 alphanumeric ASCII characters, and an empty archive. It
+signs no URL, because the client derives the download address itself.
+
+`verify` accepts either shape and names which it read. It tells them apart by field: a payload with
+`platforms` is a software manifest, and one with `sha256` is a content release. Neither list of keys
+is implied — pass the keys from `PUBLIC_KEYS` to check a manifest, and those from `CONTENT_KEYS` to
+check a content release, because `verify` passes when any key given accepts.
+
+Every command exits 0 on success and 1 on failure.

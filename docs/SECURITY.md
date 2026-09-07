@@ -193,6 +193,51 @@ continues with the entries that pass.
 The download address is not a control that can fail: `Config::binary_url` derives it from the base
 URL in the provisioning file, so a manifest cannot name another host at all.
 
+### Content install
+
+`sync` applies the same shape of control the software path uses, in this order:
+
+1. The content release must carry an Ed25519 signature from a key in `CONTENT_KEYS`. The check runs
+   over the served bytes, before any parse. A build whose content list is empty refuses every
+   release.
+2. The hash comes from the signed payload, never from the unsigned `hash` beside it, so a server
+   cannot name one archive while signing another.
+3. The signed size must be above 0 and at or below the archive cap.
+4. The downloaded file must match the signed size and the signed SHA-256. Both are checked before
+   `archive::extract` opens the file.
+5. Extraction then applies its own rules, and only then does the directory swap run.
+
+The signature moves the trust anchor off the API host, as it does for the software manifest: the
+host, any proxy in front of it, and the blob store behind it can all serve altered bytes and be
+caught. It does not protect against whoever holds the content signing key.
+
+### Two signing keys, held by different parties
+
+`PUBLIC_KEYS` verifies a software manifest. `CONTENT_KEYS` verifies a content release. A key in one
+list cannot sign for the other, and a unit test fails the build if a key appears in both.
+
+The separation is what makes it acceptable for a deploy host to hold a signing key at all. Content
+changes whenever the shared material does, so publishing must be automatic, so the key must sit on
+the machine that publishes. A single list would make that machine able to sign a software manifest
+and replace every binary in the fleet. With two, a compromise there yields what the publish scope
+already yields, and no more.
+
+The release workflow reads each block on its own for the same reason. A single grep over the file
+would collect both lists, and verification passes when any key given accepts — so a manifest signed
+with the content key would have passed the check that exists to catch exactly that.
+
+### Content is code, once it is linked
+
+`brainmaker link` registers a `SessionStart` hook and links the content's skills into `~/.claude`.
+The content directory therefore holds files that Claude reads as instructions on every session, and
+the archive's permission bits are applied on extraction, so a shipped script arrives executable.
+
+Whoever can publish content decides what runs on every machine that synced it. Two controls narrow
+that. The signature means only the content key holder can publish, not merely anyone who reaches
+the API host. And `link` installs the `SessionStart` hook alone: the content's `PreToolUse`,
+`PostToolUse`, `PreCompact` and `Stop` hooks stay project-scoped, because at user scope they would
+run on every tool call in every project on the machine.
+
 ### Size caps
 
 | Input | Cap |
