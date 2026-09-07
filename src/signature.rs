@@ -57,14 +57,39 @@ pub const PUBLIC_KEYS: &[&str] = &[
     "ce8e1071de31dc8df324a296bdcca1beebabfc17f9f2b2d9a1f874b7bc45a2e7",
 ];
 
-/// Number of signing keys this binary trusts. `status` prints it.
+/// Keys that may sign a content release, newest first.
+///
+/// A separate list from [`PUBLIC_KEYS`] on purpose. The software key signs what
+/// replaces the running executable, and it lives off every server. The content
+/// key signs what lands in `content/`, and whoever publishes content holds it —
+/// today that is the deploy host. One shared list would let the holder of the
+/// content key sign a software manifest, and then publishing content and
+/// replacing every binary would be the same capability.
+///
+/// An empty list means this build installs no content, the same way an empty
+/// [`PUBLIC_KEYS`] installs no update.
+#[rustfmt::skip]
+pub const CONTENT_KEYS: &[&str] = &[
+];
+
+/// Number of software signing keys this binary trusts. `status` prints it.
 pub fn key_count() -> usize {
     PUBLIC_KEYS.len()
 }
 
-/// Checks `signature` against `payload`, using the compiled-in keys.
+/// Number of content signing keys this binary trusts. `status` prints it.
+pub fn content_key_count() -> usize {
+    CONTENT_KEYS.len()
+}
+
+/// Checks `signature` against `payload`, using the software keys.
 pub fn verify(payload: &[u8], signature: &str) -> Result<()> {
-    verify_with(PUBLIC_KEYS, payload, signature)
+    verify_with(PUBLIC_KEYS, payload, signature).context("the software manifest")
+}
+
+/// Checks `signature` against `payload`, using the content keys.
+pub fn verify_content(payload: &[u8], signature: &str) -> Result<()> {
+    verify_with(CONTENT_KEYS, payload, signature).context("the content release")
 }
 
 /// Checks `signature` against `payload`, using `keys`.
@@ -74,18 +99,18 @@ pub fn verify(payload: &[u8], signature: &str) -> Result<()> {
 fn verify_with(keys: &[&str], payload: &[u8], signature: &str) -> Result<()> {
     if keys.is_empty() {
         bail!(
-            "this build trusts no manifest signing key, so it cannot check the software \
-             manifest and will install no update. Add the public key to PUBLIC_KEYS in \
+            "this build trusts no signing key for this document, so it cannot check it and \
+             will install nothing. Add the public key to PUBLIC_KEYS or CONTENT_KEYS in \
              src/signature.rs and build again."
         );
     }
 
     let signature_bytes = decode_hex(signature.trim(), SIGNATURE_LEN)
-        .context("the software manifest carries a malformed signature")?;
+        .context("the document carries a malformed signature")?;
 
     for (index, key) in keys.iter().enumerate() {
         let key_bytes = decode_hex(key.trim(), PUBLIC_KEY_LEN).with_context(|| {
-            format!("PUBLIC_KEYS entry {index} in src/signature.rs is not a usable public key")
+            format!("compiled-in key {index} in src/signature.rs is not a usable public key")
         })?;
 
         let public_key = UnparsedPublicKey::new(&signature::ED25519, key_bytes);
@@ -95,7 +120,7 @@ fn verify_with(keys: &[&str], payload: &[u8], signature: &str) -> Result<()> {
     }
 
     bail!(
-        "the software manifest carries no signature from a key this binary trusts. \
+        "it carries no signature from a key this binary trusts. \
          Another key signed it, or something altered it after it was signed."
     )
 }
@@ -235,7 +260,29 @@ mod tests {
         let error = verify_with(&["not a key"], b"payload", &"a".repeat(128))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("PUBLIC_KEYS entry 0"), "got {error}");
+        assert!(error.contains("compiled-in key 0"), "got {error}");
+    }
+
+    #[test]
+    fn the_two_key_lists_share_no_key() {
+        // A key in both lists would let whoever signs content sign a software
+        // manifest, and publishing content would become the power to replace
+        // every binary on every machine.
+        for key in CONTENT_KEYS {
+            assert!(
+                !PUBLIC_KEYS.contains(key),
+                "{key} signs both content and software"
+            );
+        }
+    }
+
+    #[test]
+    fn content_verification_uses_the_content_list() {
+        // With no content key compiled in, a content release cannot verify,
+        // whatever the software list holds.
+        if CONTENT_KEYS.is_empty() {
+            assert!(verify_content(b"payload", &"a".repeat(128)).is_err());
+        }
     }
 
     #[test]
@@ -243,10 +290,8 @@ mod tests {
         let error = verify_with(&[], b"payload", &"a".repeat(128))
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("trusts no manifest signing key"),
-            "got {error}"
-        );
+        assert!(error.contains("trusts no signing key"), "got {error}");
+        assert!(error.contains("CONTENT_KEYS"), "got {error}");
     }
 
     #[test]

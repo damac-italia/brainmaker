@@ -82,7 +82,7 @@ pub fn latest_release(config: &Config) -> Result<ContentRelease> {
         );
     };
 
-    crate::signature::verify(payload.as_bytes(), &signature)
+    crate::signature::verify_content(payload.as_bytes(), &signature)
         .with_context(|| format!("cannot trust the content release from {url}"))?;
 
     let release: ContentRelease = serde_json::from_str(&payload)

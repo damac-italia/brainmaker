@@ -151,6 +151,10 @@ fn status(config: &Config) -> Result<()> {
     println!("key       {}", secretstore::key_class());
     println!("signing   {} trusted key(s)", signature::key_count());
     println!(
+        "content   {} trusted key(s)",
+        signature::content_key_count()
+    );
+    println!(
         "installed {}",
         installed
             .as_ref()
