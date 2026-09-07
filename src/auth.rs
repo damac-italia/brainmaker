@@ -153,12 +153,19 @@ fn request_token(credentials: &Credentials, url: &str) -> Result<(String, Durati
         .send_form([("grant_type", "client_credentials"), ("scope", SCOPE)])
         .map_err(describe)?;
 
+    // Read the body before the status is judged: an OAuth2 failure carries its
+    // reason in the body, and the agent hands a non-2xx response over intact.
+    let status = response.status();
     let body = response
         .body_mut()
         .with_config()
         .limit(MAX_RESPONSE_BYTES)
         .read_to_string()
         .context("cannot read the token response body")?;
+
+    if !status.is_success() {
+        return Err(reject(status.as_u16(), &body));
+    }
 
     let parsed: TokenResponse = serde_json::from_str(&body)
         .context("the token endpoint did not return the expected JSON object")?;
@@ -203,33 +210,44 @@ fn check_token(token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Turns a ureq error from the token endpoint into a message that names the
-/// cause.
-fn describe(error: ureq::Error) -> anyhow::Error {
-    match error {
-        ureq::Error::StatusCode(400) | ureq::Error::StatusCode(401) => anyhow::anyhow!(
-            "the token endpoint rejected the client credentials with HTTP {}; \
+/// Turns a non-2xx token response into a message that names the cause.
+///
+/// An OAuth2 endpoint answers a failure as `{"error": "invalid_client"}`, and
+/// it may add an `error_description`. That body says which half of the
+/// credential the server objected to, so it is appended to the guidance.
+fn reject(code: u16, body: &str) -> anyhow::Error {
+    let headline = match code {
+        400 | 401 => format!(
+            "the token endpoint rejected the client credentials with HTTP {code}; \
              check {} and {}, and check that the client may ask for the scope {SCOPE}",
-            status_of(&error),
             crate::config::CLIENT_ID_ENV,
             crate::config::CLIENT_SECRET_ENV
         ),
-        ureq::Error::StatusCode(404) => anyhow::anyhow!(
+        404 => format!(
             "the token endpoint returned HTTP 404 Not Found; check {} and {}",
             crate::config::JWT_ENDPOINT_ENV,
             crate::provision::KEY_TOKEN_PATH
         ),
+        _ => format!("the token endpoint returned HTTP {code}"),
+    };
+
+    match remote::message_from_body(body) {
+        Some(message) => anyhow::anyhow!("{headline}: {message}"),
+        None => anyhow::anyhow!("{headline}"),
+    }
+}
+
+/// Turns a ureq error from the token endpoint into a message that names the
+/// cause.
+///
+/// A status no longer reaches here: the agent takes one as a value, and
+/// [`reject`] reports it. What is left is a transport failure.
+fn describe(error: ureq::Error) -> anyhow::Error {
+    match error {
         ureq::Error::StatusCode(code) => anyhow::anyhow!("the token endpoint returned HTTP {code}"),
         ureq::Error::Timeout(_) => anyhow::anyhow!("the token request timed out"),
         ureq::Error::HostNotFound => anyhow::anyhow!("cannot resolve the token endpoint host name"),
         other => anyhow::anyhow!(other),
-    }
-}
-
-fn status_of(error: &ureq::Error) -> u16 {
-    match error {
-        ureq::Error::StatusCode(code) => *code,
-        _ => 0,
     }
 }
 
