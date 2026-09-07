@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "head": "cae6929",
+  "head": "93508f3",
   "docs": {
     "README.md": {
       "doc_hash": "f5ebeab32cb2bbf2",
@@ -10,7 +10,7 @@
         "Cargo.toml": "fa306fa419bdd9f7",
         "LICENSE": "3972dc9744f6499f",
         "scripts/make-manifest.sh": "4883c40694dc1312",
-        "src/auth.rs": "29056965369ec0ea",
+        "src/auth.rs": "8e416ad13a11af97",
         "src/cli.rs": "0ddcc552ed39b702",
         "src/config.rs": "63399590aac21e95",
         "src/main.rs": "71c6e865fc5f58a2",
@@ -27,7 +27,7 @@
         ".github/workflows/release.yml": "d42ce6d184ef165b",
         "Cargo.toml": "fa306fa419bdd9f7",
         "build.rs": "3301704cc0f88c5e",
-        "src/auth.rs": "29056965369ec0ea",
+        "src/auth.rs": "8e416ad13a11af97",
         "src/config.rs": "63399590aac21e95",
         "src/main.rs": "71c6e865fc5f58a2",
         "src/provision.rs": "c340749a3c8a1d3a",
@@ -41,14 +41,14 @@
       }
     },
     "docs/FLOW.md": {
-      "doc_hash": "6d675bc4824f1e1c",
+      "doc_hash": "fdd28b7f468bc714",
       "sources": {
         "src/archive.rs": "a98d173402f543d6",
-        "src/auth.rs": "29056965369ec0ea",
+        "src/auth.rs": "8e416ad13a11af97",
         "src/config.rs": "63399590aac21e95",
         "src/main.rs": "71c6e865fc5f58a2",
         "src/provision.rs": "c340749a3c8a1d3a",
-        "src/remote.rs": "f39d81f266fa479d",
+        "src/remote.rs": "860fb03a09b9bff3",
         "src/selfupdate.rs": "3341e1d3f15ff074",
         "src/signature.rs": "f2d5983d196a7245",
         "src/state.rs": "a53e89c3aa1e37ed",
@@ -57,15 +57,15 @@
       }
     },
     "docs/API.md": {
-      "doc_hash": "397768b70e925aa0",
+      "doc_hash": "11c35803746b94d6",
       "sources": {
         "scripts/make-manifest.sh": "4883c40694dc1312",
-        "src/auth.rs": "29056965369ec0ea",
+        "src/auth.rs": "8e416ad13a11af97",
         "src/cli.rs": "0ddcc552ed39b702",
         "src/config.rs": "63399590aac21e95",
         "src/main.rs": "71c6e865fc5f58a2",
         "src/provision.rs": "c340749a3c8a1d3a",
-        "src/remote.rs": "f39d81f266fa479d",
+        "src/remote.rs": "860fb03a09b9bff3",
         "src/selfupdate.rs": "3341e1d3f15ff074",
         "src/signature.rs": "f2d5983d196a7245",
         "src/url.rs": "27ad1cf4025280af",
@@ -79,10 +79,10 @@
         "Cargo.toml": "fa306fa419bdd9f7",
         "build.rs": "3301704cc0f88c5e",
         "src/archive.rs": "a98d173402f543d6",
-        "src/auth.rs": "29056965369ec0ea",
+        "src/auth.rs": "8e416ad13a11af97",
         "src/config.rs": "63399590aac21e95",
         "src/provision.rs": "c340749a3c8a1d3a",
-        "src/remote.rs": "f39d81f266fa479d",
+        "src/remote.rs": "860fb03a09b9bff3",
         "src/secretstore.rs": "4855746c677a7b49",
         "src/selfupdate.rs": "3341e1d3f15ff074",
         "src/signature.rs": "f2d5983d196a7245",

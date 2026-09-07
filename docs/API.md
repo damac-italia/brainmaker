@@ -128,6 +128,11 @@ issues a 10-minute token serves one token request per run.
 | 404 | `the token endpoint returned HTTP 404 Not Found; check SWETSI_JWT_ENDPOINT and SWETSI_TOKEN_PATH` |
 | other | `the token endpoint returned HTTP <code>` |
 
+Each message ends with the message the endpoint itself returned, after a colon. An OAuth2 endpoint
+answers `{"error": "invalid_client"}`, and it may add an `error_description`; the client prints the
+pair as `invalid_client: <description>`. A body that is not that JSON object is printed as it
+stands. Either way the text is collapsed onto one line and stops at 200 characters.
+
 ### `GET {base}/{latest hash route}`
 
 Returns the hash of the current content.
@@ -221,6 +226,13 @@ with `--version` before it swaps.
 | other | `the server returned HTTP <code>` |
 | timeout | `the request timed out` |
 | DNS failure | `cannot resolve the host name` |
+
+Every status message ends with the message the server itself returned, after a colon. A server that
+answers `{"error": "..."}` contributes that string, so an empty deployment reads
+`the server returned HTTP 404 Not Found: no content release is published` rather than the status
+alone. A body that is not that JSON object is printed as it stands, which keeps a proxy's own page
+readable. Either way the text is collapsed onto one line and stops at 200 characters. The two
+transport rows carry no such message, because no response arrived.
 
 ## Provisioning file format
 
