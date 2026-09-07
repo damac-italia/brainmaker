@@ -15,9 +15,11 @@
 //! # What it writes
 //!
 //! 1. One symbolic link per shipped skill, under `~/.claude/skills`.
-//! 2. A `SessionStart` hook in `~/.claude/settings.json`, which runs
-//!    `brainmaker sync --quiet --no-update-check` and then
-//!    `brainmaker session-context`.
+//! 2. A copy of this binary at `<root>/bin/brainmaker`, and a `SessionStart`
+//!    hook in `~/.claude/settings.json` that runs it by that full path, first
+//!    `sync --quiet --no-update-check` and then `session-context`. The copy
+//!    exists because nothing puts the binary on `PATH`, and because the
+//!    archive it was unzipped from is meant to be deleted.
 //! 3. A marked block in `~/.claude/CLAUDE.md` that names the content
 //!    directory.
 //!
@@ -118,7 +120,8 @@ pub fn link(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Report
 
     let mut report = Report::default();
     link_skills(&content, claude, &mut report)?;
-    report.settings_changed = write_settings(claude, true)?;
+    let program = install_program(config)?;
+    report.settings_changed = write_settings(claude, Some(&program), Some(config.root()))?;
     report.briefing_changed = write_briefing(&content, claude, true)?;
     describe(&report, true, log);
     Ok(report)
@@ -129,7 +132,7 @@ pub fn unlink(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Repo
     let content = config.content_dir();
     let mut report = Report::default();
     unlink_skills(&content, claude, &mut report)?;
-    report.settings_changed = write_settings(claude, false)?;
+    report.settings_changed = write_settings(claude, None, None)?;
     report.briefing_changed = write_briefing(&content, claude, false)?;
     describe(&report, false, log);
     Ok(report)
@@ -212,6 +215,65 @@ fn floor_char_boundary(text: &str, limit: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+/// Puts the running binary where the hook can still find it, and returns that
+/// path.
+///
+/// The hook cannot name the binary by its bare name: nothing puts `brainmaker`
+/// on `PATH`, and a shell then answers `brainmaker: command not found` at every
+/// session start. Naming the running executable's own path is not enough
+/// either, because that path is wherever the archive was unzipped — a Downloads
+/// folder that the install instructions tell the reader to delete.
+///
+/// So the binary is copied under the brainmaker root, which is the one
+/// directory that outlives the archive, and the hook names that copy. A binary
+/// already living there is left alone, so `self-update` keeps working on the
+/// copy the hook runs.
+fn install_program(config: &Config) -> Result<PathBuf> {
+    let target = config.root().join("bin").join(program_name());
+    let current = std::env::current_exe().context("cannot find this program's own path")?;
+
+    if current == target {
+        return Ok(target);
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    // Remove first: copying onto a running binary fails with ETXTBSY on some
+    // systems, and a rename over it would leave the old inode running.
+    let _ = fs::remove_file(&target);
+    fs::copy(&current, &target)
+        .with_context(|| format!("cannot copy {} to {}", current.display(), target.display()))?;
+    set_executable(&target)?;
+    Ok(target)
+}
+
+/// The file name the copied binary takes.
+fn program_name() -> &'static str {
+    if cfg!(windows) {
+        "brainmaker.exe"
+    } else {
+        "brainmaker"
+    }
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut mode = fs::metadata(path)
+        .with_context(|| format!("cannot read {}", path.display()))?
+        .permissions();
+    mode.set_mode(0o755);
+    fs::set_permissions(path, mode)
+        .with_context(|| format!("cannot set the mode on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Links every shipped skill into `~/.claude/skills`.
@@ -319,7 +381,11 @@ fn make_symlink(source: &Path, target: &Path) -> Result<()> {
 }
 
 /// Adds or removes the `SessionStart` hook. Returns true when the file changed.
-fn write_settings(claude: &Path, install: bool) -> Result<bool> {
+fn write_settings(
+    claude: &Path,
+    program: Option<&Path>,
+    brainmaker_root: Option<&Path>,
+) -> Result<bool> {
     let path = claude.join("settings.json");
     let mut root: Map<String, Value> = if path.is_file() {
         let text =
@@ -348,17 +414,26 @@ fn write_settings(claude: &Path, install: bool) -> Result<bool> {
         }
     }
 
-    if install {
+    if let Some(program) = program {
+        // The full path, quoted: nothing puts this binary on PATH, and a home
+        // directory may hold a space.
+        let exe = format!("{:?}", program.display().to_string());
+        // Name the root too. Without it the hook takes the default root, which
+        // is the wrong one whenever `link` ran with `--dir`.
+        let dir = match brainmaker_root {
+            Some(path) => format!(" --dir {:?}", path.display().to_string()),
+            None => String::new(),
+        };
         let group = json!({
             "hooks": [
                 {
                     "type": "command",
-                    "command": format!("brainmaker sync --quiet --no-update-check # {MARKER}"),
+                    "command": format!("{exe}{dir} sync --quiet --no-update-check # {MARKER}"),
                     "timeout": 60
                 },
                 {
                     "type": "command",
-                    "command": format!("brainmaker session-context # {MARKER}"),
+                    "command": format!("{exe}{dir} session-context # {MARKER}"),
                     "timeout": 15
                 }
             ]
@@ -638,9 +713,9 @@ mod tests {
             r#"{"model": "opus", "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}"#,
         );
 
-        assert!(write_settings(&claude, true).unwrap());
+        assert!(write_settings(&claude, Some(Path::new("/opt/bm/bin/brainmaker")), None).unwrap());
         assert!(
-            !write_settings(&claude, true).unwrap(),
+            !write_settings(&claude, Some(Path::new("/opt/bm/bin/brainmaker")), None).unwrap(),
             "second run is a no-op"
         );
 
@@ -651,7 +726,7 @@ mod tests {
         assert_eq!(value["model"], "opus", "unrelated settings survive");
         assert_eq!(text.matches(MARKER).count(), 2);
 
-        assert!(write_settings(&claude, false).unwrap());
+        assert!(write_settings(&claude, None, None).unwrap());
         let value: Value =
             serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
                 .unwrap();
@@ -661,11 +736,48 @@ mod tests {
     }
 
     #[test]
+    fn the_hook_names_the_binary_by_its_full_path() {
+        // A bare name fails: nothing puts this binary on PATH, and a shell
+        // answers "brainmaker: command not found" at every session start.
+        let base = temp_dir("hook-path");
+        let claude = base.join("claude");
+        let program = base.join("bin").join("brainmaker");
+
+        write_settings(&claude, Some(&program), None).unwrap();
+        let text = fs::read_to_string(claude.join("settings.json")).unwrap();
+
+        assert!(text.contains(program.display().to_string().as_str()));
+        assert!(
+            !text.contains("\"brainmaker sync"),
+            "the command must not start with a bare name: {text}"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_hook_quotes_a_path_that_holds_a_space() {
+        let base = temp_dir("hook-space");
+        let claude = base.join("claude");
+        let program = base.join("My Apps").join("brainmaker");
+
+        write_settings(&claude, Some(&program), None).unwrap();
+        let value: Value =
+            serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
+                .unwrap();
+        let command = value["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(command.starts_with('"'), "unquoted path in {command}");
+        assert!(command.contains("My Apps"));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn writes_the_hook_into_a_file_that_does_not_exist_yet() {
         let base = temp_dir("fresh-settings");
         let claude = base.join("claude");
 
-        assert!(write_settings(&claude, true).unwrap());
+        assert!(write_settings(&claude, Some(Path::new("/opt/bm/bin/brainmaker")), None).unwrap());
         let value: Value =
             serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
                 .unwrap();
