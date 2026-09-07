@@ -68,8 +68,11 @@ pub const PUBLIC_KEYS: &[&str] = &[
 ///
 /// An empty list means this build installs no content, the same way an empty
 /// [`PUBLIC_KEYS`] installs no update.
+// Kept one key per line, for the same reason PUBLIC_KEYS is: the release
+// workflow finds a key with a grep that anchors to the start of a line.
 #[rustfmt::skip]
 pub const CONTENT_KEYS: &[&str] = &[
+    "382972259033ae361706b404e7c42bad2a017b5a4f63bfc2aeec9374e5213c05",
 ];
 
 /// Number of software signing keys this binary trusts. `status` prints it.

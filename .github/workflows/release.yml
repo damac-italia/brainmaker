@@ -79,6 +79,21 @@ jobs:
           fi
           echo "a manifest signing key is compiled in"
 
+      # A binary with no content key installs no content, the same way a binary
+      # with no software key installs no update. The block is read on its own,
+      # because the PUBLIC_KEYS check above would pass on either list's keys.
+      - name: Check that a content signing key is compiled in
+        shell: bash
+        run: |
+          block=$(sed -n '/^pub const CONTENT_KEYS/,/^];/p' src/signature.rs)
+          if ! grep -Eq '^[[:space:]]*"[0-9a-fA-F]{64}",' <<<"$block"; then
+            echo "CONTENT_KEYS in src/signature.rs holds no public key" >&2
+            echo "run: brainmaker-sign keygen content-signing.key" >&2
+            echo "then paste the printed key into CONTENT_KEYS and commit it" >&2
+            exit 1
+          fi
+          echo "a content signing key is compiled in"
+
       # musl gives a fully static Linux binary, so it runs on any distribution
       # of that architecture and has no glibc version floor.
       - name: Install the musl toolchain
