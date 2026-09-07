@@ -2,12 +2,14 @@
 
 Four runtime paths matter: loading the settings, getting an access token, the `sync` command, and
 the `self-update` command. `status` reuses the first two paths and then reads both remote endpoints
-without writing anything.
+without writing anything. Because it writes nothing, an endpoint it cannot reach becomes a value it
+prints rather than a reason to exit: [`main.rs:174`](../src/main.rs) prints `latest    <unknown>`
+and `state     cannot check: <reason>`.
 
 ## Settings load
 
 Every command starts here. `Config::load` runs before the dispatch in
-[`src/main.rs:86`](../src/main.rs).
+[`src/main.rs:88`](../src/main.rs).
 
 ```mermaid
 sequenceDiagram
@@ -16,7 +18,8 @@ sequenceDiagram
     participant provision
     participant secretstore
     main->>config: load(options, log)
-    config->>provision: find(--config)
+    config->>config: make --dir absolute, else ~/.brainmaker
+    config->>provision: find(--config, config.enc exists)
     alt a provisioning file was found
         provision-->>config: path
         config->>provision: read(path)
@@ -35,9 +38,11 @@ sequenceDiagram
 
 Steps:
 
-1. [`config.rs:264`](../src/config.rs) resolves the root: `--dir`, else `~/.brainmaker`.
-2. [`provision.rs:314`](../src/provision.rs) searches four locations in order and returns the first
-   hit. A `--config` or `$BRAINMAKER_CONFIG` path that is not a file fails the run.
+1. [`config.rs:264`](../src/config.rs) resolves the root: `--dir` made absolute, else
+   `~/.brainmaker`.
+2. [`provision.rs:320`](../src/provision.rs) searches up to four locations in order and returns the
+   first hit. A `--config` or `$BRAINMAKER_CONFIG` path that is not a file fails the run. The fourth
+   location, the working directory, is searched only while `config.enc` does not yet exist.
 3. On a hit, [`config.rs:277`](../src/config.rs) seals the parsed settings and writes
    `confidential/config.enc` with mode `0600` inside a `0700` directory.
 4. [`config.rs:286`](../src/config.rs) removes the plain file. A failed removal logs a warning and
@@ -47,7 +52,7 @@ Steps:
 6. [`config.rs:329`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
    `SWETSI_CLIENT_ID`, `SWETSI_CLIENT_SECRET`, and the five route keys override the stored
    values, then `--url` overrides the base URL again.
-7. [`config.rs:349`](../src/config.rs) fails when no source supplied a base URL.
+7. [`config.rs:356`](../src/config.rs) fails when no source supplied a base URL.
 8. [`config.rs:364`](../src/config.rs) fails when the base URL is not `https://`, unless its host is
    this machine.
 9. [`config.rs:368`](../src/config.rs) checks the merged credential set. Three keys, or none of
@@ -115,11 +120,13 @@ sequenceDiagram
     participant archive
     participant state
     main->>sync: sync(config, force, log)
-    sync->>remote: latest_hash(config)
+    sync->>remote: latest_release(config)
     remote->>API: GET {base}/{latest hash route}
-    API-->>remote: {"hash": "a1b2c3d4"}
-    remote-->>sync: hash
-    alt hash matches state.json and content/ exists and not --force
+    API-->>remote: {"payload": "...", "signature": "..."}
+    remote-->>sync: ContentRelease
+    alt the request failed, content/ exists and not --force
+        sync-->>main: Unreachable
+    else hash matches state.json and content/ exists and not --force
         sync-->>main: UpToDate
     else
         sync->>remote: download_archive(hash, .download.zip)
@@ -133,26 +140,31 @@ sequenceDiagram
 
 Steps:
 
-1. [`sync.rs:32`](../src/sync.rs) creates the root directory.
-2. [`sync.rs:39`](../src/sync.rs) reads the latest hash. `remote::latest_hash` runs
-   `config::validate_hash` on the response, so an out-of-range value fails before it reaches a URL
-   or a path.
-3. [`sync.rs:46`](../src/sync.rs) returns `UpToDate` when the local hash matches, `content/` is a
+1. [`sync.rs:41`](../src/sync.rs) creates the root directory.
+2. [`sync.rs:50`](../src/sync.rs) reads the signed content release. `remote::latest_release` checks
+   the Ed25519 signature against `signature::CONTENT_KEYS`, and runs `config::validate_hash` on the
+   hash from the signed payload, so an out-of-range value fails before it reaches a URL or a path.
+3. [`sync.rs:53`](../src/sync.rs) turns a failed request into `Unreachable` when `state.json` names
+   a hash, `content/` is a directory, and `--force` was not given. With nothing installed, or with
+   `--force`, the error is returned instead.
+4. [`sync.rs:64`](../src/sync.rs) returns `UpToDate` when the local hash matches, `content/` is a
    directory, and `--force` was not given. No archive is downloaded.
-4. [`sync.rs:70`](../src/sync.rs) clears `.staging`, `.trash`, and `.download.zip` left by a run
+5. [`sync.rs:95`](../src/sync.rs) clears `.staging`, `.trash`, and `.download.zip` left by a run
    that failed between steps.
-5. [`sync.rs:75`](../src/sync.rs) streams the archive to `.download.zip`, stopping at 512 MiB.
-6. [`sync.rs:78`](../src/sync.rs) extracts to `.staging`. Rejected entries are counted, not fatal;
+6. [`sync.rs:100`](../src/sync.rs) streams the archive to `.download.zip`, stopping at 512 MiB.
+7. [`sync.rs:106`](../src/sync.rs) compares the byte count and then the SHA-256 against the signed
+   release, before the extractor opens the file.
+8. [`sync.rs:116`](../src/sync.rs) extracts to `.staging`. Rejected entries are counted, not fatal;
    the log line reads `Skipped N unsafe archive entries.`
-7. [`sync.rs:90`](../src/sync.rs) swaps the directories.
-8. [`sync.rs:95`](../src/sync.rs) removes the three temporary paths, on success and on failure
-   alike.
-9. [`sync.rs:101`](../src/sync.rs) writes `state.json`, only after the swap succeeded.
-10. [`main.rs:94`](../src/main.rs) runs the software check unless `--no-update-check` was given.
+9. [`sync.rs:128`](../src/sync.rs) swaps the directories.
+10. [`sync.rs:133`](../src/sync.rs) removes the three temporary paths, on success and on failure
+    alike.
+11. [`sync.rs:139`](../src/sync.rs) writes `state.json`, only after the swap succeeded.
+12. [`main.rs:117`](../src/main.rs) runs the software check unless `--no-update-check` was given.
 
 ### The swap and its rollback
 
-[`sync.rs:131`](../src/sync.rs):
+[`sync.rs:150`](../src/sync.rs):
 
 1. Rename `content/` to `.trash/`, when `content/` exists.
 2. Rename `.staging/` to `content/`.
@@ -162,7 +174,10 @@ Steps:
 
 | Failure | Result |
 |---|---|
-| The response is not `{"hash": "..."}` | The run fails; nothing on disk changed |
+| The server cannot be reached, and content is installed | Two `notice:` lines go to stderr and the exit code stays 0 |
+| The server cannot be reached, and no content is installed | The run fails; nothing on disk changed |
+| The content release fails the `CONTENT_KEYS` signature check | The run fails; nothing on disk changed |
+| The response is not a signed envelope | The run fails; nothing on disk changed |
 | The hash is not 8 ASCII alphanumeric characters | The run fails before any URL is built |
 | The download body exceeds 512 MiB or is empty | The partial file is deleted and the run fails |
 | The archive is not a zip | The run fails; `content/` is untouched |
@@ -181,6 +196,7 @@ sequenceDiagram
     participant API
     participant signature
     participant staged as staged binary
+    participant link
     main->>selfupdate: check(config)
     selfupdate->>remote: fetch_text(the software manifest route)
     remote->>API: GET {base}/{software manifest route}
@@ -194,39 +210,44 @@ sequenceDiagram
     selfupdate->>staged: run --version
     staged-->>selfupdate: brainmaker <latest>
     selfupdate->>selfupdate: swap(exe, staged, .brainmaker-old)
+    selfupdate->>link: copy_program(exe, <root>/bin/brainmaker)
 ```
 
 Steps:
 
-1. [`selfupdate.rs:118`](../src/selfupdate.rs) reads the envelope, stopping at 1 MiB.
+1. [`selfupdate.rs:116`](../src/selfupdate.rs) reads the envelope, stopping at 1 MiB.
 2. [`selfupdate.rs:125`](../src/selfupdate.rs) checks the Ed25519 signature over the `payload`
    bytes, against the keys in `signature::PUBLIC_KEYS`. A manifest that no key accepts stops here,
    so nothing below ever sees it. A build with no key stops here too.
-3. [`selfupdate.rs:130`](../src/selfupdate.rs) parses the verified `payload` into the manifest.
-4. [`selfupdate.rs:137`](../src/selfupdate.rs) rejects a version string that is empty, longer than
+3. [`selfupdate.rs:128`](../src/selfupdate.rs) parses the verified `payload` into the manifest.
+4. [`selfupdate.rs:135`](../src/selfupdate.rs) rejects a version string that is empty, longer than
    64 characters, or holds a character outside `[A-Za-z0-9.+-]`.
-5. [`selfupdate.rs:146`](../src/selfupdate.rs) returns `UpToDate` when the manifest version is not
+5. [`selfupdate.rs:144`](../src/selfupdate.rs) returns `UpToDate` when the manifest version is not
    newer. `--force` then reinstalls the same version, if the manifest has a build for this
    platform. A replayed older manifest therefore installs nothing, even with a valid signature.
-6. [`selfupdate.rs:154`](../src/selfupdate.rs) looks up `<os>-<arch>`, for example `darwin-arm64`.
+6. [`selfupdate.rs:152`](../src/selfupdate.rs) looks up `<os>-<arch>`, for example `darwin-arm64`.
    A missing key yields `NewerElsewhere`, whose error names the keys that are present.
-7. [`selfupdate.rs:189`](../src/selfupdate.rs) derives the download URL from the base URL and
+7. [`selfupdate.rs:184`](../src/selfupdate.rs) derives the download URL from the base URL and
    `BRAINMAKER_SOFTWARE_BINARY_PATH`, filling in `{version}`, `{platform}`, and `{ext}`. The
    manifest names no URL, so it cannot move the download to another host.
-8. [`selfupdate.rs:188`](../src/selfupdate.rs) rejects a checksum that is not 64 hexadecimal
+8. [`selfupdate.rs:183`](../src/selfupdate.rs) rejects a checksum that is not 64 hexadecimal
    characters.
-9. [`selfupdate.rs:204`](../src/selfupdate.rs) writes a probe file in the install directory, so a
+9. [`selfupdate.rs:199`](../src/selfupdate.rs) writes a probe file in the install directory, so a
    permission problem fails in about a second rather than after a large download.
-10. [`selfupdate.rs:198`](../src/selfupdate.rs) downloads to `.brainmaker-update-<pid>`, stopping at
+10. [`selfupdate.rs:203`](../src/selfupdate.rs) downloads to `.brainmaker-update-<pid>`, stopping at
     128 MiB.
-11. [`selfupdate.rs:211`](../src/selfupdate.rs) streams the SHA-256 and compares it to the manifest.
-12. [`selfupdate.rs:287`](../src/selfupdate.rs) runs the staged file with `--version` and requires
+11. [`selfupdate.rs:206`](../src/selfupdate.rs) streams the SHA-256 and compares it to the manifest.
+12. [`selfupdate.rs:215`](../src/selfupdate.rs) runs the staged file with `--version` and requires
     the output to contain the manifest version. This catches a build for the wrong architecture and
     a manifest that points at the wrong file.
-13. [`selfupdate.rs:229`](../src/selfupdate.rs) renames the running binary to `.brainmaker-old`,
+13. [`selfupdate.rs:218`](../src/selfupdate.rs) renames the running binary to `.brainmaker-old`,
     then renames the staged file into place. A failure on the second rename restores the old
     binary. A running process keeps its open image, so the swap is safe while `brainmaker` runs.
-14. [`selfupdate.rs:226`](../src/selfupdate.rs) removes the staged file on failure, and removes the
+14. [`selfupdate.rs:222`](../src/selfupdate.rs) removes the staged file on failure, and removes the
     backup either way.
+15. [`selfupdate.rs:228`](../src/selfupdate.rs) replaces `<root>/bin/brainmaker` as well, when that
+    file exists and is not the file that just ran. `link::same_file` decides that by canonical
+    path. The `SessionStart` hook runs that copy, so an update that skipped it would leave every
+    session on the old version.
 
 `--check` stops after step 6 and installs nothing.

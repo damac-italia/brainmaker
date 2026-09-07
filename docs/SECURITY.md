@@ -9,7 +9,7 @@ exist, and how to report a vulnerability.
 | Party | Trusted for |
 |---|---|
 | The holder of the manifest signing key | Which binary `brainmaker` installs over itself |
-| The API host, over TLS | The content hash and the content archive |
+| The holder of the content signing key | Which archive lands in `content/`, and so what runs at every session start |
 | The administrator who issues the provisioning file | The endpoints and the client credentials |
 | The employee who runs the binary | Nothing beyond their own account; they already hold the binary |
 
@@ -25,8 +25,13 @@ forge the manifest cannot choose the checksum either.
 A replayed older manifest installs nothing, because `version::is_newer` requires a strictly greater
 numeric core.
 
-**The content path** is anchored on TLS to the base URL host. The content archive is replaced
-wholesale on every update, and it is data rather than code.
+**The content path** is anchored the same way, on a separate key. `content/latest` returns an
+envelope whose `payload` carries the hash, the size, and the SHA-256, and `signature::CONTENT_KEYS`
+verifies it before anything is parsed. The API host is therefore not trusted for either path. The
+two key lists are disjoint, and a unit test fails the build if a key appears in both.
+
+Neither anchor is TLS. TLS still runs, and it protects the credential in transit, but a host that
+serves altered bytes is caught by the signature rather than by the transport.
 
 ### What the sealed store protects, and what it does not
 
@@ -49,6 +54,7 @@ token already issued stays valid for the rest of its 10 minutes.
 
 | Boundary | Untrusted input | Control |
 |---|---|---|
+| Content API to disk | The content release | Ed25519 signature over the served bytes, checked before the parse; the hash, the size, and the SHA-256 are then taken from the signed payload |
 | Content API to disk | The hash string | Exactly 8 ASCII alphanumeric characters, checked before it enters a URL or a path |
 | Content API to disk | The zip archive | Path containment, symbolic-link rejection, permission stripping, size caps |
 | Software API to the binary | The manifest | Ed25519 signature over the served bytes, checked before the parse; then version character set and length, platform key lookup, checksum format. The manifest names no URL, so it cannot direct a download. |
@@ -141,6 +147,12 @@ Both names that `brainmaker` searches for carry the word `brainmaker`: `brainmak
 `.brainmaker.env`. It never reads a bare `.env`, so running it inside an unrelated project cannot
 import and then delete that project's file.
 
+Once `config.enc` exists, the working directory is not searched at all. The `SessionStart` hook
+runs `sync` inside whatever project the user has open, so without that rule a `brainmaker.env`
+committed to any repository would overwrite the sealed settings, and be deleted, the first time a
+session started there. `--config`, `$BRAINMAKER_CONFIG`, and a file beside the binary still work,
+so an administrator can still reissue endpoints.
+
 A build that leaves `BRAINMAKER_CONFIG_KEY` unset falls back to a published development key.
 `brainmaker status` reports which one a binary carries on its `key` line: `release` or
 `development`. The release workflow fails before it builds anything when the repository secret is
@@ -190,6 +202,12 @@ continues with the entries that pass.
 5. Only then does the swap run, through two renames. A failure on the second rename restores the
    previous binary.
 
+A verified binary then replaces `<root>/bin/brainmaker` as well, when that copy exists and is a
+different file from the one that ran. The `SessionStart` hook names that copy, so an update that
+skipped it would leave every session running the old version, including one with a fixed
+vulnerability outstanding. The copy is written under a temporary name beside the target and
+renamed over it, so a failure part-way leaves the previous copy intact.
+
 The download address is not a control that can fail: `Config::binary_url` derives it from the base
 URL in the provisioning file, so a manifest cannot name another host at all.
 
@@ -210,6 +228,15 @@ URL in the provisioning file, so a manifest cannot name another host at all.
 The signature moves the trust anchor off the API host, as it does for the software manifest: the
 host, any proxy in front of it, and the blob store behind it can all serve altered bytes and be
 caught. It does not protect against whoever holds the content signing key.
+
+A request that fails outright is treated differently from one that fails a check. When the server
+cannot be reached and `content/` already holds an installed hash, `sync` keeps that content and
+exits 0 with a `notice:` on stderr, because it runs at every session start and a laptop is often
+offline. Someone who can block the connection can therefore hold a machine at the content it
+already has, but cannot replace it: every path that writes `content/` goes through the signature
+check first. A hash the server serves is never trusted over one already installed, so this is a
+freeze rather than a downgrade. `brainmaker status` shows it as
+`state     cannot check: <reason>`.
 
 ### Two signing keys, held by different parties
 

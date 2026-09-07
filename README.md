@@ -55,8 +55,9 @@ gone. Later runs read the sealed copy and need no file.
 | Signed updates | Refuses a software manifest without an Ed25519 signature from a compiled-in key |
 | Signed content | Refuses a content release that no key in `CONTENT_KEYS` signed, and checks the archive digest before it extracts |
 | Two key lists | Content and software verify against separate lists, so a content signer cannot sign a manifest |
+| Offline tolerance | Keeps the installed content and exits 0 when the server cannot be reached, so a session still starts |
 | Claude bridge | `link` puts the shared skills and the session briefing into `~/.claude`, for every project |
-| Self-update | Verifies the SHA-256 and the `--version` output before it swaps the binary |
+| Self-update | Verifies the SHA-256 and the `--version` output before it swaps the binary, including the copy the hook runs |
 | Static Linux builds | `x86_64` and `arm64` link against musl, so there is no glibc version floor |
 
 ## Usage
@@ -475,7 +476,7 @@ cargo clippy --all-targets --features sign
 cargo fmt --check
 ```
 
-The test suite is 138 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
+The test suite is 146 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
 `--features sign` to clippy so that the signing tool is linted too; a plain `cargo build` skips it.
 The `test` workflow runs all three commands, and it fails on an unformatted file and on a clippy
 warning, so running them locally first saves a round trip.

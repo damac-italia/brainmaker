@@ -22,10 +22,10 @@ under the `sign` feature and never ships.
 | [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `digest`, `remote`, `state` |
 | [`src/archive.rs`](../src/archive.rs) | Zip extraction and its safety checks | `config`, `zip` |
 | [`src/state.rs`](../src/state.rs) | `state.json` read and atomic write | `serde_json` |
-| [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `remote`, `signature`, `version` |
+| [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `link`, `remote`, `signature`, `version` |
 | [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `ring` |
 | [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `sha2` |
-| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, and the session context | `config`, `dirs`, `serde_json` |
+| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the session context, and the binary copy under the root | `config`, `dirs`, `serde_json` |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
 
 ## Module graph
@@ -36,6 +36,7 @@ graph LR
     main --> config
     main --> sync
     main --> selfupdate
+    main --> link
     main --> state
     config --> auth
     config --> provision
@@ -49,8 +50,10 @@ graph LR
     selfupdate --> remote
     selfupdate --> signature
     selfupdate --> version
+    selfupdate --> link
     remote --> config
     remote --> auth
+    link --> config
 ```
 
 ## Boundaries
@@ -76,11 +79,16 @@ the injected `log` closure.
 
 ```text
 ~/.brainmaker/
+├── bin/
+│   └── brainmaker      0755, the copy that link writes and the SessionStart hook runs
 ├── confidential/       0700
 │   └── config.enc      0600, the sealed endpoints, routes, and credentials
 ├── content/            the extracted content
 └── state.json          {"hash": "...", "updated_at_unix": ...}
 ```
+
+`bin/brainmaker` appears only after `link` has run. `unlink` leaves it in place, because removing
+the file a running hook names would break a session that is already open.
 
 `brainmaker` also creates `.staging/`, `.trash/`, and `.download.zip` under the root while it
 works, and removes all three before it exits, on success and on failure alike. `content/` is
@@ -243,6 +251,66 @@ already vouched for rather than content that only TLS vouched for.
 This matters more than it would for inert data. The content ships a `.claude` directory whose
 hooks `link` registers, so an archive that reached a machine unchecked would be code that runs at
 every session start.
+
+### An unreachable server is a notice, not a failure, while content is installed
+
+`sync` runs from the `SessionStart` hook at the start of every Claude session, and a laptop is
+often offline. When `remote::latest_release` fails and `state.json` names a hash whose `content/`
+is a directory, `sync` returns `Outcome::Unreachable` instead of the error. `main.rs` prints two
+`notice:` lines to stderr and exits 0, so the session starts with the content it already had.
+
+The exceptions keep the fallback honest. With nothing installed there is nothing to fall back on,
+and `--force` asks for a download, so both return the error and exit 1.
+
+`status` takes the same view for a different reason: it changes nothing, so an unreachable server
+is a value to print rather than a reason to exit. It prints `latest    <unknown>` and
+`state     cannot check: <reason>`.
+
+The tradeoff: a machine that cannot reach the server for weeks reports success every session, and
+only the stderr notice says the content is not fresh. `--quiet`, which the hook passes, hides it.
+
+### The working directory is searched for a provisioning file on the first run only
+
+`provision::find` takes a `provisioned` flag, which `Config::load` sets from whether `config.enc`
+already exists. While it is true, step 4 of the search is skipped entirely.
+
+The hook runs `sync` inside whatever project the user has open. Without this rule, a
+`brainmaker.env` committed to some unrelated repository would be imported over the sealed
+settings, and then deleted, on the first session opened in that directory. Steps 1 to 3 still run,
+so `--config`, `$BRAINMAKER_CONFIG`, and a file beside the binary can still change the endpoints
+later.
+
+The tradeoff: dropping a file into the working directory works once and then stops working, which
+is surprising if you do not know the rule.
+
+### The hook runs a copy under the root, and `self-update` replaces that copy too
+
+Nothing puts `brainmaker` on `PATH`, and the install instructions tell the reader to delete the
+unpacked archive. So `link` copies the running binary to `<root>/bin/brainmaker` and writes that
+full path, quoted, into the hook, along with `--dir <root>`.
+
+That creates a second copy, and a `self-update` that reached only the file the user happened to
+run would leave every session on the old version. So `selfupdate::apply` replaces the installed
+copy as well, whenever it is a different file from the one that ran.
+
+"Different file" is decided by `link::same_file`, which canonicalises both paths, not by comparing
+the two strings. A string comparison deleted the installed binary when `link` ran through a
+symbolic link to it: the paths differed, the removal succeeded, and the copy then failed with
+`No such file or directory`.
+
+The copy itself lands beside the target under a temporary name and is renamed over it. Writing
+into a file that is being executed fails with `ETXTBSY` on some systems, and a rename leaves a
+running old copy holding its own inode.
+
+The tradeoff: two copies of the binary exist, and a `self-update` run from a third location
+updates both of them rather than one.
+
+### A relative `--dir` becomes absolute before anything is written
+
+`Config::load` passes `--dir` through `std::path::absolute`. Every path derived from the root
+outlives the working directory: the skill symbolic links under `~/.claude/skills`, the hook
+command, and the `--dir` inside it. A relative root would put a relative path into all three, and
+each would then resolve against whatever directory the next session happened to start in.
 
 ### The stored settings are bound to the machine
 
