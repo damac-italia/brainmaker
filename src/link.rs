@@ -65,11 +65,22 @@ const BLOCK_END: &str = "<!-- brainmaker-link: end -->";
 ///
 /// Each one is relative to the content directory. A missing file is skipped,
 /// which is what a fresh or a differently shaped content release gives.
-const CONTEXT_FILES: [(&str, &str); 4] = [
-    ("CLAUDE.md", "The shared briefing"),
-    ("wiki/hot.md", "Recent context"),
-    ("agent-memory/OPEN-THREADS.md", "Open threads"),
-    ("agent-memory/PREFERENCES.md", "Operator preferences"),
+///
+/// The third field is that file's own cap. Every session pays for this text,
+/// so one file that grows without bound must not crowd out the rest: an open
+/// thread list reached 34 KiB against a 17 KiB briefing, which spent most of
+/// the budget on the least load-bearing file. The briefing gets the largest
+/// share because it is the one file meant to be read whole; the other three
+/// are working notes, and their head is the part that matters.
+const CONTEXT_FILES: [(&str, &str, usize); 4] = [
+    ("CLAUDE.md", "The shared briefing", 24 * 1024),
+    ("wiki/hot.md", "Recent context", 8 * 1024),
+    ("agent-memory/OPEN-THREADS.md", "Open threads", 8 * 1024),
+    (
+        "agent-memory/PREFERENCES.md",
+        "Operator preferences",
+        8 * 1024,
+    ),
 ];
 
 /// What one run changed.
@@ -132,7 +143,7 @@ pub fn session_context(config: &Config) -> Result<String> {
     let content = config.content_dir();
     let mut text = String::new();
 
-    for (relative, title) in CONTEXT_FILES {
+    for (relative, title, cap) in CONTEXT_FILES {
         let path = content.join(relative);
         let Ok(body) = fs::read_to_string(&path) else {
             continue;
@@ -140,6 +151,7 @@ pub fn session_context(config: &Config) -> Result<String> {
         if body.trim().is_empty() {
             continue;
         }
+        let body = cut(&body, cap, relative);
         text.push_str(&format!("\n\n## {title} — `{relative}`\n\n{body}"));
     }
 
@@ -157,10 +169,11 @@ pub fn session_context(config: &Config) -> Result<String> {
     );
     let mut full = format!("{header}{text}");
 
+    // A backstop under the per-file caps, in case the file list grows.
     if full.len() > MAX_CONTEXT_BYTES {
-        let cut = floor_char_boundary(&full, MAX_CONTEXT_BYTES);
-        full.truncate(cut);
-        full.push_str("\n\n*(cut at 64 KiB; read the files directly for the rest)*");
+        let boundary = floor_char_boundary(&full, MAX_CONTEXT_BYTES);
+        full.truncate(boundary);
+        full.push_str("\n\n*(cut; read the files directly for the rest)*");
     }
 
     let value = json!({
@@ -170,6 +183,23 @@ pub fn session_context(config: &Config) -> Result<String> {
         }
     });
     Ok(serde_json::to_string(&value)?)
+}
+
+/// Returns `body` at or under `cap`, saying so in the text when it cuts.
+///
+/// The reader must know the text is partial, or it will treat a cut list as
+/// the whole list.
+fn cut(body: &str, cap: usize, relative: &str) -> String {
+    if body.len() <= cap {
+        return body.to_string();
+    }
+    let boundary = floor_char_boundary(body, cap);
+    format!(
+        "{}\n\n*(cut at {} KiB of {} KiB; read `{relative}` for the rest)*",
+        &body[..boundary],
+        cap / 1024,
+        body.len().div_ceil(1024),
+    )
 }
 
 /// Largest index at or below `limit` that starts a character.
@@ -687,6 +717,37 @@ mod tests {
         assert_eq!(strip_block("plain"), "plain");
         let text = format!("a\n{BLOCK_START}\nx\n{BLOCK_END}\nb");
         assert_eq!(strip_block(&text), "a\n\nb");
+    }
+
+    #[test]
+    fn keeps_a_file_that_fits_under_its_cap() {
+        assert_eq!(cut("short", 1024, "x.md"), "short");
+    }
+
+    #[test]
+    fn cuts_a_file_past_its_cap_and_says_so() {
+        let body = "x".repeat(3000);
+        let out = cut(&body, 1024, "agent-memory/OPEN-THREADS.md");
+        assert!(out.starts_with(&"x".repeat(1024)));
+        assert!(out.contains("cut at 1 KiB of 3 KiB"));
+        assert!(out.contains("agent-memory/OPEN-THREADS.md"));
+    }
+
+    #[test]
+    fn cuts_a_multi_byte_file_without_panicking() {
+        // 1024 lands inside a two-byte character, so a naive truncate panics.
+        let body = "é".repeat(2000);
+        let out = cut(&body, 1025, "x.md");
+        assert!(out.contains("cut at 1 KiB"));
+    }
+
+    #[test]
+    fn every_per_file_cap_fits_inside_the_overall_cap() {
+        let total: usize = CONTEXT_FILES.iter().map(|(_, _, cap)| cap).sum();
+        assert!(
+            total <= MAX_CONTEXT_BYTES,
+            "the per-file caps total {total}, past the overall {MAX_CONTEXT_BYTES}"
+        );
     }
 
     #[test]
