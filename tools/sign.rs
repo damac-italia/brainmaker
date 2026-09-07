@@ -37,6 +37,7 @@ use anyhow::{Context, Result, bail};
 use ring::rand::SystemRandom;
 use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Environment variable that carries the PKCS#8 key as hexadecimal.
 ///
@@ -45,19 +46,22 @@ use serde::{Deserialize, Serialize};
 const KEY_ENV: &str = "BRAINMAKER_SIGNING_KEY";
 
 const HELP: &str = "\
-brainmaker-sign — generate a signing key, and sign a software manifest
+brainmaker-sign — generate a signing key, and sign what brainmaker installs
 
 USAGE:
     brainmaker-sign keygen <KEY-FILE>
     brainmaker-sign sign <KEY-FILE|-> <MANIFEST-FILE> <ENVELOPE-FILE>
+    brainmaker-sign sign-content <KEY-FILE|-> <ARCHIVE> <HASH> <ENVELOPE-FILE>
     brainmaker-sign verify <ENVELOPE-FILE> <PUBLIC-KEY>...
 
 COMMANDS:
-    keygen    Write a new PKCS#8 Ed25519 key, and print its public key
-    sign      Wrap a manifest and its signature into the envelope that
-              brainmaker downloads
-    verify    Check an envelope against one or more public keys, the way
-              brainmaker checks it. Run this before you publish.
+    keygen        Write a new PKCS#8 Ed25519 key, and print its public key
+    sign          Wrap a software manifest and its signature into the envelope
+                  that brainmaker downloads
+    sign-content  Digest a content archive and sign the result, giving the
+                  envelope that {base}/content/latest returns
+    verify        Check an envelope against one or more public keys, the way
+                  brainmaker checks it. Run this before you publish.
 
 KEY-FILE:
     A path holding the PKCS#8 key as hexadecimal. Pass - to read the key from
@@ -95,6 +99,9 @@ fn run(args: &[&str]) -> Result<()> {
         }
         ["keygen", key_file] => keygen(Path::new(key_file)),
         ["sign", key, manifest, envelope] => sign(key, Path::new(manifest), Path::new(envelope)),
+        ["sign-content", key, archive, hash, envelope] => {
+            sign_content(key, Path::new(archive), hash, Path::new(envelope))
+        }
         ["verify", envelope, keys @ ..] if !keys.is_empty() => verify(Path::new(envelope), keys),
         _ => bail!("unknown arguments; run brainmaker-sign --help"),
     }
@@ -165,6 +172,68 @@ fn sign(key: &str, manifest_file: &Path, envelope_file: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Digests `archive` and signs a content release that describes it.
+///
+/// The signed payload carries the hash, the digest, and the size, and no URL.
+/// The client derives the download address from its own base URL, so a signed
+/// release cannot move the download to another host — the rule the software
+/// manifest already follows.
+fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> Result<()> {
+    let pair = load_key(key)?;
+
+    check_hash(hash)?;
+    let bytes =
+        std::fs::read(archive).with_context(|| format!("cannot read {}", archive.display()))?;
+    if bytes.is_empty() {
+        bail!("{} is empty", archive.display());
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let sha256 = hex(&hasher.finalize());
+
+    // The signature covers these exact bytes, and the client checks them
+    // before it parses them. The field order therefore only has to stay put
+    // after signing, which serialising once here guarantees.
+    let payload = serde_json::to_string(&serde_json::json!({
+        "hash": hash,
+        "sha256": sha256,
+        "size_bytes": bytes.len(),
+    }))
+    .context("cannot write the content release")?;
+
+    let envelope = Envelope {
+        signature: hex(pair.sign(payload.as_bytes()).as_ref()),
+        payload,
+    };
+
+    let text = serde_json::to_string_pretty(&envelope).context("cannot write the envelope")?;
+    std::fs::write(envelope_file, format!("{text}\n"))
+        .with_context(|| format!("cannot write {}", envelope_file.display()))?;
+
+    println!(
+        "Signed {} ({} bytes, sha256 {sha256}) into {}.",
+        archive.display(),
+        bytes.len(),
+        envelope_file.display()
+    );
+    println!("Public key: {}", hex(pair.public_key().as_ref()));
+    println!("Publish its payload and signature with the archive, so that");
+    println!("{{base}}/content/latest returns both.");
+    Ok(())
+}
+
+/// Rejects a hash that brainmaker's `validate_hash` would reject.
+///
+/// Eight alphanumeric ASCII characters, which is what synapsis derives from
+/// the first 8 characters of the archive digest.
+fn check_hash(hash: &str) -> Result<()> {
+    if hash.len() != 8 || !hash.chars().all(|c| c.is_ascii_alphanumeric()) {
+        bail!("the hash {hash:?} is not 8 alphanumeric ASCII characters");
+    }
+    Ok(())
+}
+
 /// Checks an envelope against `keys`, the way brainmaker checks it.
 ///
 /// Run this before you publish. It catches a manifest signed with a key that no
@@ -199,19 +268,19 @@ fn verify(envelope_file: &Path, keys: &[&str]) -> Result<()> {
             .verify(envelope.payload.as_bytes(), &signature_bytes)
             .is_ok()
         {
-            check_manifest(&envelope.payload)
-                .context("the signed payload is not a usable manifest")?;
+            let kind = check_payload(&envelope.payload)?;
             println!(
                 "{} verifies against public key {index} ({key}).",
                 envelope_file.display()
             );
+            println!("The signed payload is {kind}.");
             return Ok(());
         }
     }
 
     bail!(
         "{} verifies against none of the {} public key(s) given. \
-         Every brainmaker that carries those keys would refuse this manifest.",
+         Every brainmaker that carries those keys would refuse this envelope.",
         envelope_file.display(),
         keys.len()
     )
@@ -231,6 +300,65 @@ fn load_key(key: &str) -> Result<Ed25519KeyPair> {
 }
 
 /// Fails when the manifest is not the shape brainmaker reads.
+/// Names the shape of a signed payload, or fails when it is neither shape.
+///
+/// One envelope carries a software manifest, and another carries a content
+/// release. Both reach the same route pattern and the same signature check, so
+/// `verify` accepts either and says which it read. Guessing wrong would let a
+/// content release pass as a manifest.
+fn check_payload(text: &str) -> Result<&'static str> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).context("the signed payload is not valid JSON")?;
+
+    if value.get("platforms").is_some() {
+        check_manifest(text).context("the signed payload is not a usable software manifest")?;
+        return Ok("a software manifest");
+    }
+    if value.get("sha256").is_some() {
+        check_content(text).context("the signed payload is not a usable content release")?;
+        return Ok("a content release");
+    }
+    bail!(
+        "the signed payload is neither a software manifest, which carries \"platforms\", \
+         nor a content release, which carries \"sha256\""
+    )
+}
+
+/// Fails for a content release that brainmaker could not use.
+fn check_content(text: &str) -> Result<()> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).context("the content release is not valid JSON")?;
+
+    let hash = value
+        .get("hash")
+        .and_then(serde_json::Value::as_str)
+        .context("the content release has no \"hash\" string")?;
+    check_hash(hash)?;
+
+    let sha256 = value
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .context("the content release has no \"sha256\" string")?;
+    if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("the content release carries the invalid SHA-256 {sha256:?}");
+    }
+
+    let size = value
+        .get("size_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .context("the content release has no \"size_bytes\" number")?;
+    if size == 0 {
+        bail!("the content release claims a size of 0 bytes");
+    }
+
+    // The client derives the download address from its own base URL, so a URL
+    // here would be a URL the client ignores and an operator trusts.
+    if value.get("url").is_some() {
+        bail!("the content release carries a \"url\", and brainmaker derives the address itself");
+    }
+    Ok(())
+}
+
 fn check_manifest(text: &str) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_str(text).context("the manifest is not valid JSON")?;

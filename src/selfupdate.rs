@@ -23,12 +23,10 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::config::{Config, MAX_BINARY_BYTES, MAX_MANIFEST_BYTES};
 use crate::remote;
@@ -168,15 +166,7 @@ pub fn check(config: &Config) -> Result<Check> {
 impl Build {
     /// Rejects a checksum that is not 64 hexadecimal characters.
     fn checksum(&self) -> Result<String> {
-        let value = self.sha256.trim().to_ascii_lowercase();
-        if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!(
-                "the manifest carries the invalid SHA-256 {:?}; \
-                 expected 64 hexadecimal characters",
-                self.sha256
-            );
-        }
-        Ok(value)
+        crate::digest::checked_sha256(&self.sha256, "the manifest")
     }
 }
 
@@ -208,7 +198,7 @@ pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -
         let bytes = remote::download(config, &url, &staged, MAX_BINARY_BYTES)?;
         log(&format!("Downloaded {bytes} bytes."));
 
-        let actual_sum = sha256_of(&staged)?;
+        let actual_sum = crate::digest::sha256_of(&staged)?;
         if actual_sum != expected_sum {
             bail!(
                 "the SHA-256 of the download is {actual_sum}, but the manifest says {expected_sum}"
@@ -272,35 +262,6 @@ fn check_writable(directory: &Path, exe: &Path) -> Result<()> {
     })?;
     let _ = fs::remove_file(&probe);
     Ok(())
-}
-
-/// Computes the SHA-256 of a file, streaming it.
-fn sha256_of(path: &Path) -> Result<String> {
-    let file = fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .with_context(|| format!("cannot read {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(hex(&hasher.finalize()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 #[cfg(unix)]
@@ -403,27 +364,6 @@ mod tests {
 
         b.sha256 = String::new();
         assert!(b.checksum().is_err());
-    }
-
-    #[test]
-    fn hashes_a_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "brainmaker-sha-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("data");
-        fs::write(&path, b"abc").unwrap();
-
-        // The SHA-256 of "abc" is a published test vector.
-        assert_eq!(
-            sha256_of(&path).unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -22,6 +22,7 @@ mod archive;
 mod auth;
 mod cli;
 mod config;
+mod digest;
 mod link;
 mod provision;
 mod remote;
@@ -161,7 +162,7 @@ fn status(config: &Config) -> Result<()> {
         if content_dir.is_dir() { "yes" } else { "no" }
     );
 
-    let latest = remote::latest_hash(config)?;
+    let latest = remote::latest_release(config)?.hash;
     println!("latest    {latest}");
     println!(
         "state     {}",

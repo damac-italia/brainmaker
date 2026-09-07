@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::archive;
 use crate::config::{Config, validate_hash};
@@ -36,7 +36,8 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
     let local = state::read(&config.state_file());
 
     log("Checking the latest content version.");
-    let remote_hash = remote::latest_hash(config)?;
+    let release = remote::latest_release(config)?;
+    let remote_hash = release.hash.clone();
 
     let installed = local.as_ref().map(|s| s.hash.clone());
     let content_present = content_dir.is_dir();
@@ -50,15 +51,20 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
     }
 
     log(&format!("Downloading content-{remote_hash}.zip"));
-    install(config, &remote_hash, log).map(|stats| Outcome::Updated {
+    install(config, &release, log).map(|stats| Outcome::Updated {
         previous: installed,
         hash: remote_hash,
         stats,
     })
 }
 
-/// Downloads one hash and replaces `content/` with it.
-fn install(config: &Config, hash: &str, log: &dyn Fn(&str)) -> Result<archive::Stats> {
+/// Downloads one release and replaces `content/` with it.
+fn install(
+    config: &Config,
+    release: &remote::ContentRelease,
+    log: &dyn Fn(&str),
+) -> Result<archive::Stats> {
+    let hash = release.hash.as_str();
     validate_hash(hash)?;
 
     let download = config.download_file();
@@ -74,6 +80,19 @@ fn install(config: &Config, hash: &str, log: &dyn Fn(&str)) -> Result<archive::S
     let result = (|| -> Result<archive::Stats> {
         let bytes = remote::download_archive(config, hash, &download)?;
         log(&format!("Downloaded {bytes} bytes."));
+
+        // Check the archive against the signed release before the extractor
+        // reads it. The signature covers this digest, so a server that serves
+        // other bytes than it signed stops here, with nothing written.
+        if bytes != release.size_bytes {
+            bail!(
+                "the archive is {bytes} bytes, and the signed content release says {}",
+                release.size_bytes
+            );
+        }
+        let actual = crate::digest::sha256_of(&download)?;
+        crate::digest::check_matches(&actual, &release.sha256, "the signed content release")?;
+        log("The SHA-256 matches the signed content release.");
 
         let stats = archive::extract(&download, &staging)?;
         log(&format!(

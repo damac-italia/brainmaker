@@ -35,24 +35,72 @@ struct ErrorBody {
 }
 
 /// Body of `GET {base}/content/latest`.
+///
+/// `payload` and `signature` form the same envelope the software manifest
+/// uses, and the signature covers exactly the `payload` bytes. The route also
+/// carries a bare `hash`, which a client older than the signing change reads;
+/// this client ignores it and takes the hash from the signed payload, so a
+/// server cannot point it at one archive while signing another.
 #[derive(Debug, Deserialize)]
 struct Latest {
-    hash: String,
+    payload: Option<String>,
+    signature: Option<String>,
 }
 
-/// Reads the latest content hash from the API.
+/// The signed description of one content release.
 ///
-/// The returned hash always passes [`validate_hash`].
-pub fn latest_hash(config: &Config) -> Result<String> {
+/// It carries no URL, for the same reason the software manifest carries none:
+/// the client derives the download address from its own base URL, so a signed
+/// document cannot move the download to another host.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentRelease {
+    /// Short name of the release, which is also its archive name.
+    pub hash: String,
+    /// SHA-256 of the archive, as 64 hexadecimal characters.
+    pub sha256: String,
+    /// Size of the archive in bytes.
+    pub size_bytes: u64,
+}
+
+/// Reads the latest content release, and checks its signature.
+///
+/// The check runs over the served bytes before anything parses them, so no
+/// JSON canonicalisation rule takes part in the security argument. A release
+/// that no compiled-in key accepts stops here, and nothing downloads.
+pub fn latest_release(config: &Config) -> Result<ContentRelease> {
     let url = config.latest_url();
     let body = fetch_text(config, &url, crate::config::MAX_MANIFEST_BYTES)?;
 
-    let latest: Latest = serde_json::from_str(&body).with_context(|| {
-        format!("{url} did not return the expected JSON object {{\"hash\": \"...\"}}")
-    })?;
+    let latest: Latest = serde_json::from_str(&body)
+        .with_context(|| format!("{url} did not return a JSON object"))?;
 
-    validate_hash(&latest.hash)?;
-    Ok(latest.hash)
+    let (Some(payload), Some(signature)) = (latest.payload, latest.signature) else {
+        bail!(
+            "{url} returned no signed content release. This brainmaker installs only signed \
+             content, and the server published an unsigned release. Publish it again with a \
+             signature, or ask whoever runs the server to."
+        );
+    };
+
+    crate::signature::verify(payload.as_bytes(), &signature)
+        .with_context(|| format!("cannot trust the content release from {url}"))?;
+
+    let release: ContentRelease = serde_json::from_str(&payload)
+        .with_context(|| format!("the signed content release from {url} is not usable"))?;
+
+    validate_hash(&release.hash)?;
+    crate::digest::checked_sha256(&release.sha256, "the content release")?;
+    if release.size_bytes == 0 {
+        bail!("the content release claims a size of 0 bytes");
+    }
+    if release.size_bytes > MAX_ARCHIVE_BYTES {
+        bail!(
+            "the content release claims {} bytes, past the limit of {MAX_ARCHIVE_BYTES}",
+            release.size_bytes
+        );
+    }
+
+    Ok(release)
 }
 
 /// Downloads the archive for `hash` to `dest`.
@@ -241,6 +289,40 @@ fn describe(error: ureq::Error) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A release the client would accept, as JSON.
+    fn release(hash: &str, sha256: &str, size: u64) -> String {
+        format!(r#"{{"hash":"{hash}","sha256":"{sha256}","size_bytes":{size}}}"#)
+    }
+
+    #[test]
+    fn reads_a_well_formed_content_release() {
+        let text = release("25c60772", &"a".repeat(64), 1152003);
+        let parsed: ContentRelease = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.hash, "25c60772");
+        assert_eq!(parsed.size_bytes, 1152003);
+    }
+
+    #[test]
+    fn a_release_carries_no_url() {
+        // The client derives the address from its own base URL. An extra field
+        // is ignored rather than trusted, which this pins.
+        let text = r#"{"hash":"25c60772","sha256":"aa","size_bytes":1,"url":"http://evil"}"#;
+        let parsed: ContentRelease = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed.hash, "25c60772");
+    }
+
+    #[test]
+    fn the_latest_body_needs_both_envelope_fields() {
+        let both: Latest =
+            serde_json::from_str(r#"{"hash":"25c60772","payload":"{}","signature":"ab"}"#).unwrap();
+        assert!(both.payload.is_some() && both.signature.is_some());
+
+        // The shape an older server returns. Both fields are absent, and
+        // `latest_release` refuses it rather than installing unsigned content.
+        let old: Latest = serde_json::from_str(r#"{"hash":"25c60772"}"#).unwrap();
+        assert!(old.payload.is_none() && old.signature.is_none());
+    }
 
     #[test]
     fn reads_the_error_field_that_synapsis_returns() {
