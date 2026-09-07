@@ -19,6 +19,13 @@ COMMANDS:
     status         Print the installed hash, the latest hash, and both
                    software versions. It changes nothing.
     self-update    Replace this binary with the newest build for this platform
+    link           Wire the synced content into ~/.claude, so its skills and
+                   its session context load in every project, not only in the
+                   content directory
+    unlink         Remove what link wrote
+    session-context
+                   Print the SessionStart JSON that the linked hook returns.
+                   link registers this; it is not meant to be run by hand.
 
 OPTIONS:
     --force              Download and extract even when the content is up to
@@ -29,6 +36,8 @@ OPTIONS:
     --config <PATH>      Import the provisioning file at PATH
     --keep-config        Do not remove the provisioning file after the import
     --dir <PATH>         Use PATH as the root instead of ~/.brainmaker
+    --claude-dir <PATH>  With link and unlink, write to PATH instead of
+                         ~/.claude
     --url <URL>          Use URL as the API base
     -q, --quiet          Print errors only
     -h, --help           Print this help text
@@ -73,6 +82,9 @@ pub enum Command {
     Sync,
     Status,
     SelfUpdate,
+    Link,
+    Unlink,
+    SessionContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +109,9 @@ pub struct Args {
     pub keep_config: bool,
     pub dir: Option<PathBuf>,
     pub url: Option<String>,
+    /// `--claude-dir`, naming the Claude configuration directory that `link`
+    /// and `unlink` write to.
+    pub claude_dir: Option<PathBuf>,
 }
 
 impl Default for Args {
@@ -111,6 +126,7 @@ impl Default for Args {
             keep_config: false,
             dir: None,
             url: None,
+            claude_dir: None,
         }
     }
 }
@@ -146,6 +162,12 @@ where
                     .ok_or_else(|| anyhow::anyhow!("--dir needs a path"))?;
                 args.dir = Some(PathBuf::from(value));
             }
+            "--claude-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--claude-dir needs a path"))?;
+                args.claude_dir = Some(PathBuf::from(value));
+            }
             "--url" => {
                 let value = iter
                     .next()
@@ -162,6 +184,18 @@ where
             }
             "self-update" if !command_seen => {
                 args.command = Command::SelfUpdate;
+                command_seen = true;
+            }
+            "link" if !command_seen => {
+                args.command = Command::Link;
+                command_seen = true;
+            }
+            "unlink" if !command_seen => {
+                args.command = Command::Unlink;
+                command_seen = true;
+            }
+            "session-context" if !command_seen => {
+                args.command = Command::SessionContext;
                 command_seen = true;
             }
             other => bail!("unknown argument {other:?}; run brainmaker --help"),

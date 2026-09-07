@@ -22,6 +22,7 @@ mod archive;
 mod auth;
 mod cli;
 mod config;
+mod link;
 mod provision;
 mod remote;
 mod secretstore;
@@ -87,6 +88,27 @@ fn run(args: &Args) -> Result<()> {
 
     match args.command {
         Command::Status => status(&config),
+        Command::Link => {
+            let claude = match args.claude_dir.clone() {
+                Some(path) => path,
+                None => link::claude_dir()?,
+            };
+            link::link(&config, &claude, &log)?;
+            Ok(())
+        }
+        Command::Unlink => {
+            let claude = match args.claude_dir.clone() {
+                Some(path) => path,
+                None => link::claude_dir()?,
+            };
+            link::unlink(&config, &claude, &log)?;
+            Ok(())
+        }
+        // The hook reads stdout as JSON, so this one prints past --quiet.
+        Command::SessionContext => {
+            println!("{}", link::session_context(&config)?);
+            Ok(())
+        }
         Command::SelfUpdate => self_update(&config, args, &log),
         Command::Sync => {
             let outcome = sync::sync(&config, args.force, &log)?;
