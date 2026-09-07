@@ -222,13 +222,28 @@ jobs:
       # every self-update in the field.
       - name: Check that the signed manifest verifies
         run: |
-          keys=$(grep -Eo '"[0-9a-fA-F]{64}"' src/signature.rs | tr -d '"')
+          # Read the PUBLIC_KEYS block alone. A bare grep over the file would
+          # also collect CONTENT_KEYS, and verify passes when ANY key given
+          # accepts — so a manifest signed with the content key would pass this
+          # check, which is the one thing it exists to catch.
+          block=$(sed -n '/^pub const PUBLIC_KEYS/,/^];/p' src/signature.rs)
+          keys=$(grep -Eo '"[0-9a-fA-F]{64}"' <<<"$block" | tr -d '"')
           if [ -z "$keys" ]; then
             echo "PUBLIC_KEYS in src/signature.rs holds no public key" >&2
             exit 1
           fi
           # shellcheck disable=SC2086
           ./target/release/brainmaker-sign verify dist/manifest.signed.json $keys
+
+      # The deploy host signs a content release, so it needs this tool built for
+      # its own platform. It goes in its own directory: make-manifest.sh globs
+      # dist/brainmaker-*, and a tool named that way would enter the manifest as
+      # if it were a platform binary.
+      - name: Name the signing tool for release
+        run: |
+          mkdir -p tools-dist
+          cp target/release/brainmaker-sign \
+             "tools-dist/brainmaker-sign-$VERSION-linux-x86_64"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -241,6 +256,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v$VERSION" dist/* \
+          gh release create "v$VERSION" dist/* tools-dist/* \
             --title "brainmaker $VERSION" \
             --notes ""
