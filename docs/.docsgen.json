@@ -1,11 +1,14 @@
 {
   "version": 1,
-  "head": "aae2152",
+  "head": "4e55031",
   "docs": {
     "README.md": {
-      "doc_hash": "52363aee3d8d9dd8",
+      "doc_hash": "e286f7e28d6544cc",
       "sources": {
+        ".github/dependabot.yml": "37a1071047e74ea4",
+        ".github/workflows/dependency-review.yml": "568eebf8eae600c9",
         ".github/workflows/release.yml": "002afe7fda998945",
+        ".github/workflows/test.yml": "89582a7dea8914b1",
         "Cargo.lock": "6191e5ffd37aeee4",
         "Cargo.toml": "9fea85aaa7a4c5a7",
         "LICENSE": "3972dc9744f6499f",

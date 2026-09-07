@@ -416,6 +416,24 @@ matrix runner to `ubuntu-22.04`, install `gcc-aarch64-linux-gnu`, target
 `--version` check, because an arm64 binary does not run on an x86_64 runner. That build links
 against glibc, so it will not run on an older distribution.
 
+## Continuous integration
+
+| Workflow | Trigger | What it runs |
+|---|---|---|
+| `test` | push and pull request on `master` | `cargo fmt --all --check`, then `cargo clippy --workspace --all-targets --locked --features sign -- -D warnings`, then `cargo test --workspace --all-targets --locked --features sign` |
+| `dependency-review` | pull request on `master` | Blocks a pull request that introduces a dependency with a high-severity advisory |
+| `release` | a tag matching `v*`, or by hand | Builds the five platforms, writes and signs the manifest, and creates the GitHub release |
+
+`--features sign` appears in both the clippy and the test commands so that `tools/sign.rs` is
+covered too. A plain `cargo build` skips that binary, and the release depends on it, so a break in
+it must fail here rather than at a release.
+
+`dependency-review` needs the repository's dependency graph enabled. Without it the step fails with
+`Dependency review is not supported on this repository`.
+
+Dependabot raises weekly Cargo and GitHub Actions updates, and groups the `serde` crates so the
+pair resolves in one review.
+
 ## Project structure
 
 <details>
@@ -443,6 +461,8 @@ cargo fmt --check
 
 The test suite is 138 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
 `--features sign` to clippy so that the signing tool is linted too; a plain `cargo build` skips it.
+The `test` workflow runs all three commands, and it fails on an unformatted file and on a clippy
+warning, so running them locally first saves a round trip.
 
 A local `cargo build` uses the development key, so a locally built binary cannot open a store
 written by a release build, and the reverse also holds. That is the key binding working. Reimport
