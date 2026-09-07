@@ -262,7 +262,7 @@ impl Config {
     /// binary carries no default endpoint.
     pub fn load(options: &Options, log: &dyn Fn(&str)) -> Result<Self> {
         let root = match options.root.clone() {
-            Some(path) => path,
+            Some(path) => absolute(&path)?,
             None => dirs::home_dir()
                 .context("cannot locate the home directory")?
                 .join(".brainmaker"),
@@ -272,7 +272,7 @@ impl Config {
         let mut source = Source::Stored;
         let mut settings = Settings::default();
 
-        if let Some(path) = provision::find(options.config.as_deref())? {
+        if let Some(path) = provision::find(options.config.as_deref(), store.is_file())? {
             settings = provision::read(&path)?;
             let sealed = secretstore::seal(settings.to_text().as_bytes())?;
             secretstore::write_owner_only(&store, &sealed)?;
@@ -519,6 +519,17 @@ impl Config {
     }
 }
 
+/// Makes a `--dir` path absolute.
+///
+/// Every path this module derives from the root ends up somewhere that outlives
+/// the working directory: the skill links under `~/.claude/skills`, and the
+/// `--dir` in the `SessionStart` hook. A relative root would put a relative
+/// path into both, and both would then break from any other directory.
+fn absolute(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path)
+        .with_context(|| format!("cannot make {} an absolute path", path.display()))
+}
+
 fn env_value(key: &str) -> Option<String> {
     match std::env::var(key) {
         Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
@@ -563,6 +574,18 @@ mod tests {
             "super-secret-value".to_string(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_relative_root_becomes_absolute() {
+        let root = absolute(Path::new("some/root")).unwrap();
+        assert!(root.is_absolute(), "got {}", root.display());
+        assert!(root.ends_with("some/root"), "got {}", root.display());
+        // An absolute root is kept as it is.
+        assert_eq!(
+            absolute(Path::new("/tmp/root")).unwrap(),
+            PathBuf::from("/tmp/root")
+        );
     }
 
     #[test]

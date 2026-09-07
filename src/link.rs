@@ -121,8 +121,9 @@ pub fn link(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Report
     let mut report = Report::default();
     link_skills(&content, claude, &mut report)?;
     let program = install_program(config)?;
-    report.settings_changed = write_settings(claude, Some(&program), Some(config.root()))?;
-    report.briefing_changed = write_briefing(&content, claude, true)?;
+    let prefix = command_prefix(&program, Some(config.root()));
+    report.settings_changed = write_settings(claude, Some(&prefix))?;
+    report.briefing_changed = write_briefing(&content, claude, Some(&prefix))?;
     describe(&report, true, log);
     Ok(report)
 }
@@ -132,8 +133,8 @@ pub fn unlink(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Repo
     let content = config.content_dir();
     let mut report = Report::default();
     unlink_skills(&content, claude, &mut report)?;
-    report.settings_changed = write_settings(claude, None, None)?;
-    report.briefing_changed = write_briefing(&content, claude, false)?;
+    report.settings_changed = write_settings(claude, None)?;
+    report.briefing_changed = write_briefing(&content, claude, None)?;
     describe(&report, false, log);
     Ok(report)
 }
@@ -227,28 +228,63 @@ fn floor_char_boundary(text: &str, limit: usize) -> usize {
 /// folder that the install instructions tell the reader to delete.
 ///
 /// So the binary is copied under the brainmaker root, which is the one
-/// directory that outlives the archive, and the hook names that copy. A binary
-/// already living there is left alone, so `self-update` keeps working on the
-/// copy the hook runs.
+/// directory that outlives the archive, and the hook names that copy. When the
+/// running binary already is that copy, nothing is written, so `self-update`
+/// keeps working on the file the hook runs.
 fn install_program(config: &Config) -> Result<PathBuf> {
-    let target = config.root().join("bin").join(program_name());
+    let target = installed_program(config);
     let current = std::env::current_exe().context("cannot find this program's own path")?;
-
-    if current == target {
-        return Ok(target);
-    }
-
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
-    // Remove first: copying onto a running binary fails with ETXTBSY on some
-    // systems, and a rename over it would leave the old inode running.
-    let _ = fs::remove_file(&target);
-    fs::copy(&current, &target)
-        .with_context(|| format!("cannot copy {} to {}", current.display(), target.display()))?;
-    set_executable(&target)?;
+    copy_program(&current, &target)?;
     Ok(target)
+}
+
+/// The path the hook runs: `<root>/bin/brainmaker`.
+pub fn installed_program(config: &Config) -> PathBuf {
+    config.root().join("bin").join(program_name())
+}
+
+/// Copies the binary at `from` to `to`, unless both name one file.
+///
+/// The identity check goes through [`same_file`], not through the two path
+/// strings. `link` may run through a symbolic link to the installed copy, or
+/// by a path that spells the root differently, and a string comparison then
+/// removed the very file it was about to copy: the copy failed with "No such
+/// file or directory", and the installed binary was gone.
+///
+/// The copy lands beside `to` and is renamed over it. A rename never writes
+/// into a file that is being executed, which fails with ETXTBSY on some
+/// systems, and a running old copy keeps its own inode.
+pub fn copy_program(from: &Path, to: &Path) -> Result<()> {
+    if same_file(from, to) {
+        return Ok(());
+    }
+
+    let parent = to
+        .parent()
+        .with_context(|| format!("{} has no parent directory", to.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("cannot create {}", parent.display()))?;
+
+    let staged = parent.join(format!(".{}-{}.new", program_name(), std::process::id()));
+    let result = (|| -> Result<()> {
+        fs::copy(from, &staged)
+            .with_context(|| format!("cannot copy {} to {}", from.display(), staged.display()))?;
+        set_executable(&staged)?;
+        fs::rename(&staged, to)
+            .with_context(|| format!("cannot move {} to {}", staged.display(), to.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
+}
+
+/// True when both paths name one existing file, whatever links or spellings
+/// lie on the way to it.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The file name the copied binary takes.
@@ -380,12 +416,25 @@ fn make_symlink(source: &Path, target: &Path) -> Result<()> {
     })
 }
 
+/// The start of every command that names the installed binary: the full path,
+/// quoted, and the root it must use.
+///
+/// The path is quoted because nothing puts this binary on `PATH`, so the
+/// command must carry the whole path, and a home directory may hold a space.
+/// The root is named because without it the command takes the default root,
+/// which is the wrong one whenever `link` ran with `--dir`.
+pub fn command_prefix(program: &Path, root: Option<&Path>) -> String {
+    let exe = format!("{:?}", program.display().to_string());
+    match root {
+        Some(path) => format!("{exe} --dir {:?}", path.display().to_string()),
+        None => exe,
+    }
+}
+
 /// Adds or removes the `SessionStart` hook. Returns true when the file changed.
-fn write_settings(
-    claude: &Path,
-    program: Option<&Path>,
-    brainmaker_root: Option<&Path>,
-) -> Result<bool> {
+///
+/// `prefix` is the [`command_prefix`] to install, or `None` to remove the hook.
+fn write_settings(claude: &Path, prefix: Option<&str>) -> Result<bool> {
     let path = claude.join("settings.json");
     let mut root: Map<String, Value> = if path.is_file() {
         let text =
@@ -414,26 +463,17 @@ fn write_settings(
         }
     }
 
-    if let Some(program) = program {
-        // The full path, quoted: nothing puts this binary on PATH, and a home
-        // directory may hold a space.
-        let exe = format!("{:?}", program.display().to_string());
-        // Name the root too. Without it the hook takes the default root, which
-        // is the wrong one whenever `link` ran with `--dir`.
-        let dir = match brainmaker_root {
-            Some(path) => format!(" --dir {:?}", path.display().to_string()),
-            None => String::new(),
-        };
+    if let Some(prefix) = prefix {
         let group = json!({
             "hooks": [
                 {
                     "type": "command",
-                    "command": format!("{exe}{dir} sync --quiet --no-update-check # {MARKER}"),
+                    "command": format!("{prefix} sync --quiet --no-update-check # {MARKER}"),
                     "timeout": 60
                 },
                 {
                     "type": "command",
-                    "command": format!("{exe}{dir} session-context # {MARKER}"),
+                    "command": format!("{prefix} session-context # {MARKER}"),
                     "timeout": 15
                 }
             ]
@@ -485,12 +525,16 @@ fn is_ours(group: &Value) -> bool {
 }
 
 /// Adds or removes the marked block in `CLAUDE.md`. Returns true on a change.
-fn write_briefing(content: &Path, claude: &Path, install: bool) -> Result<bool> {
+///
+/// `prefix` is the [`command_prefix`] the block tells the reader to run, or
+/// `None` to remove the block. The block names the full command, because a
+/// bare `brainmaker unlink` fails: nothing puts the binary on `PATH`.
+fn write_briefing(content: &Path, claude: &Path, prefix: Option<&str>) -> Result<bool> {
     let path = claude.join("CLAUDE.md");
     let existing = fs::read_to_string(&path).unwrap_or_default();
     let stripped = strip_block(&existing);
 
-    let updated = if install {
+    let updated = if let Some(prefix) = prefix {
         let block = format!(
             "{BLOCK_START}\n\
              # Shared content\n\n\
@@ -498,7 +542,7 @@ fn write_briefing(content: &Path, claude: &Path, install: bool) -> Result<bool> 
              briefing, the wiki, and the agent memory. Read `CLAUDE.md` there before any \
              non-trivial action, and follow the `[[wiki/...]]` pointers it gives rather than \
              loading the whole directory.\n\n\
-             Run `brainmaker unlink` to remove this block and the linked skills.\n\
+             Run `{prefix} unlink` to remove this block and the linked skills.\n\
              {BLOCK_END}",
             content.display()
         );
@@ -612,6 +656,86 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn copying_through_a_link_to_the_target_leaves_the_target_alone() {
+        // `link` run through a symbolic link to the installed copy used to
+        // remove that copy and then fail to copy it onto itself.
+        let base = temp_dir("copy-self");
+        let target = base.join("bin").join("brainmaker");
+        write(&target, "installed\n");
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+
+        copy_program(&alias, &target).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "installed\n");
+        assert!(same_file(&alias, &target));
+        assert!(!same_file(&base.join("absent"), &target));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_a_binary_from_elsewhere_and_makes_it_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = temp_dir("copy-new");
+        let source = base.join("Downloads").join("brainmaker");
+        write(&source, "new\n");
+        let target = base.join("root").join("bin").join("brainmaker");
+        write(&target, "old\n");
+
+        copy_program(&source, &target).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "got {mode:o}");
+        // No staging file is left beside the target.
+        let leftovers: Vec<_> = fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["brainmaker".to_string()]);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_command_prefix_quotes_the_path_and_names_the_root() {
+        assert_eq!(
+            command_prefix(Path::new("/opt/bm/bin/brainmaker"), None),
+            "\"/opt/bm/bin/brainmaker\""
+        );
+        assert_eq!(
+            command_prefix(
+                Path::new("/My Apps/brainmaker"),
+                Some(Path::new("/My Root"))
+            ),
+            "\"/My Apps/brainmaker\" --dir \"/My Root\""
+        );
+    }
+
+    #[test]
+    fn the_briefing_block_names_a_command_that_can_run() {
+        // A bare `brainmaker unlink` fails: nothing puts the binary on PATH.
+        let base = temp_dir("briefing-command");
+        let content = base.join("content");
+        let claude = base.join("claude");
+        let prefix = command_prefix(
+            Path::new("/opt/bm/bin/brainmaker"),
+            Some(Path::new("/opt/bm")),
+        );
+
+        write_briefing(&content, &claude, Some(&prefix)).unwrap();
+        let text = fs::read_to_string(claude.join("CLAUDE.md")).unwrap();
+        assert!(
+            text.contains("Run `\"/opt/bm/bin/brainmaker\" --dir \"/opt/bm\" unlink`"),
+            "{text}"
+        );
+        assert!(!text.contains("Run `brainmaker unlink`"), "{text}");
+        fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn finds_only_a_directory_that_holds_a_skill_file() {
         let base = temp_dir("shipped");
@@ -713,9 +837,19 @@ mod tests {
             r#"{"model": "opus", "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}"#,
         );
 
-        assert!(write_settings(&claude, Some(Path::new("/opt/bm/bin/brainmaker")), None).unwrap());
         assert!(
-            !write_settings(&claude, Some(Path::new("/opt/bm/bin/brainmaker")), None).unwrap(),
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+            )
+            .unwrap()
+        );
+        assert!(
+            !write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+            )
+            .unwrap(),
             "second run is a no-op"
         );
 
@@ -726,7 +860,7 @@ mod tests {
         assert_eq!(value["model"], "opus", "unrelated settings survive");
         assert_eq!(text.matches(MARKER).count(), 2);
 
-        assert!(write_settings(&claude, None, None).unwrap());
+        assert!(write_settings(&claude, None).unwrap());
         let value: Value =
             serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
                 .unwrap();
@@ -743,7 +877,7 @@ mod tests {
         let claude = base.join("claude");
         let program = base.join("bin").join("brainmaker");
 
-        write_settings(&claude, Some(&program), None).unwrap();
+        write_settings(&claude, Some(&command_prefix(&program, None))).unwrap();
         let text = fs::read_to_string(claude.join("settings.json")).unwrap();
 
         assert!(text.contains(program.display().to_string().as_str()));
@@ -760,7 +894,7 @@ mod tests {
         let claude = base.join("claude");
         let program = base.join("My Apps").join("brainmaker");
 
-        write_settings(&claude, Some(&program), None).unwrap();
+        write_settings(&claude, Some(&command_prefix(&program, None))).unwrap();
         let value: Value =
             serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
                 .unwrap();
@@ -777,7 +911,13 @@ mod tests {
         let base = temp_dir("fresh-settings");
         let claude = base.join("claude");
 
-        assert!(write_settings(&claude, Some(Path::new("/opt/bm/bin/brainmaker")), None).unwrap());
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+            )
+            .unwrap()
+        );
         let value: Value =
             serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
                 .unwrap();
@@ -793,17 +933,17 @@ mod tests {
         fs::create_dir_all(&claude).unwrap();
         write(&claude.join("CLAUDE.md"), "# Mine\n\nKeep this.\n");
 
-        assert!(write_briefing(&content, &claude, true).unwrap());
+        assert!(write_briefing(&content, &claude, Some("\"/opt/bm/bin/brainmaker\"")).unwrap());
         let text = fs::read_to_string(claude.join("CLAUDE.md")).unwrap();
         assert!(text.starts_with("# Mine\n\nKeep this."));
         assert!(text.contains(BLOCK_START) && text.contains(BLOCK_END));
 
         assert!(
-            !write_briefing(&content, &claude, true).unwrap(),
+            !write_briefing(&content, &claude, Some("\"/opt/bm/bin/brainmaker\"")).unwrap(),
             "idempotent"
         );
 
-        assert!(write_briefing(&content, &claude, false).unwrap());
+        assert!(write_briefing(&content, &claude, None).unwrap());
         assert_eq!(
             fs::read_to_string(claude.join("CLAUDE.md")).unwrap(),
             "# Mine\n\nKeep this.\n"
@@ -817,9 +957,9 @@ mod tests {
         let content = base.join("content");
         let claude = base.join("claude");
 
-        assert!(write_briefing(&content, &claude, true).unwrap());
+        assert!(write_briefing(&content, &claude, Some("\"/opt/bm/bin/brainmaker\"")).unwrap());
         assert!(claude.join("CLAUDE.md").is_file());
-        assert!(write_briefing(&content, &claude, false).unwrap());
+        assert!(write_briefing(&content, &claude, None).unwrap());
         assert!(!claude.join("CLAUDE.md").exists());
         fs::remove_dir_all(&base).ok();
     }

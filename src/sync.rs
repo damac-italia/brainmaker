@@ -16,6 +16,9 @@ use crate::state::{self, State};
 pub enum Outcome {
     /// The local content already matches the remote hash.
     UpToDate { hash: String },
+    /// The server could not be reached, and the installed content stays in
+    /// place. `hash` is the installed one.
+    Unreachable { hash: String, error: String },
     /// The local content now matches the remote hash.
     Updated {
         previous: Option<String>,
@@ -28,19 +31,35 @@ pub enum Outcome {
 ///
 /// The function downloads and extracts only when the local hash differs from
 /// the remote hash, when `content/` is missing, or when `force` is true.
+///
+/// A server that cannot be reached is not an error while content is
+/// installed. The hook runs this at every session start, and a laptop is
+/// often offline; the installed content then stays in place and the run
+/// reports [`Outcome::Unreachable`]. With nothing installed, or with
+/// `force`, the failure is returned, because there is nothing to fall back on.
 pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome> {
     fs::create_dir_all(config.root())
         .with_context(|| format!("cannot create the directory {}", config.root().display()))?;
 
     let content_dir = config.content_dir();
     let local = state::read(&config.state_file());
-
-    log("Checking the latest content version.");
-    let release = remote::latest_release(config)?;
-    let remote_hash = release.hash.clone();
-
     let installed = local.as_ref().map(|s| s.hash.clone());
     let content_present = content_dir.is_dir();
+
+    log("Checking the latest content version.");
+    let release = match remote::latest_release(config) {
+        Ok(release) => release,
+        Err(error) => {
+            return match installed {
+                Some(hash) if content_present && !force => Ok(Outcome::Unreachable {
+                    hash,
+                    error: format!("{error:#}"),
+                }),
+                _ => Err(error),
+            };
+        }
+    };
+    let remote_hash = release.hash.clone();
 
     if !force && installed.as_deref() == Some(remote_hash.as_str()) && content_present {
         return Ok(Outcome::UpToDate { hash: remote_hash });

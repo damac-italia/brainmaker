@@ -51,6 +51,11 @@ A failed software check during `sync` does not change the exit code. `brainmaker
 `notice: cannot check for a software update: ...` to stderr and exits 0, because the content is
 already in place. `--quiet` suppresses that notice.
 
+A server that `sync` cannot reach is treated the same way while content is installed: `brainmaker`
+prints `notice: cannot check the latest content version: ...` and
+`notice: the installed content <hash> stays in place.` to stderr, and exits 0. With nothing
+installed, or with `--force`, the failure exits 1.
+
 ### `status` output
 
 `status` prints one `key value` pair per line:
@@ -68,12 +73,12 @@ already in place. `--quiet` suppresses that notice.
 | `signing` | Both key counts, as `N trusted software key(s), N trusted content key(s)`. `0` software keys means it installs no update; `0` content keys means it installs no content. |
 | `installed` | The hash in `state.json`, or `<none>` |
 | `present` | `yes` when `content/` is a directory |
-| `latest` | The hash the server reports |
-| `state` | `up to date`, `stale`, or `not installed` |
+| `latest` | The hash the server reports, or `<unknown>` when it cannot be reached |
+| `state` | `up to date`, `stale`, `not installed`, or `cannot check: <reason>` |
 | `software` | This binary's version |
 | `platform` | This machine's manifest key, for example `darwin-arm64` |
 | `published` | The manifest version, or `<unknown>` |
-| `update` | `none`, `available; run brainmaker self-update`, or a reason |
+| `update` | `none`, `available; run <path of this binary> self-update`, or a reason |
 
 ### `session-context` output
 

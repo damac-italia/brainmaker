@@ -310,8 +310,14 @@ pub fn read(path: &Path) -> Result<Settings> {
 ///    silent skip.
 /// 2. `$BRAINMAKER_CONFIG`.
 /// 3. `brainmaker.env`, then `.brainmaker.env`, next to the running binary.
-/// 4. `brainmaker.env`, then `.brainmaker.env`, in the working directory.
-pub fn find(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
+/// 4. `brainmaker.env`, then `.brainmaker.env`, in the working directory, but
+///    only when `provisioned` is false.
+///
+/// The working directory is searched on the first run only. The `SessionStart`
+/// hook runs `sync` inside whatever project is open, and once the settings are
+/// sealed, a file of that name in a project must not be imported over them and
+/// deleted. A later change of endpoint goes through steps 1 to 3.
+pub fn find(explicit: Option<&Path>, provisioned: bool) -> Result<Option<PathBuf>> {
     if let Some(path) = explicit {
         if !path.is_file() {
             bail!("--config names {}, which is not a file", path.display());
@@ -333,7 +339,8 @@ pub fn find(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
     {
         directories.push(parent.to_path_buf());
     }
-    if let Ok(cwd) = std::env::current_dir()
+    if !provisioned
+        && let Ok(cwd) = std::env::current_dir()
         && !directories.contains(&cwd)
     {
         directories.push(cwd);
@@ -576,8 +583,39 @@ mod tests {
     }
 
     #[test]
+    fn find_reads_the_working_directory_on_the_first_run_only() {
+        // The hook runs inside whatever project is open. A brainmaker.env
+        // there must not replace sealed settings and then be deleted.
+        let dir = std::env::temp_dir().join(format!(
+            "brainmaker-find-cwd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("brainmaker.env"),
+            "BRAINMAKER_API_BASE=https://x\n",
+        )
+        .unwrap();
+
+        let before = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let first = find(None, false);
+        let later = find(None, true);
+        std::env::set_current_dir(before).unwrap();
+
+        assert!(first.unwrap().is_some(), "the first run imports the file");
+        assert!(
+            later.unwrap().is_none(),
+            "a provisioned run leaves it alone"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn find_rejects_an_explicit_path_that_does_not_exist() {
         let missing = Path::new("/nonexistent/brainmaker.env");
-        assert!(find(Some(missing)).is_err());
+        assert!(find(Some(missing), false).is_err());
     }
 }

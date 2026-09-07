@@ -174,6 +174,11 @@ impl Build {
 ///
 /// The function verifies the SHA-256 and runs the new binary with `--version`
 /// before it swaps. Returns the path it replaced.
+///
+/// When `link` has installed a copy under the root and the running binary is
+/// another file, that copy is replaced too. The hook runs the copy, and an
+/// update that reached only the file the user happened to run would leave
+/// every session on the old version.
 pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -> Result<PathBuf> {
     let expected_sum = build.checksum()?;
     let url = config.binary_url(latest, &platform_key());
@@ -217,8 +222,29 @@ pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -
         let _ = fs::remove_file(&staged);
     }
     let _ = fs::remove_file(&backup);
+    result?;
 
-    result.map(|()| exe)
+    let installed = crate::link::installed_program(config);
+    if installed.is_file() && !crate::link::same_file(&exe, &installed) {
+        crate::link::copy_program(&exe, &installed)?;
+        log(&format!(
+            "Replaced {} too, which the SessionStart hook runs.",
+            installed.display()
+        ));
+    }
+
+    Ok(exe)
+}
+
+/// The command that installs the update, as the reader can type it.
+///
+/// A bare `brainmaker self-update` fails after the archive is deleted: nothing
+/// puts the binary on `PATH`. So the hint names the running binary's own path.
+pub fn self_update_command() -> String {
+    match std::env::current_exe() {
+        Ok(exe) => format!("{} self-update", exe.display()),
+        Err(_) => "brainmaker self-update".to_string(),
+    }
 }
 
 /// Puts `staged` at `exe`.

@@ -169,16 +169,26 @@ fn status(config: &Config) -> Result<()> {
         if content_dir.is_dir() { "yes" } else { "no" }
     );
 
-    let latest = remote::latest_release(config)?.hash;
-    println!("latest    {latest}");
-    println!(
-        "state     {}",
-        match installed.as_ref() {
-            Some(s) if s.hash == latest && content_dir.is_dir() => "up to date",
-            Some(_) => "stale",
-            None => "not installed",
+    // `status` changes nothing, so an unreachable server is a value here, not
+    // an exit. The software rows below take the same view.
+    match remote::latest_release(config) {
+        Ok(release) => {
+            let latest = release.hash;
+            println!("latest    {latest}");
+            println!(
+                "state     {}",
+                match installed.as_ref() {
+                    Some(s) if s.hash == latest && content_dir.is_dir() => "up to date",
+                    Some(_) => "stale",
+                    None => "not installed",
+                }
+            );
         }
-    );
+        Err(error) => {
+            println!("latest    <unknown>");
+            println!("state     cannot check: {error:#}");
+        }
+    }
 
     println!("software  {}", selfupdate::CURRENT_VERSION);
     println!("platform  {}", selfupdate::platform_key());
@@ -189,7 +199,10 @@ fn status(config: &Config) -> Result<()> {
         }
         Ok(selfupdate::Check::Newer { latest, .. }) => {
             println!("published {latest}");
-            println!("update    available; run brainmaker self-update");
+            println!(
+                "update    available; run {}",
+                selfupdate::self_update_command()
+            );
         }
         Ok(selfupdate::Check::NewerElsewhere {
             latest, offered, ..
@@ -286,9 +299,9 @@ fn report_software_check(config: &Config, quiet: bool) {
         Ok(selfupdate::Check::Newer { latest, .. }) => {
             if !quiet {
                 println!(
-                    "A newer brainmaker is published: {latest} (this binary is {}). \
-                     Run brainmaker self-update.",
-                    selfupdate::CURRENT_VERSION
+                    "A newer brainmaker is published: {latest} (this binary is {}). Run {}.",
+                    selfupdate::CURRENT_VERSION,
+                    selfupdate::self_update_command()
                 );
             }
         }
@@ -310,6 +323,12 @@ fn report(config: &Config, outcome: &sync::Outcome, quiet: bool) {
     match outcome {
         sync::Outcome::UpToDate { hash } => {
             println!("The content is up to date at {hash}.");
+        }
+        // A notice, not an error: the installed content is in place and the
+        // exit code stays 0. Quiet suppresses it, as it does the software one.
+        sync::Outcome::Unreachable { hash, error } => {
+            eprintln!("notice: cannot check the latest content version: {error}");
+            eprintln!("notice: the installed content {hash} stays in place.");
         }
         sync::Outcome::Updated {
             previous,

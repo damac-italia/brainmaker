@@ -120,7 +120,7 @@ as a project, and at user scope they would run on every tool call in every proje
 
 ### Run it at the start of every Claude session
 
-Add a `SessionStart` hook to `~/.claude/settings.json`:
+`link` writes this `SessionStart` group into `~/.claude/settings.json`:
 
 ```json
 {
@@ -130,8 +130,13 @@ Add a `SessionStart` hook to `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "brainmaker sync --quiet --no-update-check",
+            "command": "\"/Users/you/.brainmaker/bin/brainmaker\" --dir \"/Users/you/.brainmaker\" sync --quiet --no-update-check # brainmaker-link",
             "timeout": 60
+          },
+          {
+            "type": "command",
+            "command": "\"/Users/you/.brainmaker/bin/brainmaker\" --dir \"/Users/you/.brainmaker\" session-context # brainmaker-link",
+            "timeout": 15
           }
         ]
       }
@@ -140,9 +145,17 @@ Add a `SessionStart` hook to `~/.claude/settings.json`:
 }
 ```
 
-`--quiet` keeps a successful run silent. A failed run still prints to stderr and exits 1.
+The command names the binary by its full path, because nothing puts `brainmaker` on `PATH`, and
+`link` first copies the running binary to `~/.brainmaker/bin/brainmaker` so the path outlives the
+archive it was unzipped from. `--dir` names the root, so a link made with `--dir` keeps using it.
+A relative `--dir` is made absolute before anything is written.
+
+`--quiet` keeps a successful run silent. A failed run still prints to stderr and exits 1. A server
+that cannot be reached is not a failure while content is installed: the installed content stays,
+and the run exits 0 with a notice that `--quiet` hides.
 `--no-update-check` drops one HTTP request per session. The hook installs no binary; run
-`brainmaker self-update` yourself.
+`self-update` yourself. `self-update` replaces the binary you ran and, when it is another file,
+the copy under `~/.brainmaker/bin` too, so the hook never stays on the old version.
 
 ## Configuration
 
@@ -203,10 +216,12 @@ BRAINMAKER_SOFTWARE_BINARY_PATH=releases/bm-{version}-{platform}{ext}
 1. `--config <PATH>`. A path that is not a file is an error, not a silent skip.
 2. `$BRAINMAKER_CONFIG`. A path that is not a file is an error.
 3. `brainmaker.env`, then `.brainmaker.env`, next to the running binary.
-4. `brainmaker.env`, then `.brainmaker.env`, in the working directory.
+4. `brainmaker.env`, then `.brainmaker.env`, in the working directory, on the first run only.
 
 `brainmaker` never reads a bare `.env`, so running it inside another project cannot import and then
-delete that project's file.
+delete that project's file. Once the settings are sealed, it also stops searching the working
+directory: the `SessionStart` hook runs inside whatever project is open, and a `brainmaker.env`
+there must not replace the sealed settings. To change endpoints later, use steps 1 to 3.
 
 To change endpoints later, issue a new file and have the employee drop it next to the binary. The
 next run imports it, overwrites the sealed store, and removes the file.
