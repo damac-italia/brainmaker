@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "head": "4e55031",
+  "head": "73a3b10",
   "docs": {
     "README.md": {
-      "doc_hash": "e286f7e28d6544cc",
+      "doc_hash": "6b71cc6eadd45372",
       "sources": {
         ".github/dependabot.yml": "37a1071047e74ea4",
         ".github/workflows/dependency-review.yml": "568eebf8eae600c9",
@@ -17,7 +17,7 @@
         "src/cli.rs": "cfdd372b2c15d789",
         "src/config.rs": "63399590aac21e95",
         "src/link.rs": "8f7f0f69c330a2a4",
-        "src/main.rs": "ae6f1ad7c6d86c1e",
+        "src/main.rs": "5a88a1b28ea3afec",
         "src/provision.rs": "c340749a3c8a1d3a",
         "src/selfupdate.rs": "660d65b1022786b1",
         "src/signature.rs": "c47681e493b62b27",
@@ -35,7 +35,7 @@
         "src/config.rs": "63399590aac21e95",
         "src/digest.rs": "2047ae79b95e1a8b",
         "src/link.rs": "8f7f0f69c330a2a4",
-        "src/main.rs": "ae6f1ad7c6d86c1e",
+        "src/main.rs": "5a88a1b28ea3afec",
         "src/provision.rs": "c340749a3c8a1d3a",
         "src/secretstore.rs": "4855746c677a7b49",
         "src/selfupdate.rs": "660d65b1022786b1",
@@ -52,7 +52,7 @@
         "src/archive.rs": "a98d173402f543d6",
         "src/auth.rs": "8e416ad13a11af97",
         "src/config.rs": "63399590aac21e95",
-        "src/main.rs": "ae6f1ad7c6d86c1e",
+        "src/main.rs": "5a88a1b28ea3afec",
         "src/provision.rs": "c340749a3c8a1d3a",
         "src/remote.rs": "0b0ce8427a86816a",
         "src/selfupdate.rs": "660d65b1022786b1",
@@ -63,14 +63,14 @@
       }
     },
     "docs/API.md": {
-      "doc_hash": "e2d0009284cfb189",
+      "doc_hash": "7521f46da28e55b8",
       "sources": {
         "scripts/make-manifest.sh": "4883c40694dc1312",
         "src/auth.rs": "8e416ad13a11af97",
         "src/cli.rs": "cfdd372b2c15d789",
         "src/config.rs": "63399590aac21e95",
         "src/link.rs": "8f7f0f69c330a2a4",
-        "src/main.rs": "ae6f1ad7c6d86c1e",
+        "src/main.rs": "5a88a1b28ea3afec",
         "src/provision.rs": "c340749a3c8a1d3a",
         "src/remote.rs": "0b0ce8427a86816a",
         "src/selfupdate.rs": "660d65b1022786b1",

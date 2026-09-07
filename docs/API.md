@@ -65,8 +65,7 @@ already in place. `--quiet` suppresses that notice.
 | `token url` | The token endpoint in use, or `<none>` |
 | `auth` | `absent`, or `client-credentials grant, scope sync, client id N characters, secret N characters`. Never a credential itself. |
 | `key` | `release` or `development`, naming which build key this binary carries |
-| `signing` | How many software signing keys this binary trusts. `0` means it installs no update. |
-| `content` | How many content signing keys this binary trusts. `0` means it installs no content. This key repeats the label of the content directory row above; both are printed. |
+| `signing` | Both key counts, as `N trusted software key(s), N trusted content key(s)`. `0` software keys means it installs no update; `0` content keys means it installs no content. |
 | `installed` | The hash in `state.json`, or `<none>` |
 | `present` | `yes` when `content/` is a directory |
 | `latest` | The hash the server reports |

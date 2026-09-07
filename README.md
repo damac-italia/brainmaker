@@ -88,7 +88,8 @@ brainmaker self-update
 
 `self-update` installs only a manifest signed by a key in `PUBLIC_KEYS` in
 [src/signature.rs](src/signature.rs). A build with an empty list installs nothing, and
-`brainmaker status` reports `signing   0 trusted key(s)`. See [Signing keys](#signing-keys).
+`brainmaker status` reports `0 trusted software key(s)` on its `signing` line. See
+[Signing keys](#signing-keys).
 
 `sync` applies the same rule to the content, against `CONTENT_KEYS`. A release that no listed key
 signed stops before the archive is extracted, and the archive's SHA-256 and size are checked
