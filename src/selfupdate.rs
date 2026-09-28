@@ -362,6 +362,7 @@ fn verify_runs(staged: &Path, expected_version: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{self, Route, Server, Signer};
 
     fn build() -> Build {
         Build {
@@ -469,5 +470,137 @@ mod tests {
         assert_eq!(fs::read(&exe).unwrap(), b"new");
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A software manifest for `version`, with one build for each of `platforms`.
+    fn manifest(version: &str, platforms: &[&str]) -> String {
+        let builds: serde_json::Map<String, serde_json::Value> = platforms
+            .iter()
+            .map(|platform| {
+                (
+                    platform.to_string(),
+                    serde_json::json!({ "sha256": "c".repeat(64) }),
+                )
+            })
+            .collect();
+        serde_json::json!({ "version": version, "platforms": builds }).to_string()
+    }
+
+    /// Runs `check` against a server that publishes `payload`, signed by `signer`.
+    fn check_against(signer: &Signer, payload: &str) -> Result<Check> {
+        let server = Server::start(vec![Route::get(
+            "/software/brainmaker",
+            signer.envelope(payload),
+        )]);
+        let dir = testutil::temp_dir("update-check");
+        let result = check(&Config::for_test(&dir, &server.base()));
+        fs::remove_dir_all(&dir).unwrap();
+        result
+    }
+
+    #[test]
+    fn offers_a_newer_version_for_this_platform() {
+        let signer = Signer::new();
+        signer.trust();
+        let platform = platform_key();
+        let payload = manifest("999.0.0", &[platform.as_str()]);
+
+        match check_against(&signer, &payload).unwrap() {
+            Check::Newer {
+                latest,
+                platform: offered_for,
+                build,
+            } => {
+                assert_eq!(latest, "999.0.0");
+                assert_eq!(offered_for, platform);
+                assert_eq!(build.sha256, "c".repeat(64));
+            }
+            other => panic!("expected a newer version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offers_nothing_for_the_running_version() {
+        let signer = Signer::new();
+        signer.trust();
+        let platform = platform_key();
+        let payload = manifest(CURRENT_VERSION, &[platform.as_str()]);
+
+        match check_against(&signer, &payload).unwrap() {
+            Check::UpToDate { version, build, .. } => {
+                assert_eq!(version, CURRENT_VERSION);
+                assert!(build.is_some(), "the manifest lists this platform");
+            }
+            other => panic!("expected the running version to stand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offers_nothing_for_an_older_version() {
+        // A replayed manifest from an earlier release, which carries a valid
+        // signature, must not move the binary back.
+        let signer = Signer::new();
+        signer.trust();
+        let platform = platform_key();
+        let payload = manifest("0.0.1", &[platform.as_str()]);
+
+        match check_against(&signer, &payload).unwrap() {
+            Check::UpToDate { version, .. } => assert_eq!(version, "0.0.1"),
+            other => panic!("expected no update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn names_the_platforms_when_this_one_is_absent() {
+        let signer = Signer::new();
+        signer.trust();
+        let payload = manifest("999.0.0", &["plan9-mips"]);
+
+        match check_against(&signer, &payload).unwrap() {
+            Check::NewerElsewhere {
+                latest,
+                platform,
+                offered,
+            } => {
+                assert_eq!(latest, "999.0.0");
+                assert_eq!(platform, platform_key());
+                assert_eq!(offered, vec!["plan9-mips".to_string()]);
+            }
+            other => panic!("expected a version for other platforms, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_a_manifest_that_the_content_key_signed() {
+        // The harness makes the client trust one key for both documents, so it
+        // cannot give the content key a role of its own. This test covers the
+        // rule one level down: a manifest that a key outside the trusted set
+        // signed is refused. `the_two_key_lists_share_no_key` covers the rule
+        // that the content key is not in the software list.
+        let signer = Signer::new();
+        Signer::new().trust();
+        let platform = platform_key();
+        let payload = manifest("999.0.0", &[platform.as_str()]);
+
+        let error = check_against(&signer, &payload).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("cannot trust the software manifest"),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_version_with_a_forbidden_character() {
+        let signer = Signer::new();
+        signer.trust();
+        let platform = platform_key();
+        let payload = manifest("1.0.0/../x", &[platform.as_str()]);
+
+        let error = check_against(&signer, &payload).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("invalid version string"), "got {text}");
     }
 }
