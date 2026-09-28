@@ -39,10 +39,12 @@ pub enum Outcome {
 #[cfg(not(test))]
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 
-/// The same wait in a test build, short enough for a test that holds the
-/// lock on purpose.
+/// The same wait in a test build. It stays short, because a test that holds
+/// the lock on purpose waits for all of it. It is one second and no less,
+/// because a test that frees the lock from a second thread needs room on a
+/// slow machine.
 #[cfg(test)]
-const LOCK_WAIT: Duration = Duration::from_millis(200);
+const LOCK_WAIT: Duration = Duration::from_secs(1);
 
 /// Brings `content/` to the latest remote version.
 ///
