@@ -3,7 +3,7 @@
 //! The local record of which content version is installed.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -36,6 +36,11 @@ pub fn read(path: &Path) -> Option<State> {
     serde_json::from_str(&text).ok()
 }
 
+/// The temporary file that [`write`] renames over `path`.
+pub fn temporary_path(path: &Path) -> PathBuf {
+    path.with_extension("json.tmp")
+}
+
 /// Writes the state file through a temporary file and a rename, so that a
 /// crash never leaves a half-written state file.
 pub fn write(path: &Path, state: &State) -> Result<()> {
@@ -45,7 +50,7 @@ pub fn write(path: &Path, state: &State) -> Result<()> {
     fs::create_dir_all(parent)
         .with_context(|| format!("cannot create the directory {}", parent.display()))?;
 
-    let temp = path.with_extension("json.tmp");
+    let temp = temporary_path(path);
     let text = serde_json::to_string_pretty(state).context("cannot serialize the state")?;
     fs::write(&temp, text).with_context(|| format!("cannot write {}", temp.display()))?;
     fs::rename(&temp, path)

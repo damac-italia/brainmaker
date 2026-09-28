@@ -165,6 +165,18 @@ The binary itself discloses no endpoint. Two unit tests enforce that: one reads 
 compile time and fails when a scheme is followed by a host character outside the test module, and
 one asserts that the help text holds no `http://` or `https://`.
 
+### Removal
+
+`brainmaker uninstall` deletes `confidential/config.enc` and its temporary file, together with the
+rest of the install. It reads no settings to do so, and it never imports a provisioning file.
+Deleting the store does not revoke the client on the server: the client identifier and secret stay
+valid until an administrator revokes them, so revoke them when a machine leaves service.
+
+The removal stays inside what `brainmaker` wrote. It acts only on a root that holds a parsable
+`state.json` or a `config.enc` that starts with the sealed header, and otherwise changes nothing,
+not even the hook in `~/.claude`. It removes named paths rather than the whole root. A symbolic link
+that it removes goes without the target it names.
+
 ## Input validation
 
 ### Content hash
@@ -250,7 +262,7 @@ and replace every binary in the fleet. With two, a compromise there yields what 
 already yields, and no more.
 
 The release workflow reads each block on its own for the same reason. A single grep over the file
-would collect both lists, and verification passes when any key given accepts — so a manifest signed
+would collect both lists, and verification passes when any key given accepts, so a manifest signed
 with the content key would have passed the check that exists to catch exactly that.
 
 ### Content is code, once it is linked
@@ -284,7 +296,7 @@ truncated. The caps are constants in [`src/config.rs`](../src/config.rs).
 | Crate | Requirement | Role |
 |---|---|---|
 | `anyhow` | 1.0.104 | Error context |
-| `dirs` | 6.0.0 | Home directory lookup |
+| `dirs` | 7.0.0 | Home directory lookup |
 | `ring` | 0.17 | AES-256-GCM, HKDF-SHA256, and Ed25519 verification |
 | `serde`, `serde_json` | 1.0.229, 1.0.151 | Manifest and state parsing |
 | `sha2` | 0.11.0 | Download checksum |
@@ -305,5 +317,5 @@ not open a public issue.
 Include the version from `brainmaker --version`, the platform key and signing-key count from
 `brainmaker status`, and the steps to reproduce.
 
-<!-- docsgen: unverified — private vulnerability reporting must be switched on in the repository's
+<!-- docsgen: unverified: private vulnerability reporting must be switched on in the repository's
      Settings > Code security before the link above accepts a report. -->

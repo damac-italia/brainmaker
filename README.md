@@ -57,6 +57,7 @@ gone. Later runs read the sealed copy and need no file.
 | Two key lists | Content and software verify against separate lists, so a content signer cannot sign a manifest |
 | Offline tolerance | Keeps the installed content and exits 0 when the server cannot be reached, so a session still starts |
 | Claude bridge | `link` puts the shared skills and the session briefing into `~/.claude`, for every project |
+| Clean removal | `uninstall` removes the bridge and everything brainmaker wrote under the root, and nothing else |
 | Self-update | Verifies the SHA-256 and the `--version` output before it swaps the binary, including the copy the hook runs |
 | Static Linux builds | `x86_64` and `arm64` link against musl, so there is no glibc version floor |
 
@@ -157,6 +158,34 @@ and the run exits 0 with a notice that `--quiet` hides.
 `--no-update-check` drops one HTTP request per session. The hook installs no binary; run
 `self-update` yourself. `self-update` replaces the binary you ran and, when it is another file,
 the copy under `~/.brainmaker/bin` too, so the hook never stays on the old version.
+
+### Remove brainmaker from this machine
+
+```bash
+brainmaker uninstall
+```
+
+`uninstall` asks first, then removes brainmaker in this order:
+
+1. What `link` wrote into `~/.claude`, exactly as `unlink` removes it.
+2. What brainmaker wrote under `~/.brainmaker`: the content, the program copy that the hook runs,
+   the state file, the sealed settings, and any temporary file that a stopped run left.
+3. `~/.brainmaker` itself, when nothing else is left in it.
+
+It removes nothing that brainmaker did not write. Your own skills, hooks, and `CLAUDE.md` text
+stay, and a file of yours under the root stays together with the root. When the root exists but
+holds neither a `state.json` nor a sealed `confidential/config.enc`, `uninstall` changes nothing,
+not even in `~/.claude`, so a mistyped `--dir` removes nothing. When the root is a symbolic link,
+the link goes and the directory it names stays.
+
+`--yes` skips the question. Without a terminal to ask on, `uninstall` refuses to run unless
+`--yes` is given. It loads no settings, so it also works where the sealed store no longer opens,
+and it refuses `--config`, `--keep-config`, and `--url`.
+
+The program you ran stays, unless it is the copy under the root, and the run names its path. A
+copy from `cargo install` goes with `cargo uninstall brainmaker`. Restart any open Claude session,
+because it keeps the hook that it loaded at its start. The client credentials stay valid on the
+server until your administrator revokes them.
 
 ## Configuration
 
@@ -268,6 +297,7 @@ disk. Every API request then carries `Authorization: Bearer <token>`.
 | `--force` | With `sync`, download and extract even when the content is up to date. With `self-update`, reinstall the same version. |
 | `--check` | With `self-update`, report the newer version and install nothing |
 | `--no-update-check` | With `sync`, skip the software version check |
+| `-y`, `--yes` | With `uninstall`, remove without asking first |
 | `--config <PATH>` | Import the provisioning file at `PATH` |
 | `--keep-config` | Do not remove the provisioning file after the import |
 | `--dir <PATH>` | Use `PATH` as the root instead of `~/.brainmaker` |
@@ -457,7 +487,7 @@ pair resolves in one review.
 <summary>Directory layout</summary>
 
 ```text
-src/                     the crate, one module per concern (16 files)
+src/                     the crate, one module per concern (17 files)
 tools/                   sign.rs, the signing tool; builds only under the sign feature
 scripts/                 make-manifest.sh, which writes the software manifest
 .github/workflows/       release.yml, plus the test and dependency-review checks
@@ -476,7 +506,7 @@ cargo clippy --all-targets --features sign
 cargo fmt --check
 ```
 
-The test suite is 146 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
+The test suite is 161 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
 `--features sign` to clippy so that the signing tool is linted too; a plain `cargo build` skips it.
 The `test` workflow runs all three commands, and it fails on an unformatted file and on a clippy
 warning, so running them locally first saves a round trip.

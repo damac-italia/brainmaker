@@ -23,7 +23,7 @@
 //! does not set it uses a published development key, and [`key_class`] then
 //! reports `development`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use ring::aead::{self, BoundKey, NONCE_LEN};
@@ -232,6 +232,25 @@ fn platform_machine_id() -> Option<String> {
     None
 }
 
+/// True when the file at `path` starts with the header that [`seal`] writes.
+///
+/// `uninstall` reads this to tell a store that brainmaker wrote from another
+/// file that only carries the same name.
+pub fn is_sealed(path: &Path) -> bool {
+    use std::io::Read;
+
+    let mut header = [0u8; MAGIC.len()];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && header.as_slice() == MAGIC
+}
+
+/// The temporary file that [`write_owner_only`] renames over `path`.
+pub fn temporary_path(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
 /// Writes `bytes` so that only the owner can read the file.
 pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -241,7 +260,7 @@ pub fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 
     // Write through a temporary file, so a crash never leaves a partial file.
-    let temp = path.with_extension("tmp");
+    let temp = temporary_path(path);
     std::fs::write(&temp, bytes).with_context(|| format!("cannot write {}", temp.display()))?;
     restrict_file(&temp)?;
     std::fs::rename(&temp, path)
@@ -312,6 +331,32 @@ mod tests {
         assert!(open(b"").is_err());
         assert!(open(b"BMKR1").is_err());
         assert!(open(b"NOPE1234567890123456789012345678").is_err());
+    }
+
+    #[test]
+    fn recognises_a_sealed_file_by_its_header() {
+        let dir = std::env::temp_dir().join(format!(
+            "brainmaker-sealed-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sealed = dir.join("config.enc");
+        let other = dir.join("other.enc");
+        let short = dir.join("short.enc");
+        std::fs::write(
+            &sealed,
+            seal(b"BRAINMAKER_API_BASE=https://example.test/v1").unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&other, b"some other tool's encrypted settings").unwrap();
+        std::fs::write(&short, b"BMK").unwrap();
+
+        assert!(is_sealed(&sealed));
+        assert!(!is_sealed(&other));
+        assert!(!is_sealed(&short));
+        assert!(!is_sealed(&dir.join("absent.enc")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

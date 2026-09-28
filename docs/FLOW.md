@@ -1,15 +1,15 @@
 # Flow
 
-Four runtime paths matter: loading the settings, getting an access token, the `sync` command, and
-the `self-update` command. `status` reuses the first two paths and then reads both remote endpoints
+Five runtime paths matter: loading the settings, getting an access token, the `sync` command, the
+`self-update` command, and the `uninstall` command. `status` reuses the first two paths and then reads both remote endpoints
 without writing anything. Because it writes nothing, an endpoint it cannot reach becomes a value it
-prints rather than a reason to exit: [`main.rs:174`](../src/main.rs) prints `latest    <unknown>`
+prints rather than a reason to exit: [`main.rs:183`](../src/main.rs) prints `latest    <unknown>`
 and `state     cannot check: <reason>`.
 
 ## Settings load
 
-Every command starts here. `Config::load` runs before the dispatch in
-[`src/main.rs:88`](../src/main.rs).
+Every command but `uninstall` starts here. `Config::load` runs before the dispatch in
+[`src/main.rs:96`](../src/main.rs).
 
 ```mermaid
 sequenceDiagram
@@ -38,33 +38,33 @@ sequenceDiagram
 
 Steps:
 
-1. [`config.rs:264`](../src/config.rs) resolves the root: `--dir` made absolute, else
+1. [`config.rs:325`](../src/config.rs) resolves the root: `--dir` made absolute, else
    `~/.brainmaker`.
 2. [`provision.rs:320`](../src/provision.rs) searches up to four locations in order and returns the
    first hit. A `--config` or `$BRAINMAKER_CONFIG` path that is not a file fails the run. The fourth
    location, the working directory, is searched only while `config.enc` does not yet exist.
-3. On a hit, [`config.rs:277`](../src/config.rs) seals the parsed settings and writes
+3. On a hit, [`config.rs:333`](../src/config.rs) seals the parsed settings and writes
    `confidential/config.enc` with mode `0600` inside a `0700` directory.
-4. [`config.rs:286`](../src/config.rs) removes the plain file. A failed removal logs a warning and
+4. [`config.rs:342`](../src/config.rs) removes the plain file. A failed removal logs a warning and
    the run continues, because the settings are already stored.
-5. With no hit and an existing store, [`config.rs:315`](../src/config.rs) decrypts it. A store from
+5. With no hit and an existing store, [`config.rs:371`](../src/config.rs) decrypts it. A store from
    another machine or another build fails here with a message that tells you to reimport.
-6. [`config.rs:329`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
+6. [`config.rs:385`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
    `SWETSI_CLIENT_ID`, `SWETSI_CLIENT_SECRET`, and the five route keys override the stored
    values, then `--url` overrides the base URL again.
-7. [`config.rs:356`](../src/config.rs) fails when no source supplied a base URL.
-8. [`config.rs:364`](../src/config.rs) fails when the base URL is not `https://`, unless its host is
+7. [`config.rs:412`](../src/config.rs) fails when no source supplied a base URL.
+8. [`config.rs:420`](../src/config.rs) fails when the base URL is not `https://`, unless its host is
    this machine.
-9. [`config.rs:368`](../src/config.rs) checks the merged credential set. Three keys, or none of
+9. [`config.rs:424`](../src/config.rs) checks the merged credential set. Three keys, or none of
    them, passes. Any other count fails and names the missing keys. A configuration that still
    carries `SWETSI_TOKEN` and none of the three fails here.
-10. [`config.rs:380`](../src/config.rs) builds the `Credentials`. It applies the TLS rule to
+10. [`config.rs:436`](../src/config.rs) builds the `Credentials`. It applies the TLS rule to
     `SWETSI_JWT_ENDPOINT`, and it refuses a credential value that cannot go into a header.
-11. [`config.rs:388`](../src/config.rs) reads the five routes. Each absent key takes its default.
+11. [`config.rs:444`](../src/config.rs) reads the five routes. Each absent key takes its default.
     A route that holds `://`, a `..` segment, or a space fails here, because it would leave the
     base URL.
 
-[`config.rs:324`](../src/config.rs) runs before all of this and fails when a configuration still
+[`config.rs:380`](../src/config.rs) runs before all of this and fails when a configuration still
 carries a key under its old name, such as `SWETSI_API_BASE`.
 
 ## Access token
@@ -160,7 +160,7 @@ Steps:
 10. [`sync.rs:133`](../src/sync.rs) removes the three temporary paths, on success and on failure
     alike.
 11. [`sync.rs:139`](../src/sync.rs) writes `state.json`, only after the swap succeeded.
-12. [`main.rs:117`](../src/main.rs) runs the software check unless `--no-update-check` was given.
+12. [`main.rs:126`](../src/main.rs) runs the software check unless `--no-update-check` was given.
 
 ### The swap and its rollback
 
@@ -251,3 +251,52 @@ Steps:
     session on the old version.
 
 `--check` stops after step 6 and installs nothing.
+
+## Uninstall
+
+```mermaid
+sequenceDiagram
+    participant main
+    participant uninstall
+    participant link
+    participant disk as root directory
+    main->>main: ask the question, unless --yes
+    main->>uninstall: uninstall(layout, claude, log)
+    alt the root exists and holds neither mark
+        uninstall-->>main: Report, unrecognised
+    else
+        uninstall->>link: remove_bridge(content, claude)
+        uninstall->>disk: remove content, temporaries, the program copy
+        uninstall->>disk: remove state.json and config.enc
+        uninstall->>disk: remove bin, confidential, the root, when empty
+        uninstall-->>main: Report
+    end
+```
+
+Steps:
+
+1. [`main.rs:86`](../src/main.rs) sends `uninstall` down its own path before `Config::load`, so no
+   setting is read and no provisioning file is imported.
+2. [`main.rs:247`](../src/main.rs) fails when stdin is not a terminal and `--yes` was not given.
+   Otherwise the question prints past `--quiet`, and any answer but `y` or `yes` exits 0 with
+   `Nothing was removed.`
+3. [`uninstall.rs:107`](../src/uninstall.rs) stops the run with nothing changed when the root
+   exists and holds neither a parsable `state.json` nor a sealed `confidential/config.enc`.
+4. [`uninstall.rs:120`](../src/uninstall.rs) resolves the running program before any file goes,
+   so it can later say whether that program was the copy under the root.
+5. [`uninstall.rs:125`](../src/uninstall.rs) removes the bridge through `link::remove_bridge`, the
+   code that `unlink` runs.
+6. [`uninstall.rs:177`](../src/uninstall.rs) lists `content/`, `.staging/`, `.trash/`,
+   `.download.zip`, the program copy and every `bin/.brainmaker*` file, then the two temporary
+   files and the two marks, in that order.
+7. [`uninstall.rs:191`](../src/uninstall.rs) removes each path that exists. A symbolic link goes
+   without its target. On Windows, a program copy that is running now yields a `notice:` line
+   instead of an error.
+8. [`uninstall.rs:210`](../src/uninstall.rs) removes `bin/`, `confidential/`, and the root when
+   each one is empty, and names what the root still holds otherwise.
+9. [`uninstall.rs:136`](../src/uninstall.rs) prints the path of the program that ran, unless it
+   was the copy under the root, and asks you to restart any open Claude session when the hook was
+   removed.
+
+A removal that fails part-way returns the error, and the run exits 1. The marks go last, so the
+next run still recognises the root and removes the rest.

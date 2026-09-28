@@ -1,8 +1,9 @@
 # Architecture
 
-`brainmaker` is one Rust binary with sixteen modules. It has no background process, no plugin
+`brainmaker` is one Rust binary with seventeen modules. It has no background process, no plugin
 system, and no local database. One invocation loads settings, gets one access token, makes at most
-three further HTTP requests, writes the filesystem, and exits.
+three further HTTP requests, writes the filesystem, and exits. `uninstall` is the exception: it loads
+no settings and opens no socket.
 
 A second binary, `brainmaker-sign`, lives in [`tools/sign.rs`](../tools/sign.rs). It builds only
 under the `sign` feature and never ships.
@@ -13,7 +14,7 @@ under the `sign` feature and never ships.
 |---|---|---|
 | [`src/main.rs`](../src/main.rs) | Entry point, command dispatch, all `stdout` output | every module |
 | [`src/cli.rs`](../src/cli.rs) | Argument parsing and the help text | none |
-| [`src/config.rs`](../src/config.rs) | Settings load, paths, route and URL building, credential checks, size limits, hash validation | `auth`, `provision`, `secretstore`, `url` |
+| [`src/config.rs`](../src/config.rs) | Settings load, the root and every path under it (`Layout`), route and URL building, credential checks, size limits, hash validation | `auth`, `provision`, `secretstore`, `url` |
 | [`src/auth.rs`](../src/auth.rs) | The OAuth2 client-credentials exchange, and the access token cache | `config`, `remote`, `ureq` |
 | [`src/url.rs`](../src/url.rs) | URL origin parsing, and the rule that a base URL must use TLS | none |
 | [`src/provision.rs`](../src/provision.rs) | Provisioning file discovery, parsing, validation | `url` |
@@ -27,6 +28,7 @@ under the `sign` feature and never ships.
 | [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `sha2` |
 | [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the session context, and the binary copy under the root | `config`, `dirs`, `serde_json` |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
+| [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root | `config`, `link`, `secretstore`, `state` |
 
 ## Module graph
 
@@ -38,6 +40,7 @@ graph LR
     main --> selfupdate
     main --> link
     main --> state
+    main --> uninstall
     config --> auth
     config --> provision
     config --> secretstore
@@ -54,6 +57,10 @@ graph LR
     remote --> config
     remote --> auth
     link --> config
+    uninstall --> config
+    uninstall --> link
+    uninstall --> secretstore
+    uninstall --> state
 ```
 
 ## Boundaries
@@ -88,7 +95,8 @@ the injected `log` closure.
 ```
 
 `bin/brainmaker` appears only after `link` has run. `unlink` leaves it in place, because removing
-the file a running hook names would break a session that is already open.
+the file a running hook names would break a session that is already open. `uninstall` removes it,
+together with everything else in this tree that `brainmaker` wrote.
 
 `brainmaker` also creates `.staging/`, `.trash/`, and `.download.zip` under the root while it
 works, and removes all three before it exits, on success and on failure alike. `content/` is
@@ -224,7 +232,7 @@ different path means issuing a new provisioning file rather than editing one man
 They are separate because they protect different things and are held by different people. The
 software key signs what replaces the running executable, so it stays off every server and reaches
 CI only as a repository secret. The content key signs what lands in `content/`, which changes
-whenever the shared vault does, so whoever publishes content must hold it — a deploy host, in
+whenever the shared vault does, so whoever publishes content must hold it: a deploy host, in
 practice.
 
 One list would collapse those into a single capability: the machine that publishes a note could
@@ -244,8 +252,8 @@ unsigned field beside it. A server therefore cannot point a client at one archiv
 another.
 
 After the download, the size and the SHA-256 are compared against the signed values before
-`archive::extract` opens the file. The extractor's own rules — no escaping path, no symbolic link,
-a cap per entry and per archive — still apply, but they now guard content that a trusted key
+`archive::extract` opens the file. The extractor's own rules (no escaping path, no symbolic link,
+a cap per entry and per archive) still apply, but they now guard content that a trusted key
 already vouched for rather than content that only TLS vouched for.
 
 This matters more than it would for inert data. The content ships a `.claude` directory whose
@@ -311,6 +319,40 @@ updates both of them rather than one.
 outlives the working directory: the skill symbolic links under `~/.claude/skills`, the hook
 command, and the `--dir` inside it. A relative root would put a relative path into all three, and
 each would then resolve against whatever directory the next session happened to start in.
+
+### `uninstall` reads no settings
+
+Every other command runs `Config::load` first. `uninstall` builds a `Layout` from `--dir` alone,
+because it must work where the sealed store no longer opens, for example after a switch between a
+release build and a local one, whose compiled-in keys differ. Loading settings could also import a
+provisioning file, which would write a store only for `uninstall` to remove it. The parser therefore
+refuses `--config`, `--keep-config`, and `--url` with `uninstall`, rather than accept flags that
+would do nothing.
+
+`Layout` is the part of `Config` that names the root and the paths under it. `Config` answers each
+of its path methods through its `Layout`, so the two cannot disagree on where a file lives.
+
+The tradeoff: `uninstall` holds no credential, so it cannot revoke the client on the server. The
+client stays valid until an administrator revokes it.
+
+### `uninstall` removes only a recognised root, one entry at a time
+
+A root is recognised when it holds a `state.json` that parses as the state `sync` writes, or a
+`confidential/config.enc` that starts with the sealed header. `uninstall` then removes the paths
+that `brainmaker` writes, by name, and removes `bin/`, `confidential/`, and the root only when each
+one is empty. A file of yours under the root survives, and so does every directory that holds it.
+A symbolic link goes, and the target it names stays; a root that is itself a link loses the link.
+
+A root that exists but is not recognised stops the run before anything changes, the bridge in
+`~/.claude` included. `link` marks the hook and the `CLAUDE.md` block with `brainmaker-link`, not
+with the root they serve, so removing them on behalf of a wrong `--dir` would cut off a real install
+elsewhere. A root that does not exist carries no such risk, and the bridge still goes.
+
+The two marks go last. A run that stops part-way keeps them, so the next run still recognises the
+root and finishes.
+
+The tradeoff: a root whose `state.json` is corrupt and whose store is missing is not recognised,
+and you remove it by hand.
 
 ### The stored settings are bound to the machine
 
