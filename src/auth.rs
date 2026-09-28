@@ -307,6 +307,7 @@ pub fn base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{Route, Server, temp_dir};
 
     #[test]
     fn encodes_the_base64_test_vectors() {
@@ -405,5 +406,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A server whose token route answers with `status` and `body`.
+    fn serving_token(status: u16, body: &str) -> Server {
+        Server::start(vec![Route {
+            status,
+            ..Route::post("/oauth2/token", body)
+        }])
+    }
+
+    #[test]
+    fn exchanges_the_credentials_for_a_token() {
+        let server = serving_token(
+            200,
+            r#"{"access_token":"abc","expires_in":600,"token_type":"Bearer"}"#,
+        );
+        let dir = temp_dir("auth-exchange");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let token = bearer(&config).unwrap();
+
+        assert_eq!(token, Some("abc".to_string()));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let (method, path, authorization) = &requests[0];
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/oauth2/token");
+        assert!(authorization.starts_with("Basic "), "got {authorization}");
+        // The base64 of "the-client-id:the-client-secret", which the system
+        // base64 tool computed, so that the wire format does not rest on this
+        // module's own encoder.
+        assert_eq!(
+            authorization,
+            "Basic dGhlLWNsaWVudC1pZDp0aGUtY2xpZW50LXNlY3JldA=="
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn asks_for_one_token_per_run() {
+        let server = serving_token(200, r#"{"access_token":"abc","expires_in":600}"#);
+        let dir = temp_dir("auth-cache");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        assert_eq!(bearer(&config).unwrap(), Some("abc".to_string()));
+        assert_eq!(bearer(&config).unwrap(), Some("abc".to_string()));
+
+        assert_eq!(server.requests().len(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_token_type_that_is_not_bearer() {
+        let server = serving_token(
+            200,
+            r#"{"access_token":"abc","expires_in":600,"token_type":"mac"}"#,
+        );
+        let dir = temp_dir("auth-token-type");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let error = bearer(&config).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("token type"), "got {text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_token_that_holds_a_line_break() {
+        // The JSON escapes decode to a carriage return and a line feed, which
+        // would let the server write a header of its own.
+        let server = serving_token(200, r#"{"access_token":"a\r\nX-Injected: 1"}"#);
+        let dir = temp_dir("auth-line-break");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let error = bearer(&config).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("cannot send"), "got {text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_the_reason_that_the_token_endpoint_gives() {
+        let server = serving_token(
+            401,
+            r#"{"error":"invalid_client","error_description":"unknown client"}"#,
+        );
+        let dir = temp_dir("auth-rejected");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let error = bearer(&config).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("invalid_client"), "got {text}");
+        assert!(text.contains("unknown client"), "got {text}");
+        assert!(!text.contains("the-client-secret"), "got {text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sends_no_header_when_no_credential_is_configured() {
+        let server = Server::start(vec![Route::get("/x", "hello")]);
+        let dir = temp_dir("auth-none");
+        let config = Config::for_test(&dir, &server.base());
+
+        assert_eq!(bearer(&config).unwrap(), None);
+        remote::fetch_text(&config, &format!("{}/x", server.base()), 1024).unwrap();
+
+        // One request, the one for the route, with no Authorization header.
+        assert_eq!(
+            server.requests(),
+            vec![("GET".to_string(), "/x".to_string(), String::new())]
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
