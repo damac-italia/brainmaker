@@ -564,14 +564,25 @@ fn write_settings(claude: &Path, prefix: Option<&str>) -> Result<bool> {
     };
     let before = root.clone();
 
-    // Drop any matcher group this module wrote before, so a second run neither
-    // duplicates the hook nor keeps a command from an older version.
+    // Drop any hook entry this module wrote before, so a second run neither
+    // duplicates the hook nor keeps a command from an older version. Single
+    // entries go, so a command the user added to the same group stays. A group
+    // goes only when this run removed its last entry: a group that was already
+    // empty belongs to the user.
     let hooks = root.entry("hooks").or_insert_with(|| json!({}));
     let Some(hooks) = hooks.as_object_mut() else {
         bail!("the \"hooks\" value in {} is not an object", path.display());
     };
     if let Some(Value::Array(groups)) = hooks.get_mut("SessionStart") {
-        groups.retain(|group| !is_ours(group));
+        groups.retain_mut(|group| {
+            let Some(Value::Array(entries)) = group.get_mut("hooks") else {
+                return true;
+            };
+            let held = entries.len();
+            entries.retain(|entry| !is_ours(entry));
+            let removed_any = entries.len() < held;
+            !(removed_any && entries.is_empty())
+        });
         if groups.is_empty() {
             hooks.remove("SessionStart");
         }
@@ -623,18 +634,14 @@ fn write_settings(claude: &Path, prefix: Option<&str>) -> Result<bool> {
     Ok(true)
 }
 
-/// True when this module wrote the matcher group.
-fn is_ours(group: &Value) -> bool {
-    group
-        .get("hooks")
-        .and_then(Value::as_array)
-        .is_some_and(|list| {
-            list.iter().any(|hook| {
-                hook.get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(|command| command.contains(MARKER))
-            })
-        })
+/// True when this module wrote the hook entry.
+///
+/// Every command that `link` writes ends with the marker as a shell comment.
+/// A command that only mentions the marker somewhere else is the user's own.
+fn is_ours(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| command.trim_end().ends_with(&format!("# {MARKER}")))
 }
 
 /// Adds or removes the marked block in `CLAUDE.md`. Returns true on a change.
@@ -645,7 +652,7 @@ fn is_ours(group: &Value) -> bool {
 fn write_briefing(content: &Path, claude: &Path, prefix: Option<&str>) -> Result<bool> {
     let path = claude.join("CLAUDE.md");
     let existing = read_if_present(&path)?.unwrap_or_default();
-    let stripped = strip_block(&existing);
+    let stripped = strip_block(&existing, &path)?;
 
     let updated = if let Some(prefix) = prefix {
         let block = format!(
@@ -685,15 +692,26 @@ fn write_briefing(content: &Path, claude: &Path, prefix: Option<&str>) -> Result
 }
 
 /// Returns `text` without the marked block, if it holds one.
-fn strip_block(text: &str) -> String {
-    let (Some(start), Some(end)) = (text.find(BLOCK_START), text.find(BLOCK_END)) else {
-        return text.to_string();
-    };
-    if end < start {
-        return text.to_string();
+///
+/// The text must hold no marker, or one start marker followed by one end
+/// marker. Any other shape is an error and removes nothing: a guess at which
+/// markers belong together would delete text that the user wrote.
+fn strip_block(text: &str, path: &Path) -> Result<String> {
+    let starts = text.matches(BLOCK_START).count();
+    let ends = text.matches(BLOCK_END).count();
+    match (starts, ends, text.find(BLOCK_START), text.find(BLOCK_END)) {
+        (0, 0, _, _) => Ok(text.to_string()),
+        (1, 1, Some(start), Some(end)) if start < end => {
+            let after = end + BLOCK_END.len();
+            Ok(format!("{}{}", &text[..start], &text[after..]))
+        }
+        _ => bail!(
+            "{} holds a damaged brainmaker block: {starts} start marker(s) and {ends} end \
+             marker(s). Remove the lines that hold \"{MARKER}\" from the file by hand, then \
+             run the command again",
+            path.display()
+        ),
     }
-    let after = end + BLOCK_END.len();
-    format!("{}{}", &text[..start], &text[after..])
 }
 
 /// Prints what the run changed.
@@ -985,6 +1003,48 @@ mod tests {
     }
 
     #[test]
+    fn unlink_keeps_a_command_the_user_added_to_our_group() {
+        // `unlink` used to drop the whole group, so a command the user had put
+        // beside ours went with it.
+        let base = temp_dir("settings-shared-group");
+        let claude = base.join("claude");
+        let path = claude.join("settings.json");
+        let prefix = command_prefix(Path::new("/opt/bm/bin/brainmaker"), None);
+        assert!(write_settings(&claude, Some(&prefix)).unwrap());
+
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value
+            .pointer_mut("/hooks/SessionStart/0/hooks")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .push(json!({"type": "command", "command": "echo mine"}));
+        write(&path, &serde_json::to_string_pretty(&value).unwrap());
+
+        assert!(write_settings(&claude, None).unwrap());
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("echo mine"), "{text}");
+        assert!(!text.contains(MARKER), "{text}");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn keeps_a_command_that_only_mentions_the_marker() {
+        // A command that names the marker anywhere but at the end is the
+        // user's own, and `unlink` used to drop its group.
+        let base = temp_dir("settings-mention");
+        let claude = base.join("claude");
+        let path = claude.join("settings.json");
+        let original = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "grep brainmaker-link ~/.claude/settings.json"}]}]}}"#;
+        write(&path, original);
+
+        assert!(!write_settings(&claude, None).unwrap());
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn the_hook_names_the_binary_by_its_full_path() {
         // A bare name fails: nothing puts this binary on PATH, and a shell
         // answers "brainmaker: command not found" at every session start.
@@ -1265,9 +1325,71 @@ mod tests {
 
     #[test]
     fn strips_a_block_and_leaves_text_that_holds_none() {
-        assert_eq!(strip_block("plain"), "plain");
+        let path = Path::new("CLAUDE.md");
+        assert_eq!(strip_block("plain", path).unwrap(), "plain");
         let text = format!("a\n{BLOCK_START}\nx\n{BLOCK_END}\nb");
-        assert_eq!(strip_block(&text), "a\n\nb");
+        assert_eq!(strip_block(&text, path).unwrap(), "a\n\nb");
+    }
+
+    #[test]
+    fn refuses_a_start_marker_with_no_end() {
+        let text = format!("mine\n{BLOCK_START}\nx\n");
+
+        let error = strip_block(&text, Path::new("CLAUDE.md")).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("1 start marker(s) and 0 end marker(s)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn refuses_an_end_marker_before_the_start() {
+        let text = format!("{BLOCK_END}\nmine\n{BLOCK_START}\n");
+
+        let error = strip_block(&text, Path::new("CLAUDE.md")).unwrap_err();
+
+        assert!(
+            error.to_string().contains("damaged brainmaker block"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn refuses_two_blocks() {
+        let text = format!("{BLOCK_START}\na\n{BLOCK_END}\nmine\n{BLOCK_START}\nb\n{BLOCK_END}\n");
+
+        let error = strip_block(&text, Path::new("CLAUDE.md")).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("2 start marker(s) and 2 end marker(s)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_damaged_block_leaves_the_briefing_as_it_is() {
+        // With the end line deleted by hand, the next run appended a second
+        // block, and the run after that paired the first start marker with the
+        // new end marker and deleted the text between them.
+        let base = temp_dir("briefing-damaged");
+        let content = base.join("content");
+        let claude = base.join("claude");
+        let original = format!("# Mine\n\nKeep this.\n\n{BLOCK_START}\nleft over\n\nAlso mine.\n");
+        write(&claude.join("CLAUDE.md"), &original);
+
+        let result = write_briefing(&content, &claude, Some("\"/opt/bm/bin/brainmaker\""));
+
+        assert!(result.is_err(), "a damaged block is an error");
+        assert_eq!(
+            fs::read_to_string(claude.join("CLAUDE.md")).unwrap(),
+            original
+        );
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
