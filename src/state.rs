@@ -15,6 +15,9 @@ pub struct State {
     pub hash: String,
     /// Time of the last successful install, in seconds since the Unix epoch.
     pub updated_at_unix: u64,
+    /// Sequence of the installed release, when the release carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
 }
 
 impl State {
@@ -22,6 +25,15 @@ impl State {
         Self {
             hash: hash.into(),
             updated_at_unix: now_unix(),
+            sequence: None,
+        }
+    }
+
+    /// The state for a release that carries a sequence.
+    pub fn with_sequence(hash: impl Into<String>, sequence: Option<u64>) -> Self {
+        Self {
+            sequence,
+            ..Self::new(hash)
         }
     }
 }
@@ -99,6 +111,48 @@ mod tests {
         fs::write(&path, "{ not json").unwrap();
 
         assert_eq!(read(&path), None);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reads_a_state_file_that_an_older_version_wrote() {
+        let dir = crate::testutil::temp_dir("state-older");
+        let path = dir.join("state.json");
+        fs::write(&path, r#"{"hash": "a1b2c3d4", "updated_at_unix": 1}"#).unwrap();
+
+        let state = read(&path).expect("a state file with no sequence still parses");
+
+        assert_eq!(state.hash, "a1b2c3d4");
+        assert_eq!(state.sequence, None);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writes_and_reads_the_sequence() {
+        let dir = crate::testutil::temp_dir("state-sequence");
+        let path = dir.join("state.json");
+
+        let state = State::with_sequence("a1b2c3d4", Some(1760000000));
+        write(&path, &state).unwrap();
+
+        let read_back = read(&path).expect("the state file parses");
+        assert_eq!(read_back.sequence, Some(1760000000));
+        assert_eq!(read_back, state);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writes_no_sequence_key_when_there_is_none() {
+        let dir = crate::testutil::temp_dir("state-no-sequence");
+        let path = dir.join("state.json");
+
+        write(&path, &State::new("a1b2c3d4")).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("sequence"), "got {text}");
 
         fs::remove_dir_all(&dir).unwrap();
     }
