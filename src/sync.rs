@@ -4,11 +4,13 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 use crate::archive;
 use crate::config::{Config, validate_hash};
+use crate::lock;
 use crate::remote;
 use crate::state::{self, State};
 
@@ -19,6 +21,9 @@ pub enum Outcome {
     /// The server could not be reached, and the installed content stays in
     /// place. `hash` is the installed one.
     Unreachable { hash: String, error: String },
+    /// Another run holds the install lock, and the installed content stays in
+    /// place. `hash` is the installed one.
+    Busy { hash: String },
     /// The local content now matches the remote hash.
     Updated {
         previous: Option<String>,
@@ -26,6 +31,12 @@ pub enum Outcome {
         stats: archive::Stats,
     },
 }
+
+/// How long a run waits for another run's install to end.
+///
+/// The hook allows `sync` 60 seconds in all, and the check of the latest
+/// version can take 20 of them.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// Brings `content/` to the latest remote version.
 ///
@@ -37,9 +48,17 @@ pub enum Outcome {
 /// often offline; the installed content then stays in place and the run
 /// reports [`Outcome::Unreachable`]. With nothing installed, or with
 /// `force`, the failure is returned, because there is nothing to fall back on.
+///
+/// Two runs never install at once. The function takes the install lock before
+/// it downloads, and waits up to [`LOCK_WAIT`] for another run to release it.
+/// A run that still finds the lock held keeps the installed content and
+/// reports [`Outcome::Busy`]. With nothing installed, or with `force`, it
+/// returns an error instead, as it does for a server that cannot be reached.
 pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome> {
     fs::create_dir_all(config.root())
         .with_context(|| format!("cannot create the directory {}", config.root().display()))?;
+
+    restore_stranded(config);
 
     let content_dir = config.content_dir();
     let local = state::read(&config.state_file());
@@ -67,6 +86,26 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
 
     if !force && installed.as_deref() == Some(remote_hash.as_str()) && !content_present {
         log("The state file matches the remote version, but the content directory is missing.");
+    }
+
+    // One install at a time. `_lock` lives until this function returns.
+    let Some(_lock) = lock::acquire(&config.lock_file(), LOCK_WAIT)? else {
+        return match installed {
+            Some(hash) if content_present && !force => Ok(Outcome::Busy { hash }),
+            _ => bail!(
+                "another brainmaker run is installing content in {}; \
+                 run the command again when it ends",
+                config.root().display()
+            ),
+        };
+    };
+
+    // The run that held the lock may have installed this release.
+    if !force
+        && state::read(&config.state_file()).is_some_and(|s| s.hash == remote_hash)
+        && content_dir.is_dir()
+    {
+        return Ok(Outcome::UpToDate { hash: remote_hash });
     }
 
     log(&format!("Downloading content-{remote_hash}.zip"));
@@ -169,6 +208,23 @@ fn swap(content: &Path, staging: &Path, trash: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Puts the previous content back when a stopped run left it in `.trash`.
+///
+/// A run that stops between the two renames of [`swap`] leaves no `content`
+/// and the old one in `.trash`. The state file is written after the swap, so
+/// it still names that old content.
+fn restore_stranded(config: &Config) {
+    let content = config.content_dir();
+    let trash = config.trash_dir();
+    if content.exists() || !trash.is_dir() {
+        return;
+    }
+    // Only when no run is in its own swap right now.
+    if let Ok(Some(_lock)) = lock::acquire(&config.lock_file(), Duration::ZERO) {
+        let _ = fs::rename(&trash, &content);
+    }
+}
+
 fn remove_dir_if_present(path: &Path) -> Result<()> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
@@ -264,6 +320,73 @@ mod tests {
         let dir = temp_dir("remove-missing");
         remove_dir_if_present(&dir.join("absent")).unwrap();
         remove_file_if_present(&dir.join("absent.zip")).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restores_the_content_that_a_stopped_run_left_in_the_trash() {
+        let dir = temp_dir("restore-stranded");
+        let config = Config::for_test(&dir, "https://api.example.test/v1");
+        fs::create_dir_all(config.trash_dir()).unwrap();
+        fs::write(config.trash_dir().join("old.md"), "old").unwrap();
+
+        restore_stranded(&config);
+
+        assert_eq!(
+            fs::read_to_string(config.content_dir().join("old.md")).unwrap(),
+            "old"
+        );
+        assert!(!config.trash_dir().exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn leaves_the_trash_alone_while_content_exists() {
+        let dir = temp_dir("restore-content-present");
+        let config = Config::for_test(&dir, "https://api.example.test/v1");
+        fs::create_dir_all(config.content_dir()).unwrap();
+        fs::write(config.content_dir().join("new.md"), "new").unwrap();
+        fs::create_dir_all(config.trash_dir()).unwrap();
+        fs::write(config.trash_dir().join("old.md"), "old").unwrap();
+
+        restore_stranded(&config);
+
+        assert_eq!(
+            fs::read_to_string(config.content_dir().join("new.md")).unwrap(),
+            "new"
+        );
+        assert!(!config.content_dir().join("old.md").exists());
+        assert_eq!(
+            fs::read_to_string(config.trash_dir().join("old.md")).unwrap(),
+            "old"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn leaves_the_trash_alone_while_another_run_holds_the_lock() {
+        // A run between the two renames of `swap` has no content either, and
+        // it holds the lock. What it left in `.trash` is not stranded.
+        let dir = temp_dir("restore-lock-held");
+        let config = Config::for_test(&dir, "https://api.example.test/v1");
+        fs::create_dir_all(config.trash_dir()).unwrap();
+        fs::write(config.trash_dir().join("old.md"), "old").unwrap();
+        // The other run, as the operating system sees it: an open handle with
+        // the exclusive lock on the lock file.
+        let other_run = fs::File::create(config.lock_file()).unwrap();
+        other_run.try_lock().unwrap();
+
+        restore_stranded(&config);
+
+        assert!(!config.content_dir().exists());
+        assert_eq!(
+            fs::read_to_string(config.trash_dir().join("old.md")).unwrap(),
+            "old"
+        );
+
+        drop(other_run);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

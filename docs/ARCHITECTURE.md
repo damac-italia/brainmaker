@@ -102,7 +102,9 @@ together with everything else in this tree that `brainmaker` wrote.
 
 `brainmaker` also creates `.staging/`, `.trash/`, and `.download.zip` under the root while it
 works, and removes all three before it exits, on success and on failure alike. `content/` is
-replaced on every update, so keep your own files elsewhere.
+replaced on every update, so keep your own files elsewhere. `sync` holds an exclusive lock on
+`.lock` while it installs, and `self-update` holds one on `.update.lock` while it replaces the
+program. Both files stay in the root between runs, and `uninstall` removes them.
 
 `self-update` writes `.brainmaker-update-<pid>` and `.brainmaker-old` beside the binary, and
 removes both before it exits. On Windows both carry the `.exe` suffix.
@@ -397,6 +399,38 @@ directory.
 
 The tradeoff: `.staging` must sit on the same filesystem as `content/`, which is why both live
 under the same root.
+
+### One install at a time, and a busy root is a notice
+
+The `SessionStart` hook and the hourly LaunchAgent both run `sync`, and nothing orders them. Several
+Claude sessions can also start together. Every run uses the same `.staging/`, `.trash/`, and
+`.download.zip`, and clears them before and after its own install. Without a lock, a second run
+deletes the `.staging/` that the first run is still filling. The first run then swaps a partial
+directory into `content/` and writes the release hash to `state.json`, and every later `sync`
+reports that content as up to date.
+
+`sync` therefore takes an exclusive lock on `.lock` before it downloads, and holds it until the
+install ends. `self-update` takes a second lock, on `.update.lock`, while it replaces the program.
+The two are separate files, so a long content download does not delay a software update, and the
+reverse. The operating system drops a lock when its process ends, including when the process is
+killed, so no stale lock remains.
+
+A run that finds the lock held waits up to 30 seconds. When the holder installed the release in that
+time, `sync` reads `state.json` again and reports the content as up to date. When the lock is still
+held after 30 seconds, and content is installed, `sync` returns `Outcome::Busy`. `main.rs` prints
+two `notice:` lines to stderr and exits 0, as it does for an unreachable server, and `--quiet`
+hides them. With nothing installed, or with `--force`, `sync` exits 1, because there is nothing to
+fall back on. A `self-update` that finds its lock held for 30 seconds exits 1.
+
+`sync` also restores content that a killed run stranded. A run that stops between the two renames of
+the swap leaves the old content in `.trash/` and no `content/`. When `sync` starts and finds
+`content/` missing and `.trash/` present, it takes the lock without waiting and renames `.trash/` to
+`content/`. If another run holds the lock, that run may be inside its own swap, so `sync` leaves
+`.trash/` alone.
+
+The tradeoff: a run that finds the lock held for 30 seconds installs nothing, so the update arrives
+with the next run. The lock is advisory. It orders `brainmaker` runs only, and `uninstall` takes no
+lock.
 
 ### `state.json` is written after the swap
 

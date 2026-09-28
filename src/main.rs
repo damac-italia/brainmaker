@@ -24,6 +24,7 @@ mod cli;
 mod config;
 mod digest;
 mod link;
+mod lock;
 mod provision;
 mod remote;
 mod schedule;
@@ -386,6 +387,12 @@ fn report(config: &Config, outcome: &sync::Outcome, quiet: bool) {
         // exit code stays 0. Quiet suppresses it, as it does the software one.
         sync::Outcome::Unreachable { hash, error } => {
             eprintln!("notice: cannot check the latest content version: {error}");
+            eprintln!("notice: the installed content {hash} stays in place.");
+        }
+        // A notice, for the same reason: another run is installing, and the
+        // content on disk stays usable. The exit code stays 0.
+        sync::Outcome::Busy { hash } => {
+            eprintln!("notice: another brainmaker run is installing content.");
             eprintln!("notice: the installed content {hash} stays in place.");
         }
         sync::Outcome::Updated {

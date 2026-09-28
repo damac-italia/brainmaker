@@ -92,7 +92,7 @@ and `--url` with `<flag> has no effect with uninstall, which loads no settings`,
 | Step | Removes | When |
 |---|---|---|
 | 1 | The LaunchAgent, the skill links, the `SessionStart` hook, and the `CLAUDE.md` block that `link` wrote, as `unlink` removes them | the root is recognised or does not exist |
-| 2 | `content/`, `.staging/`, `.trash/`, `.download.zip`, and `agent.log` | the root is recognised |
+| 2 | `content/`, `.staging/`, `.trash/`, `.download.zip`, `.lock`, `.update.lock`, and `agent.log` | the root is recognised |
 | 3 | `bin/brainmaker`, and every `bin/.brainmaker*` file that `link` or `self-update` left | the root is recognised |
 | 4 | `state.json.tmp`, `state.json`, `confidential/config.tmp`, and `confidential/config.enc` | the root is recognised |
 | 5 | `bin/`, `confidential/`, and then the root | each one is empty |

@@ -283,6 +283,19 @@ impl Layout {
     pub fn download_file(&self) -> PathBuf {
         self.root.join(".download.zip")
     }
+
+    /// File that one run locks while it installs content.
+    pub fn lock_file(&self) -> PathBuf {
+        self.root.join(".lock")
+    }
+
+    /// File that one run locks while it replaces the program.
+    ///
+    /// A second file, so that a long content download does not hold back a
+    /// software update, and the reverse.
+    pub fn update_lock_file(&self) -> PathBuf {
+        self.root.join(".update.lock")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +508,16 @@ impl Config {
         self.layout.download_file()
     }
 
+    /// File that one run locks while it installs content.
+    pub fn lock_file(&self) -> PathBuf {
+        self.layout.lock_file()
+    }
+
+    /// File that one run locks while it replaces the program.
+    pub fn update_lock_file(&self) -> PathBuf {
+        self.layout.update_lock_file()
+    }
+
     /// URL that returns the latest content hash as JSON.
     pub fn latest_url(&self) -> String {
         join(&self.base_url, &self.routes.content_latest)
@@ -602,6 +625,27 @@ pub fn validate_hash(hash: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// This block follows every production item on purpose. The test
+// `no_endpoint_is_compiled_into_this_module` reads only the text that comes
+// before the first item that is built for tests alone, so a block placed
+// earlier would take the rest of the file out of that check.
+#[cfg(test)]
+impl Config {
+    /// A configuration for a test: the root, a base URL, and nothing else.
+    pub fn for_test(root: &Path, base_url: &str) -> Self {
+        Self {
+            layout: Layout {
+                root: root.to_path_buf(),
+            },
+            base_url: base_url.to_string(),
+            routes: Routes::default(),
+            credentials: None,
+            tokens: Arc::new(TokenCache::default()),
+            source: Source::Stored,
+        }
+    }
 }
 
 #[cfg(test)]

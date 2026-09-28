@@ -24,6 +24,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -35,6 +36,12 @@ use crate::version;
 
 /// Version of this binary.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long a run waits for another run to finish replacing the program.
+///
+/// The download of a binary is the long step, so this matches the wait of the
+/// content install.
+const UPDATE_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// One platform's build in the manifest.
 ///
@@ -175,12 +182,26 @@ impl Build {
 /// The function verifies the SHA-256 and runs the new binary with `--version`
 /// before it swaps. Returns the path it replaced.
 ///
+/// The function holds the update lock until it returns, so two runs never
+/// replace the program at once. It waits up to `UPDATE_LOCK_WAIT` for that
+/// lock, and returns an error when another run still holds it.
+///
 /// When `link` has installed a copy under the root and the running binary is
 /// another file, that copy is replaced too. The hook runs the copy, and an
 /// update that reached only the file the user happened to run would leave
 /// every session on the old version.
 pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -> Result<PathBuf> {
     let expected_sum = build.checksum()?;
+
+    // One update at a time. Two runs would each remove the other's backup.
+    let Some(_lock) = crate::lock::acquire(&config.update_lock_file(), UPDATE_LOCK_WAIT)? else {
+        bail!(
+            "another brainmaker run is replacing the program under {}; \
+             run the command again when it ends",
+            config.root().display()
+        );
+    };
+
     let url = config.binary_url(latest, &platform_key());
 
     let exe = current_exe()?;
