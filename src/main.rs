@@ -33,6 +33,8 @@ mod selfupdate;
 mod signature;
 mod state;
 mod sync;
+#[cfg(test)]
+mod testutil;
 mod uninstall;
 mod url;
 mod version;
