@@ -52,6 +52,10 @@ struct Latest {
 /// It carries no URL, for the same reason the software manifest carries none:
 /// the client derives the download address from its own base URL, so a signed
 /// document cannot move the download to another host.
+///
+/// It carries a sequence, which lets the client refuse a release that was
+/// signed before the one it holds. A signature proves who made a release, and
+/// not when.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentRelease {
     /// Short name of the release, which is also its archive name.
@@ -60,6 +64,11 @@ pub struct ContentRelease {
     pub sha256: String,
     /// Size of the archive in bytes.
     pub size_bytes: u64,
+    /// Order of this release among all releases, higher for a later one.
+    ///
+    /// A release from a signer older than this field carries none.
+    #[serde(default)]
+    pub sequence: Option<u64>,
 }
 
 /// Reads the latest content release, and checks its signature.
