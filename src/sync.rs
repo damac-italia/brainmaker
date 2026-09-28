@@ -55,6 +55,11 @@ const LOCK_WAIT: Duration = Duration::from_millis(200);
 /// reports [`Outcome::Unreachable`]. With nothing installed, or with
 /// `force`, the failure is returned, because there is nothing to fall back on.
 ///
+/// A release with another hash installs only when its sequence is higher than
+/// the installed one, so a server cannot make a machine install a release that
+/// was signed before the one it holds. The run then returns an error, and
+/// `force` installs the release anyway.
+///
 /// Two runs never install at once. The function takes the install lock before
 /// it downloads, and waits up to [`LOCK_WAIT`] for another run to release it.
 /// A run that still finds the lock held keeps the installed content and
@@ -69,6 +74,7 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
     let content_dir = config.content_dir();
     let local = state::read(&config.state_file());
     let installed = local.as_ref().map(|s| s.hash.clone());
+    let installed_sequence = local.as_ref().and_then(|s| s.sequence);
     let content_present = content_dir.is_dir();
 
     log("Checking the latest content version.");
@@ -94,6 +100,12 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
         log("The state file matches the remote version, but the content directory is missing.");
     }
 
+    // A release with another hash must also be a later one. The same hash is
+    // the release that is already installed, so it needs no order.
+    if !force && installed.as_deref() != Some(remote_hash.as_str()) {
+        check_order(installed_sequence, release.sequence)?;
+    }
+
     // One install at a time. `_lock` lives until this function returns.
     let Some(_lock) = lock::acquire(&config.lock_file(), LOCK_WAIT)? else {
         return match installed {
@@ -106,12 +118,15 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
         };
     };
 
-    // The run that held the lock may have installed this release.
-    if !force
-        && state::read(&config.state_file()).is_some_and(|s| s.hash == remote_hash)
-        && content_dir.is_dir()
-    {
+    // The run that held the lock may have installed this release, or a later
+    // one. The first reading of the state is older than the wait, so read it
+    // again, and apply the same order to what it holds now.
+    let current = state::read(&config.state_file());
+    if !force && current.as_ref().is_some_and(|s| s.hash == remote_hash) && content_dir.is_dir() {
         return Ok(Outcome::UpToDate { hash: remote_hash });
+    }
+    if !force && current.as_ref().map(|s| s.hash.as_str()) != Some(remote_hash.as_str()) {
+        check_order(current.and_then(|s| s.sequence), release.sequence)?;
     }
 
     log(&format!("Downloading content-{remote_hash}.zip"));
@@ -120,6 +135,29 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
         hash: remote_hash,
         stats,
     })
+}
+
+/// Fails for a release that is not newer than the installed one.
+///
+/// The signature proves who made a release, and not when. Without an
+/// order, a server could serve any release that was ever signed, and the
+/// client would install it. `installed` and `offered` are the two
+/// sequences; the hashes are already known to differ.
+fn check_order(installed: Option<u64>, offered: Option<u64>) -> Result<()> {
+    match (installed, offered) {
+        (None, _) => Ok(()),
+        (Some(held), Some(new)) if new > held => Ok(()),
+        (Some(held), Some(new)) => bail!(
+            "the server offers a content release with the sequence {new}, and the \
+             installed one has the sequence {held}. brainmaker installs only a newer \
+             release. If this rollback is intended, run sync --force"
+        ),
+        (Some(held), None) => bail!(
+            "the server offers a content release with no sequence, and the installed \
+             one has the sequence {held}. Sign the release with a current \
+             brainmaker-sign. If this rollback is intended, run sync --force"
+        ),
+    }
 }
 
 /// Downloads one release and replaces `content/` with it.
@@ -181,8 +219,11 @@ fn install(
 
     let stats = result?;
 
-    state::write(&config.state_file(), &State::new(hash))
-        .context("the content was installed, but the state file could not be written")?;
+    state::write(
+        &config.state_file(),
+        &State::with_sequence(hash, release.sequence),
+    )
+    .context("the content was installed, but the state file could not be written")?;
 
     Ok(stats)
 }
