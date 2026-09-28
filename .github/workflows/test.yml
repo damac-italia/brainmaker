@@ -14,9 +14,24 @@ on:
 
 jobs:
   test:
-    # arm64 Linux runners are free for public repositories, and this one is
-    # public. See the linux-arm64 note in release.yml.
-    runs-on: ubuntu-24.04-arm
+    # The product ships for three systems, and each one has code that the
+    # others never compile: the LaunchAgent and ioreg on macOS, the registry
+    # and the directory links on Windows. arm64 Linux runners are free for
+    # public repositories, and this one is public.
+    name: test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+          - os: macos-14
+          # Several tests name Unix paths, so a failure on Windows does not
+          # yet prove a defect. The job compiles and lints as a hard gate;
+          # its test step reports and does not block. Remove `experimental`
+          # once the Windows tests pass.
+          - os: windows-2022
+            experimental: true
 
     steps:
       - name: Checkout
@@ -33,7 +48,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Check the formatting
-        # Runs before the cache step, because it compiles nothing.
+        # Runs before the cache step, because it compiles nothing. The
+        # formatting does not depend on the system, so one runner checks it.
+        if: matrix.os == 'ubuntu-24.04-arm'
         run: cargo fmt --all --check
 
       - name: Cache cargo build
@@ -53,4 +70,8 @@ jobs:
         # BRAINMAKER_CONFIG_KEY stays unset on purpose: the tests seal and open
         # their own values with the development key, and the release workflow
         # is the only place that needs the real one.
+        #
+        # The Windows entry of the matrix is marked experimental, so a failing
+        # test there is reported and does not block a merge.
+        continue-on-error: ${{ matrix.experimental == true }}
         run: cargo test --workspace --all-targets --locked --features sign

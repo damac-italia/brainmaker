@@ -2,6 +2,8 @@
 name = "brainmaker"
 version = "0.1.6"
 edition = "2024"
+# File::try_lock, which the run lock uses, is stable since this version.
+rust-version = "1.89"
 description = "Keeps ~/.brainmaker/content in step with the content API"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/damac-italia/brainmaker"

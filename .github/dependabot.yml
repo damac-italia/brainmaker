@@ -14,9 +14,8 @@ updates:
         patterns:
           - "serde*"
 
-  # Keep the GitHub Actions used in CI patched too. release.yml still pins its
-  # actions by tag, and test.yml and dependency-review.yml pin them by SHA;
-  # dependabot updates both forms.
+  # Keep the GitHub Actions used in CI patched too. Every workflow pins its
+  # actions by SHA, and dependabot updates the SHA and the version comment.
   - package-ecosystem: github-actions
     directory: /
     schedule:

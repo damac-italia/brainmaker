@@ -109,6 +109,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      # The same toolchain step that the test workflow uses, so that a release
+      # is built by the compiler that tested it, and not by whatever the
+      # runner image holds.
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
       - name: Add the Rust target
         run: rustup target add ${{ matrix.target }}
 
@@ -221,6 +230,14 @@ jobs:
           chmod +x scripts/make-manifest.sh
           ./scripts/make-manifest.sh dist "$VERSION"
           cat dist/manifest.json
+
+      # The same toolchain step that the test workflow uses, so that a release
+      # is built by the compiler that tested it, and not by whatever the
+      # runner image holds.
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
 
       # Built with no secret in the environment. A dependency build script or
       # a procedural macro runs during this step, and it must find no key.
