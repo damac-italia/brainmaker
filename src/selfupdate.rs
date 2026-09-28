@@ -225,11 +225,7 @@ pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -
         log(&format!("Downloaded {bytes} bytes."));
 
         let actual_sum = crate::digest::sha256_of(&staged)?;
-        if actual_sum != expected_sum {
-            bail!(
-                "the SHA-256 of the download is {actual_sum}, but the manifest says {expected_sum}"
-            );
-        }
+        crate::digest::check_matches(&actual_sum, &expected_sum, "the manifest")?;
         log("The SHA-256 matches the manifest.");
 
         set_executable(&staged)?;
