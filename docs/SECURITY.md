@@ -107,7 +107,7 @@ any route of a deployment.
 | The binary | Only `BRAINMAKER_CONFIG_KEY` and `CARGO_PKG_VERSION` are read at compile time. Two unit tests, `config::tests::no_endpoint_is_compiled_into_this_module` and `auth::tests::no_endpoint_is_compiled_into_this_module`, fail the build if a URL with a host enters either module. `cli::tests::the_help_text_names_no_endpoint` does the same for the help text. |
 | The repository | Every document uses `api.example.test`. The five route keys let a deployment replace every default route name, so even the route layout need not appear here. |
 | The workflow logs | The release workflow takes no URL as input. It builds, checksums, and signs. |
-| The release notes and assets | The manifest carries a version and one SHA-256 per platform. `selfupdate::tests::the_manifest_type_carries_no_url` fails the build if a `url` field returns to the manifest type. |
+| The release notes and assets | The manifest carries a version and one SHA-256 per platform. `selfupdate::tests::the_manifest_type_carries_no_url` fails the build if a `url` field returns to the manifest type. GitHub writes the notes from merged pull request titles, so a title must name no endpoint. |
 
 The base URL, the OAuth2 endpoint, and any custom routes reach a machine only in the provisioning
 file, and that file is sealed on first use and then deleted. A public release therefore discloses
@@ -222,6 +222,12 @@ renamed over it, so a failure part-way leaves the previous copy intact.
 
 The download address is not a control that can fail: `Config::binary_url` derives it from the base
 URL in the provisioning file, so a manifest cannot name another host at all.
+
+On macOS, `link` installs a LaunchAgent that runs `self-update` every hour with no person present.
+A build signed by a key in `PUBLIC_KEYS` therefore reaches every linked Mac within an hour of its
+promotion. The five controls above apply unchanged, and the agent passes no `--force`, so it never
+reinstalls or downgrades. The agent runs as the user, in the user's GUI session, and writes only
+under the root and its own property list. `unlink` and `uninstall` remove it.
 
 ### Content install
 

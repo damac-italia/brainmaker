@@ -26,9 +26,10 @@ under the `sign` feature and never ships.
 | [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `link`, `remote`, `signature`, `version` |
 | [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `ring` |
 | [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `sha2` |
-| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the session context, and the binary copy under the root | `config`, `dirs`, `serde_json` |
+| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the session context, and the binary copy under the root | `config`, `dirs`, `schedule`, `serde_json` |
+| [`src/schedule.rs`](../src/schedule.rs) | Write, load, unload, and remove the hourly macOS LaunchAgent | `dirs` |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
-| [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root | `config`, `link`, `secretstore`, `state` |
+| [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root | `config`, `link`, `schedule`, `secretstore`, `state` |
 
 ## Module graph
 
@@ -86,8 +87,9 @@ the injected `log` closure.
 
 ```text
 ~/.brainmaker/
+├── agent.log           the LaunchAgent's output: a date line per run, and errors
 ├── bin/
-│   └── brainmaker      0755, the copy that link writes and the SessionStart hook runs
+│   └── brainmaker      0755, the copy that link writes and the hook and the agent run
 ├── confidential/       0700
 │   └── config.enc      0600, the sealed endpoints, routes, and credentials
 ├── content/            the extracted content
@@ -312,6 +314,30 @@ running old copy holding its own inode.
 
 The tradeoff: two copies of the binary exist, and a `self-update` run from a third location
 updates both of them rather than one.
+
+### An hourly LaunchAgent installs signed builds without a person
+
+The `SessionStart` hook only syncs, and it never installs a binary, so a Mac stayed on its version
+until someone ran `self-update`, and a Mac that started no session kept old content. On macOS,
+`link` therefore also writes a LaunchAgent that runs `self-update` and then `sync` through
+`/bin/sh` at minute 0 of every hour and at each login. `;` joins the two, so a failed update never
+holds the content back. The agent runs the same copy under the root that the hook runs.
+
+The agent is part of the bridge. `link` writes it, and `unlink` and `uninstall` remove it before
+the program copy goes, so no hourly run starts a file that is gone. The installer already runs
+`link` and has no step of its own for the agent.
+
+It belongs to the account, as `~/.claude` does. `--claude-dir` names another Claude directory,
+which is a test or a second setup, so `Agents::resolve` then returns no agent unless
+`--agent-dir` names where it goes, and an agent in a named directory is never loaded. Without this
+rule, the installer's dry run would leave a real agent that synced a throwaway root every hour.
+
+A `launchctl` failure is a notice, not an error: the property list is in place, and launchd loads
+it at the next login. An SSH session, which has no GUI domain, is the usual cause.
+
+The tradeoff: a promoted build reaches every linked Mac within an hour, with no person to stop
+it. The five `self-update` controls are the only gate, so the signing key decides what every Mac
+runs. Only macOS has launchd; Windows and Linux keep the hook as their only trigger.
 
 ### A relative `--dir` becomes absolute before anything is written
 

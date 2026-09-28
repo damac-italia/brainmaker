@@ -21,8 +21,9 @@ COMMANDS:
     self-update    Replace this binary with the newest build for this platform
     link           Wire the synced content into ~/.claude, so its skills and
                    its session context load in every project, not only in the
-                   content directory
-    unlink         Remove what link wrote
+                   content directory. On macOS it also installs a LaunchAgent
+                   that runs self-update, then sync, every hour.
+    unlink         Remove what link wrote, the LaunchAgent included
     uninstall      Remove brainmaker from this machine: what link wrote, then
                    the content, the sealed settings, and the program copy
                    under the root. It asks first, unless --yes is given.
@@ -41,7 +42,11 @@ OPTIONS:
     --keep-config        Do not remove the provisioning file after the import
     --dir <PATH>         Use PATH as the root instead of ~/.brainmaker
     --claude-dir <PATH>  With link, unlink, and uninstall, write to PATH
-                         instead of ~/.claude
+                         instead of ~/.claude. The LaunchAgent is then left
+                         alone, unless --agent-dir names where it goes.
+    --agent-dir <PATH>   With link, unlink, and uninstall, write the
+                         LaunchAgent to PATH instead of ~/Library/LaunchAgents,
+                         and do not load it
     --url <URL>          Use URL as the API base
     -q, --quiet          Print errors only
     -h, --help           Print this help text
@@ -119,6 +124,9 @@ pub struct Args {
     /// `--claude-dir`, naming the Claude configuration directory that `link`,
     /// `unlink`, and `uninstall` write to.
     pub claude_dir: Option<PathBuf>,
+    /// `--agent-dir`, naming the directory that holds the LaunchAgent that
+    /// `link` writes and that `unlink` and `uninstall` remove.
+    pub agent_dir: Option<PathBuf>,
 }
 
 impl Default for Args {
@@ -135,6 +143,7 @@ impl Default for Args {
             dir: None,
             url: None,
             claude_dir: None,
+            agent_dir: None,
         }
     }
 }
@@ -176,6 +185,12 @@ where
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("--claude-dir needs a path"))?;
                 args.claude_dir = Some(PathBuf::from(value));
+            }
+            "--agent-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--agent-dir needs a path"))?;
+                args.agent_dir = Some(PathBuf::from(value));
             }
             "--url" => {
                 let value = iter
@@ -292,6 +307,7 @@ mod tests {
         assert_eq!(args.command, Command::Uninstall);
         assert!(!args.yes, "uninstall asks unless --yes is given");
         assert_eq!(args.claude_dir, Some(PathBuf::from("/tmp/claude")));
+        assert_eq!(args.agent_dir, None);
 
         assert!(run(&["uninstall", "--yes"]).yes);
         assert!(run(&["-y", "uninstall"]).yes);
@@ -310,6 +326,14 @@ mod tests {
         }
         // The same flags stay valid with every other command.
         assert!(parse(["unlink", "--url", "https://x/y"]).is_ok());
+    }
+
+    #[test]
+    fn parses_the_agent_dir_flag() {
+        let args = run(&["link", "--agent-dir", "/tmp/agents"]);
+        assert_eq!(args.command, Command::Link);
+        assert_eq!(args.agent_dir, Some(PathBuf::from("/tmp/agents")));
+        assert!(parse(["link", "--agent-dir"]).is_err());
     }
 
     #[test]

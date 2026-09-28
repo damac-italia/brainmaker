@@ -1,103 +1,107 @@
 {
   "version": 1,
-  "head": "5968263",
+  "head": "ee77a89",
   "docs": {
     "README.md": {
-      "doc_hash": "e931de02aac74437",
+      "doc_hash": "dc00cfc75f9f8570",
       "sources": {
         ".github/dependabot.yml": "37a1071047e74ea4",
         ".github/workflows/dependency-review.yml": "568eebf8eae600c9",
-        ".github/workflows/release.yml": "002afe7fda998945",
+        ".github/workflows/release.yml": "f8f76a2858e040c5",
         ".github/workflows/test.yml": "89582a7dea8914b1",
-        "Cargo.lock": "658509dd06220746",
-        "Cargo.toml": "e00fc35596385190",
+        "Cargo.lock": "3ad2d803ade00edc",
+        "Cargo.toml": "86315b3f692997a4",
         "LICENSE": "3972dc9744f6499f",
         "scripts/make-manifest.sh": "4883c40694dc1312",
         "src/auth.rs": "8e416ad13a11af97",
-        "src/cli.rs": "8b23392197430305",
+        "src/cli.rs": "2b5cce2ab264296c",
         "src/config.rs": "4be8e4230d92645e",
-        "src/link.rs": "62b703dd859b424d",
-        "src/main.rs": "df2e59e384bbd7ee",
+        "src/link.rs": "2b5e2c917af950bb",
+        "src/main.rs": "3a66ce1482548812",
         "src/provision.rs": "813af36c30031578",
         "src/selfupdate.rs": "34b29e3c5abcafc5",
         "src/signature.rs": "c47681e493b62b27",
         "src/sync.rs": "1fdc6dc7b5af2534",
-        "src/uninstall.rs": "8f947da78e18b369",
+        "src/uninstall.rs": "4c46a30c822ac3a5",
         "src/url.rs": "27ad1cf4025280af",
-        "tools/sign.rs": "64703b7834be75fd"
+        "tools/sign.rs": "64703b7834be75fd",
+        "src/schedule.rs": "f618e40c7f10bda2"
       }
     },
     "docs/ARCHITECTURE.md": {
-      "doc_hash": "15bf6812f098b76b",
+      "doc_hash": "5a227b4061191fc2",
       "sources": {
-        ".github/workflows/release.yml": "002afe7fda998945",
-        "Cargo.toml": "e00fc35596385190",
+        ".github/workflows/release.yml": "f8f76a2858e040c5",
+        "Cargo.toml": "86315b3f692997a4",
         "build.rs": "3301704cc0f88c5e",
         "src/auth.rs": "8e416ad13a11af97",
-        "src/cli.rs": "8b23392197430305",
+        "src/cli.rs": "2b5cce2ab264296c",
         "src/config.rs": "4be8e4230d92645e",
         "src/digest.rs": "2047ae79b95e1a8b",
-        "src/link.rs": "62b703dd859b424d",
-        "src/main.rs": "df2e59e384bbd7ee",
+        "src/link.rs": "2b5e2c917af950bb",
+        "src/main.rs": "3a66ce1482548812",
         "src/provision.rs": "813af36c30031578",
         "src/secretstore.rs": "a44cf93a01a24669",
         "src/selfupdate.rs": "34b29e3c5abcafc5",
         "src/signature.rs": "c47681e493b62b27",
         "src/state.rs": "807e997cfce67984",
         "src/sync.rs": "1fdc6dc7b5af2534",
-        "src/uninstall.rs": "8f947da78e18b369",
+        "src/uninstall.rs": "4c46a30c822ac3a5",
         "src/url.rs": "27ad1cf4025280af",
-        "src/version.rs": "6bfa971eabf2a0fe"
+        "src/version.rs": "6bfa971eabf2a0fe",
+        "src/schedule.rs": "f618e40c7f10bda2"
       }
     },
     "docs/FLOW.md": {
-      "doc_hash": "8813c4785de310d4",
+      "doc_hash": "aca20197820ab099",
       "sources": {
         "src/archive.rs": "a98d173402f543d6",
         "src/auth.rs": "8e416ad13a11af97",
         "src/config.rs": "4be8e4230d92645e",
-        "src/link.rs": "62b703dd859b424d",
-        "src/main.rs": "df2e59e384bbd7ee",
+        "src/link.rs": "2b5e2c917af950bb",
+        "src/main.rs": "3a66ce1482548812",
         "src/provision.rs": "813af36c30031578",
         "src/remote.rs": "0b0ce8427a86816a",
         "src/selfupdate.rs": "34b29e3c5abcafc5",
         "src/signature.rs": "c47681e493b62b27",
         "src/state.rs": "807e997cfce67984",
         "src/sync.rs": "1fdc6dc7b5af2534",
-        "src/uninstall.rs": "8f947da78e18b369",
-        "src/url.rs": "27ad1cf4025280af"
+        "src/uninstall.rs": "4c46a30c822ac3a5",
+        "src/url.rs": "27ad1cf4025280af",
+        "src/schedule.rs": "f618e40c7f10bda2"
       }
     },
     "docs/API.md": {
-      "doc_hash": "03d7fa2dc5321c1b",
+      "doc_hash": "48b48bb48f6dc0b8",
       "sources": {
         "scripts/make-manifest.sh": "4883c40694dc1312",
         "src/auth.rs": "8e416ad13a11af97",
-        "src/cli.rs": "8b23392197430305",
+        "src/cli.rs": "2b5cce2ab264296c",
         "src/config.rs": "4be8e4230d92645e",
-        "src/link.rs": "62b703dd859b424d",
-        "src/main.rs": "df2e59e384bbd7ee",
+        "src/link.rs": "2b5e2c917af950bb",
+        "src/main.rs": "3a66ce1482548812",
         "src/provision.rs": "813af36c30031578",
         "src/remote.rs": "0b0ce8427a86816a",
         "src/selfupdate.rs": "34b29e3c5abcafc5",
         "src/signature.rs": "c47681e493b62b27",
         "src/sync.rs": "1fdc6dc7b5af2534",
-        "src/uninstall.rs": "8f947da78e18b369",
+        "src/uninstall.rs": "4c46a30c822ac3a5",
         "src/url.rs": "27ad1cf4025280af",
-        "tools/sign.rs": "64703b7834be75fd"
+        "tools/sign.rs": "64703b7834be75fd",
+        "src/schedule.rs": "f618e40c7f10bda2"
       }
     },
     "docs/SECURITY.md": {
-      "doc_hash": "9c29801b0937be51",
+      "doc_hash": "b2efaf6f70ae5df7",
       "sources": {
-        ".github/workflows/release.yml": "002afe7fda998945",
-        "Cargo.toml": "e00fc35596385190",
+        ".github/workflows/release.yml": "f8f76a2858e040c5",
+        "Cargo.toml": "86315b3f692997a4",
         "build.rs": "3301704cc0f88c5e",
         "src/archive.rs": "a98d173402f543d6",
         "src/auth.rs": "8e416ad13a11af97",
         "src/config.rs": "4be8e4230d92645e",
         "src/digest.rs": "2047ae79b95e1a8b",
-        "src/link.rs": "62b703dd859b424d",
+        "src/link.rs": "2b5e2c917af950bb",
         "src/provision.rs": "813af36c30031578",
         "src/remote.rs": "0b0ce8427a86816a",
         "src/secretstore.rs": "a44cf93a01a24669",
@@ -105,8 +109,9 @@
         "src/signature.rs": "c47681e493b62b27",
         "src/state.rs": "807e997cfce67984",
         "src/sync.rs": "1fdc6dc7b5af2534",
-        "src/uninstall.rs": "8f947da78e18b369",
-        "src/url.rs": "27ad1cf4025280af"
+        "src/uninstall.rs": "4c46a30c822ac3a5",
+        "src/url.rs": "27ad1cf4025280af",
+        "src/schedule.rs": "f618e40c7f10bda2"
       }
     }
   }

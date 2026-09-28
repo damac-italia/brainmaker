@@ -22,6 +22,9 @@
 //!    archive it was unzipped from is meant to be deleted.
 //! 3. A marked block in `~/.claude/CLAUDE.md` that names the content
 //!    directory.
+//! 4. On macOS, a LaunchAgent that runs `self-update` and then `sync` every
+//!    hour, through the same program copy. [`crate::schedule`] says why and
+//!    when it is left out.
 //!
 //! Every piece carries a marker, so `unlink` removes what `link` wrote and
 //! leaves everything else alone. `link` never overwrites a file it did not
@@ -43,6 +46,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 use crate::config::Config;
+use crate::schedule::{self, Agents};
 
 /// Largest context this emits, in bytes.
 ///
@@ -100,6 +104,8 @@ pub struct Report {
     pub settings_changed: bool,
     /// True when `CLAUDE.md` changed.
     pub briefing_changed: bool,
+    /// True when the LaunchAgent's property list changed.
+    pub agent_changed: bool,
 }
 
 impl Report {
@@ -107,6 +113,7 @@ impl Report {
     pub fn changed(&self) -> bool {
         self.settings_changed
             || self.briefing_changed
+            || self.agent_changed
             || !self.linked.is_empty()
             || !self.removed.is_empty()
     }
@@ -118,8 +125,13 @@ pub fn claude_dir() -> Result<PathBuf> {
     Ok(home.join(".claude"))
 }
 
-/// Writes the bridge.
-pub fn link(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Report> {
+/// Writes the bridge, and the agent when `agents` names where it goes.
+pub fn link(
+    config: &Config,
+    claude: &Path,
+    agents: Option<&Agents>,
+    log: &dyn Fn(&str),
+) -> Result<Report> {
     let content = config.content_dir();
     if !content.is_dir() {
         bail!(
@@ -134,13 +146,21 @@ pub fn link(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Report
     let prefix = command_prefix(&program, Some(config.root()));
     report.settings_changed = write_settings(claude, Some(&prefix))?;
     report.briefing_changed = write_briefing(&content, claude, Some(&prefix))?;
+    if let Some(agents) = agents {
+        report.agent_changed = schedule::install(agents, &prefix, config.root(), log)?;
+    }
     describe(&report, true, log);
     Ok(report)
 }
 
-/// Removes the bridge.
-pub fn unlink(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Report> {
-    let report = remove_bridge(&config.content_dir(), claude)?;
+/// Removes the bridge, and the agent when `agents` names where it is.
+pub fn unlink(
+    config: &Config,
+    claude: &Path,
+    agents: Option<&Agents>,
+    log: &dyn Fn(&str),
+) -> Result<Report> {
+    let report = remove_bridge(&config.content_dir(), claude, agents)?;
     describe(&report, false, log);
     Ok(report)
 }
@@ -149,8 +169,13 @@ pub fn unlink(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Repo
 ///
 /// `uninstall` calls this rather than [`unlink`]: it reads no settings, so it
 /// holds no [`Config`], and it reports the bridge together with the root.
-pub fn remove_bridge(content: &Path, claude: &Path) -> Result<Report> {
+pub fn remove_bridge(content: &Path, claude: &Path, agents: Option<&Agents>) -> Result<Report> {
     let mut report = Report::default();
+    // The agent goes first: it runs the program copy, which uninstall removes
+    // next, and an hourly run in between would fail on the missing file.
+    if let Some(agents) = agents {
+        report.agent_changed = schedule::remove(agents)?;
+    }
     unlink_skills(content, claude, &mut report)?;
     report.settings_changed = write_settings(claude, None)?;
     report.briefing_changed = write_briefing(content, claude, None)?;
@@ -627,6 +652,12 @@ pub fn describe(report: &Report, installing: bool, log: &dyn Fn(&str)) {
     }
     if report.briefing_changed {
         log(&format!("{verb} the shared-content block in CLAUDE.md."));
+    }
+    if report.agent_changed {
+        log(&format!(
+            "{verb} the hourly LaunchAgent {}.",
+            schedule::LABEL
+        ));
     }
     if !report.changed() {
         log("Nothing to change.");

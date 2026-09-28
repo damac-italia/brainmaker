@@ -16,9 +16,9 @@ brainmaker [COMMAND] [OPTIONS]
 | `sync` | Update the content when the server has a newer version. The default when no command is given. | `content/`, `state.json` |
 | `status` | Print the installed hash, the latest hash, and both software versions | nothing |
 | `self-update` | Replace this binary with the newest build for this platform | the binary |
-| `link` | Bridge the synced content into `~/.claude` | `~/.claude/skills`, `settings.json`, `CLAUDE.md` |
-| `unlink` | Remove what `link` wrote, and nothing else | the same three |
-| `uninstall` | Remove what `link` wrote, then what brainmaker wrote under the root, then the root when it is empty. It asks first. | the same three, and the root |
+| `link` | Bridge the synced content into `~/.claude`. On macOS, also install and load the hourly LaunchAgent. | `~/.claude/skills`, `settings.json`, `CLAUDE.md`, `~/Library/LaunchAgents/it.damac.brainmaker.plist` |
+| `unlink` | Remove what `link` wrote, and nothing else | the same four |
+| `uninstall` | Remove what `link` wrote, then what brainmaker wrote under the root, then the root when it is empty. It asks first. | the same four, and the root |
 | `session-context` | Print the `SessionStart` JSON the linked hook returns | nothing |
 
 The parser accepts one command. A second command is an error, and so is any unrecognised argument.
@@ -35,12 +35,32 @@ The parser accepts one command. A second command is an error, and so is any unre
 | `--keep-config` | none | all but `uninstall`, which rejects it | Do not remove the provisioning file after the import |
 | `--dir` | `<PATH>` | all | Use `PATH` as the root instead of `~/.brainmaker` |
 | `--url` | `<URL>` | all but `uninstall`, which rejects it | Use `URL` as the API base |
-| `--claude-dir` | `<PATH>` | `link`, `unlink`, `uninstall` | Write to `PATH` instead of `~/.claude` |
+| `--claude-dir` | `<PATH>` | `link`, `unlink`, `uninstall` | Write to `PATH` instead of `~/.claude`. The LaunchAgent is then left alone, unless `--agent-dir` is also given. |
+| `--agent-dir` | `<PATH>` | `link`, `unlink`, `uninstall` | Write the LaunchAgent to `PATH` instead of `~/Library/LaunchAgents`, and do not load it |
 | `-q`, `--quiet` | none | all | Print errors only |
 | `-h`, `--help` | none | — | Print the help text and exit 0 |
 | `-V`, `--version` | none | — | Print `brainmaker <version>` and exit 0 |
 
-`--config`, `--dir`, `--url`, and `--claude-dir` fail when their value is absent.
+`--config`, `--dir`, `--url`, `--claude-dir`, and `--agent-dir` fail when their value is absent.
+
+### The LaunchAgent
+
+`link` writes `it.damac.brainmaker.plist` on macOS only. It runs this through `/bin/sh -c` at
+minute 0 of every hour, and once at each login:
+
+```sh
+date; "<root>/bin/brainmaker" --dir "<root>" self-update --quiet; "<root>/bin/brainmaker" --dir "<root>" sync --quiet --no-update-check
+```
+
+`sync` runs even when `self-update` fails. Both write to `<root>/agent.log`, so the log holds one
+date line per run and the errors, if any. `link` loads the agent with `launchctl bootstrap`; a
+`launchctl` failure prints a notice and does not fail `link`, because launchd loads the file at the
+next login. An unchanged file is neither rewritten nor reloaded. `unlink` and `uninstall` run
+`launchctl bootout` and remove the file.
+
+With `--claude-dir` and no `--agent-dir`, `link`, `unlink`, and `uninstall` leave the agent alone.
+The agent belongs to the account, so a link into another Claude directory, such as the installer's
+dry run, must not start an hourly job against its root. On Windows and Linux there is no agent.
 
 ### Exit codes
 
@@ -71,16 +91,16 @@ and `--url` with `<flag> has no effect with uninstall, which loads no settings`,
 
 | Step | Removes | When |
 |---|---|---|
-| 1 | The skill links, the `SessionStart` hook, and the `CLAUDE.md` block that `link` wrote, as `unlink` removes them | the root is recognised or does not exist |
-| 2 | `content/`, `.staging/`, `.trash/`, and `.download.zip` | the root is recognised |
+| 1 | The LaunchAgent, the skill links, the `SessionStart` hook, and the `CLAUDE.md` block that `link` wrote, as `unlink` removes them | the root is recognised or does not exist |
+| 2 | `content/`, `.staging/`, `.trash/`, `.download.zip`, and `agent.log` | the root is recognised |
 | 3 | `bin/brainmaker`, and every `bin/.brainmaker*` file that `link` or `self-update` left | the root is recognised |
 | 4 | `state.json.tmp`, `state.json`, `confidential/config.tmp`, and `confidential/config.enc` | the root is recognised |
 | 5 | `bin/`, `confidential/`, and then the root | each one is empty |
 
 The root is recognised when it holds a `state.json` of the shape that `sync` writes, or a
 `confidential/config.enc` that starts with the sealed header. When the root exists but is not
-recognised, the run changes nothing, step 1 included, and says so. The hook and the `CLAUDE.md`
-block do not name their root, so step 1 under a wrong `--dir` would cut off a real install
+recognised, the run changes nothing, step 1 included, and says so. The agent, the hook, and the
+`CLAUDE.md` block are not checked against their root, so step 1 under a wrong `--dir` would cut off a real install
 elsewhere. Step 4 comes last because those two files are the marks: a run that stops part-way
 keeps them, and the next run still recognises the root.
 
