@@ -36,7 +36,13 @@ pub enum Outcome {
 ///
 /// The hook allows `sync` 60 seconds in all, and the check of the latest
 /// version can take 20 of them.
+#[cfg(not(test))]
 const LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// The same wait in a test build, short enough for a test that holds the
+/// lock on purpose.
+#[cfg(test)]
+const LOCK_WAIT: Duration = Duration::from_millis(200);
 
 /// Brings `content/` to the latest remote version.
 ///
@@ -246,6 +252,7 @@ fn remove_file_if_present(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{self, Route, Server, Signer};
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -387,6 +394,386 @@ mod tests {
         );
 
         drop(other_run);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Ignores the progress messages.
+    fn quiet(_: &str) {}
+
+    /// The SHA-256 of `bytes`, from the function that checks a download.
+    fn digest_of(bytes: &[u8]) -> String {
+        let dir = testutil::temp_dir("sync-digest");
+        let path = dir.join("bytes");
+        fs::write(&path, bytes).unwrap();
+        let digest = crate::digest::sha256_of(&path).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        digest
+    }
+
+    /// The routes of a server that publishes one release.
+    ///
+    /// The signed release names `described` by its digest and claims `size`
+    /// bytes, and the archive route serves `served`. The three differ in the
+    /// tests that publish a release that cannot be trusted.
+    fn routes(
+        signer: &Signer,
+        hash: &str,
+        described: &[u8],
+        size: u64,
+        served: &[u8],
+    ) -> Vec<Route> {
+        let payload = serde_json::json!({
+            "hash": hash,
+            "sha256": digest_of(described),
+            "size_bytes": size,
+        })
+        .to_string();
+        vec![
+            Route::get("/content/latest", signer.envelope(&payload)),
+            Route::get(&format!("/content/{hash}.zip"), served),
+        ]
+    }
+
+    /// The routes of a server that publishes `archive` as it stands.
+    fn published(signer: &Signer, hash: &str, archive: &[u8]) -> Vec<Route> {
+        routes(signer, hash, archive, archive.len() as u64, archive)
+    }
+
+    /// How many times `server` was asked for the archive of `hash`.
+    fn downloads(server: &Server, hash: &str) -> usize {
+        let path = format!("/content/{hash}.zip");
+        server
+            .requests()
+            .iter()
+            .filter(|(_, requested, _)| *requested == path)
+            .count()
+    }
+
+    #[test]
+    fn installs_a_signed_release() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(published(&signer, "a1b2c3d4", &archive));
+        let dir = testutil::temp_dir("sync-install");
+        let config = Config::for_test(&dir, &server.base());
+
+        let outcome = sync(&config, false, &quiet).unwrap();
+
+        match outcome {
+            Outcome::Updated {
+                previous,
+                hash,
+                stats,
+            } => {
+                assert_eq!(previous, None);
+                assert_eq!(hash, "a1b2c3d4");
+                assert_eq!(stats.files, 1);
+            }
+            other => panic!("expected an install, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(config.content_dir().join("notes.md")).unwrap(),
+            "# release one"
+        );
+        assert_eq!(state::read(&config.state_file()).unwrap().hash, "a1b2c3d4");
+        for leftover in [
+            config.staging_dir(),
+            config.trash_dir(),
+            config.download_file(),
+        ] {
+            assert!(!leftover.exists(), "{} was left behind", leftover.display());
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reports_up_to_date_and_downloads_nothing() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(published(&signer, "a1b2c3d4", &archive));
+        let dir = testutil::temp_dir("sync-up-to-date");
+        let config = Config::for_test(&dir, &server.base());
+
+        sync(&config, false, &quiet).unwrap();
+        let outcome = sync(&config, false, &quiet).unwrap();
+
+        assert_eq!(
+            outcome,
+            Outcome::UpToDate {
+                hash: "a1b2c3d4".to_string()
+            }
+        );
+        // The first run downloaded the archive, and the second one did not.
+        assert_eq!(downloads(&server, "a1b2c3d4"), 1);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn force_installs_again() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(published(&signer, "a1b2c3d4", &archive));
+        let dir = testutil::temp_dir("sync-force");
+        let config = Config::for_test(&dir, &server.base());
+
+        sync(&config, false, &quiet).unwrap();
+        let outcome = sync(&config, true, &quiet).unwrap();
+
+        match outcome {
+            Outcome::Updated { previous, hash, .. } => {
+                assert_eq!(previous, Some("a1b2c3d4".to_string()));
+                assert_eq!(hash, "a1b2c3d4");
+            }
+            other => panic!("expected a second install, got {other:?}"),
+        }
+        assert_eq!(downloads(&server, "a1b2c3d4"), 2);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keeps_the_content_when_the_server_cannot_be_reached() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(published(&signer, "a1b2c3d4", &archive));
+        let dir = testutil::temp_dir("sync-offline");
+        let config = Config::for_test(&dir, &server.base());
+        sync(&config, false, &quiet).unwrap();
+
+        let offline = Config::for_test(&dir, &testutil::closed_port_base());
+        let outcome = sync(&offline, false, &quiet).unwrap();
+
+        match outcome {
+            Outcome::Unreachable { hash, error } => {
+                assert_eq!(hash, "a1b2c3d4");
+                assert!(!error.is_empty(), "the outcome names no cause");
+            }
+            other => panic!("expected the installed content to stay, got {other:?}"),
+        }
+        assert!(config.content_dir().join("notes.md").is_file());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fails_when_nothing_is_installed_and_the_server_cannot_be_reached() {
+        let dir = testutil::temp_dir("sync-offline-empty");
+        let config = Config::for_test(&dir, &testutil::closed_port_base());
+
+        let result = sync(&config, false, &quiet);
+
+        assert!(result.is_err(), "got {result:?}");
+        assert!(!config.content_dir().exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fails_with_force_when_the_server_cannot_be_reached() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(published(&signer, "a1b2c3d4", &archive));
+        let dir = testutil::temp_dir("sync-offline-force");
+        let config = Config::for_test(&dir, &server.base());
+        sync(&config, false, &quiet).unwrap();
+
+        let offline = Config::for_test(&dir, &testutil::closed_port_base());
+        let result = sync(&offline, true, &quiet);
+
+        assert!(result.is_err(), "got {result:?}");
+        assert!(config.content_dir().join("notes.md").is_file());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_an_archive_that_differs_from_the_signed_digest() {
+        let signer = Signer::new();
+        signer.trust();
+        let signed = testutil::zip_of(&[("notes.md", b"signed bytes")]);
+        let served = testutil::zip_of(&[("notes.md", b"forged bytes")]);
+        assert_eq!(
+            signed.len(),
+            served.len(),
+            "the two archives must differ in content alone"
+        );
+        let server = Server::start(routes(
+            &signer,
+            "a1b2c3d4",
+            &signed,
+            signed.len() as u64,
+            &served,
+        ));
+        let dir = testutil::temp_dir("sync-forged");
+        let config = Config::for_test(&dir, &server.base());
+
+        let error = sync(&config, false, &quiet).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("does not match"), "got {text}");
+        assert!(!config.content_dir().exists());
+        assert!(!config.state_file().exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_an_archive_of_another_size() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(routes(
+            &signer,
+            "a1b2c3d4",
+            &archive,
+            archive.len() as u64 + 1,
+            &archive,
+        ));
+        let dir = testutil::temp_dir("sync-size");
+        let config = Config::for_test(&dir, &server.base());
+
+        let error = sync(&config, false, &quiet).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("signed content release says"), "got {text}");
+        assert!(!config.content_dir().exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_install_keeps_the_previous_content() {
+        let signer = Signer::new();
+        signer.trust();
+        let first = testutil::zip_of(&[("one.md", b"release one")]);
+        let second = testutil::zip_of(&[("two.md", b"release two")]);
+        let old_server = Server::start(published(&signer, "a1b2c3d4", &first));
+        // The second release names the digest of other bytes than it serves.
+        let new_server = Server::start(routes(
+            &signer,
+            "e5f6a7b8",
+            b"other bytes",
+            second.len() as u64,
+            &second,
+        ));
+        let dir = testutil::temp_dir("sync-failed-install");
+        let config = Config::for_test(&dir, &old_server.base());
+        sync(&config, false, &quiet).unwrap();
+
+        let newer = Config::for_test(&dir, &new_server.base());
+        let result = sync(&newer, false, &quiet);
+
+        assert!(result.is_err(), "got {result:?}");
+        assert_eq!(
+            fs::read_to_string(config.content_dir().join("one.md")).unwrap(),
+            "release one"
+        );
+        assert!(!config.content_dir().join("two.md").exists());
+        assert_eq!(state::read(&config.state_file()).unwrap().hash, "a1b2c3d4");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn installs_again_when_the_content_directory_is_missing() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(published(&signer, "a1b2c3d4", &archive));
+        let dir = testutil::temp_dir("sync-missing-content");
+        let config = Config::for_test(&dir, &server.base());
+        sync(&config, false, &quiet).unwrap();
+        fs::remove_dir_all(config.content_dir()).unwrap();
+
+        let outcome = sync(&config, false, &quiet).unwrap();
+
+        match outcome {
+            Outcome::Updated { previous, hash, .. } => {
+                assert_eq!(previous, Some("a1b2c3d4".to_string()));
+                assert_eq!(hash, "a1b2c3d4");
+            }
+            other => panic!("expected a new install, got {other:?}"),
+        }
+        assert!(config.content_dir().join("notes.md").is_file());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keeps_the_content_while_another_run_holds_the_lock() {
+        let signer = Signer::new();
+        signer.trust();
+        let first = testutil::zip_of(&[("one.md", b"release one")]);
+        let second = testutil::zip_of(&[("two.md", b"release two")]);
+        let old_server = Server::start(published(&signer, "a1b2c3d4", &first));
+        let new_server = Server::start(published(&signer, "e5f6a7b8", &second));
+        let dir = testutil::temp_dir("sync-busy");
+        let config = Config::for_test(&dir, &old_server.base());
+        sync(&config, false, &quiet).unwrap();
+
+        // The other run, as the operating system sees it: an exclusive lock on
+        // the lock file. The server now publishes the second release.
+        let newer = Config::for_test(&dir, &new_server.base());
+        let held = lock::acquire(&config.lock_file(), Duration::ZERO)
+            .unwrap()
+            .expect("nothing else holds the lock");
+        let outcome = sync(&newer, false, &quiet).unwrap();
+
+        assert_eq!(
+            outcome,
+            Outcome::Busy {
+                hash: "a1b2c3d4".to_string()
+            }
+        );
+        assert!(config.content_dir().join("one.md").is_file());
+        assert_eq!(downloads(&new_server, "e5f6a7b8"), 0);
+
+        // With the lock free again, the same run installs the second release.
+        drop(held);
+        let outcome = sync(&newer, false, &quiet).unwrap();
+
+        match outcome {
+            Outcome::Updated { previous, hash, .. } => {
+                assert_eq!(previous, Some("a1b2c3d4".to_string()));
+                assert_eq!(hash, "e5f6a7b8");
+            }
+            other => panic!("expected the second release, got {other:?}"),
+        }
+        assert!(config.content_dir().join("two.md").is_file());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fails_while_another_run_holds_the_lock_and_nothing_is_installed() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(published(&signer, "a1b2c3d4", &archive));
+        let dir = testutil::temp_dir("sync-busy-empty");
+        let config = Config::for_test(&dir, &server.base());
+        let held = lock::acquire(&config.lock_file(), Duration::ZERO)
+            .unwrap()
+            .expect("nothing else holds the lock");
+
+        let error = sync(&config, false, &quiet).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("another brainmaker run is installing content"),
+            "got {text}"
+        );
+        assert!(!config.content_dir().exists());
+        assert_eq!(downloads(&server, "a1b2c3d4"), 0);
+
+        drop(held);
         fs::remove_dir_all(&dir).unwrap();
     }
 }
