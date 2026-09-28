@@ -26,9 +26,15 @@ A replayed older manifest installs nothing, because `version::is_newer` requires
 numeric core.
 
 **The content path** is anchored the same way, on a separate key. `content/latest` returns an
-envelope whose `payload` carries the hash, the size, and the SHA-256, and `signature::CONTENT_KEYS`
-verifies it before anything is parsed. The API host is therefore not trusted for either path. The
-two key lists are disjoint, and a unit test fails the build if a key appears in both.
+envelope whose `payload` carries the hash, the size, the SHA-256, and a sequence, and
+`signature::CONTENT_KEYS` verifies it before anything is parsed. The API host is therefore not
+trusted for either path. The two key lists are disjoint, and a unit test fails the build if a key
+appears in both.
+
+A signature proves who made a release, and not when, so the payload also carries a sequence.
+`brainmaker-sign` writes the time of signing, and the client refuses a release whose sequence is not
+higher than the installed one. A replayed older release therefore installs nothing, as a replayed
+older manifest installs nothing.
 
 Neither anchor is TLS. TLS still runs, and it protects the credential in transit, but a host that
 serves altered bytes is caught by the signature rather than by the transport.
@@ -238,10 +244,14 @@ under the root and its own property list. `unlink` and `uninstall` remove it.
    release.
 2. The hash comes from the signed payload, never from the unsigned `hash` beside it, so a server
    cannot name one archive while signing another.
-3. The signed size must be above 0 and at or below the archive cap.
-4. The downloaded file must match the signed size and the signed SHA-256. Both are checked before
+3. The sequence in the signed payload must be higher than the installed one, unless `--force` is
+   given. The rule applies when the hash differs from the installed hash. A release with no
+   sequence is refused once the installed release has one. The check runs again after the install
+   lock is taken, on the state as it stands then.
+4. The signed size must be above 0 and at or below the archive cap.
+5. The downloaded file must match the signed size and the signed SHA-256. Both are checked before
    `archive::extract` opens the file.
-5. Extraction then applies its own rules, and only then does the directory swap run.
+6. Extraction then applies its own rules, and only then does the directory swap run.
 
 The signature moves the trust anchor off the API host, as it does for the software manifest: the
 host, any proxy in front of it, and the blob store behind it can all serve altered bytes and be
@@ -255,6 +265,12 @@ already has, but cannot replace it: every path that writes `content/` goes throu
 check first. A hash the server serves is never trusted over one already installed, so this is a
 freeze rather than a downgrade. `brainmaker status` shows it as
 `state     cannot check: <reason>`.
+
+A host that serves an older signed release is a different case. The sequence rule refuses that
+release, and the run fails with exit code 1 and leaves `content/` as it was. `--force` installs such
+a release anyway, for a deliberate rollback on one machine. The rule has one limit: a machine whose
+`state.json` holds no sequence has nothing to compare against, so it accepts an older signed
+release, and the rule holds from the first install of a release that carries a sequence.
 
 ### Two signing keys, held by different parties
 

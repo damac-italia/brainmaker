@@ -230,7 +230,7 @@ Returns the signed description of the current content.
 ```json
 {
   "hash": "a1b2c3d4",
-  "payload": "{\"hash\":\"a1b2c3d4\",\"sha256\":\"<64 hex>\",\"size_bytes\":1152430}",
+  "payload": "{\"hash\":\"a1b2c3d4\",\"sha256\":\"<64 hex>\",\"size_bytes\":1152430,\"sequence\":1760000000}",
   "signature": "<128 hex>"
 }
 ```
@@ -249,6 +249,7 @@ then reads these fields from the payload:
 | `hash` | Exactly 8 ASCII alphanumeric characters. |
 | `sha256` | 64 hexadecimal characters, the digest of the archive. |
 | `size_bytes` | Above 0 and at or below 512 MiB. |
+| `sequence` | Optional. A whole number, higher for a later release. `brainmaker-sign` writes the time of signing. The client refuses a release whose sequence is not higher than the installed one. |
 
 A response with no `payload` or no `signature` fails the run. The bare `hash` is kept beside them
 so a client older than the signing change keeps working, which is what lets a deployment publish
@@ -410,18 +411,19 @@ cargo build --features sign --bin brainmaker-sign
 |---|---|
 | `keygen <KEY-FILE>` | Write a new PKCS#8 Ed25519 key with mode `0600`, and print its public key. Fails when the file exists. |
 | `sign <KEY-FILE\|-> <MANIFEST-FILE> <ENVELOPE-FILE>` | Check the manifest, sign it, and write the envelope |
-| `sign-content <KEY-FILE\|-> <ARCHIVE> <HASH> <ENVELOPE-FILE>` | Digest the archive, sign `hash`, `sha256` and `size_bytes`, and write the envelope |
+| `sign-content <KEY-FILE\|-> <ARCHIVE> <HASH> <ENVELOPE-FILE> [SEQUENCE]` | Digest the archive, sign `hash`, `sha256`, `size_bytes` and `sequence`, and write the envelope. The sequence is the time of signing unless `SEQUENCE` names one. |
 | `verify <ENVELOPE-FILE> <PUBLIC-KEY>...` | Check an envelope against one or more public keys, the way `brainmaker` checks it |
 
 Pass `-` in place of the key file to read the key from `$BRAINMAKER_SIGNING_KEY` as hexadecimal.
 The release workflow uses that form, so the private key never reaches the runner's disk.
 
 `sign` refuses a manifest that `brainmaker` could not use: one that is not JSON, one whose
-`version` is empty or longer than 64 characters, one with no platform, or one whose `sha256` is not
-64 hexadecimal characters.
+`version` is not 1 to 64 characters of ASCII letters, digits, dots, hyphens, and plus signs, one
+with no platform, or one whose `sha256` is not 64 hexadecimal characters.
 
-`sign-content` refuses a hash that is not 8 alphanumeric ASCII characters, and an empty archive. It
-signs no URL, because the client derives the download address itself.
+`sign-content` refuses a hash that is not 8 alphanumeric ASCII characters, an empty archive, an
+archive of more than 512 MiB, and a `SEQUENCE` that is not a whole number. It signs no URL, because
+the client derives the download address itself.
 
 `verify` accepts either shape and names which it read. It tells them apart by field: a payload with
 `platforms` is a software manifest, and one with `sha256` is a content release. Neither list of keys
