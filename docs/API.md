@@ -78,6 +78,16 @@ prints `notice: cannot check the latest content version: ...` and
 `notice: the installed content <hash> stays in place.` to stderr, and exits 0. With nothing
 installed, or with `--force`, the failure exits 1.
 
+A `sync` that waits 30 seconds for the install lock of another run, and still finds it held, is
+treated the same way while content is installed: `brainmaker` prints
+`notice: another brainmaker run is installing content.` and
+`notice: the installed content <hash> stays in place.` to stderr, and exits 0. `--quiet` suppresses
+both lines. With nothing installed, or with `--force`, it exits 1. A `self-update` that cannot take
+the update lock within 30 seconds exits 1.
+
+A `sync` exits 1 when the server offers a release with another hash whose sequence is not higher
+than the installed one. The content stays as it was. `--force` installs that release.
+
 `uninstall` exits 0 and removes nothing when the answer to its question is not `y` or `yes`. It
 exits 1 when stdin is not a terminal and `--yes` is absent. A removal that fails part-way exits 1
 with part of the install already gone; run the command again to finish.

@@ -441,7 +441,9 @@ not publish it.
 The workflow creates the GitHub release with `--generate-notes`, so GitHub writes the notes from
 the titles of the pull requests merged since the previous tag. Keep endpoints out of those titles.
 
-`workflow_dispatch` runs the same build without creating a release.
+`workflow_dispatch` runs the same build without creating a release. Such a run signs nothing: only a
+run for a `v*` tag checks that the signing key is set, signs the manifest, and verifies the signed
+manifest.
 
 ### Build locally
 
@@ -492,7 +494,7 @@ against glibc, so it will not run on an older distribution.
 
 | Workflow | Trigger | What it runs |
 |---|---|---|
-| `test` | push and pull request on `master` | `cargo fmt --all --check`, then `cargo clippy --workspace --all-targets --locked --features sign -- -D warnings`, then `cargo test --workspace --all-targets --locked --features sign` |
+| `test` | push and pull request on `master` | On three systems, `ubuntu-24.04-arm`, `macos-14`, and `windows-2022`: `cargo fmt --all --check` (on the Linux runner alone), then `cargo clippy --workspace --all-targets --locked --features sign -- -D warnings`, then `cargo test --workspace --all-targets --locked --features sign`. A failed test step on Windows is reported and does not block a merge yet. |
 | `dependency-review` | pull request on `master` | Blocks a pull request that introduces a dependency with a high-severity advisory |
 | `release` | a tag matching `v*`, or by hand | Builds the five platforms, writes and signs the manifest, and creates the GitHub release |
 

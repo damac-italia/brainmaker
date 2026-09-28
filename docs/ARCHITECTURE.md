@@ -1,6 +1,6 @@
 # Architecture
 
-`brainmaker` is one Rust binary with seventeen modules. It has no background process, no plugin
+`brainmaker` is one Rust binary. It has no background process, no plugin
 system, and no local database. One invocation loads settings, gets one access token, makes at most
 three further HTTP requests, writes the filesystem, and exits. `uninstall` is the exception: it loads
 no settings and opens no socket.
@@ -20,16 +20,20 @@ under the `sign` feature and never ships.
 | [`src/provision.rs`](../src/provision.rs) | Provisioning file discovery, parsing, validation | `url` |
 | [`src/secretstore.rs`](../src/secretstore.rs) | Seal and open the stored settings, restrict file modes | `ring`, `dirs` |
 | [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, and the signed content release | `auth`, `config`, `digest`, `signature`, `ureq` |
-| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `digest`, `remote`, `state` |
+| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `digest`, `lock`, `remote`, `state` |
 | [`src/archive.rs`](../src/archive.rs) | Zip extraction and its safety checks | `config`, `zip` |
 | [`src/state.rs`](../src/state.rs) | `state.json` read and atomic write | `serde_json` |
-| [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `link`, `remote`, `signature`, `version` |
+| [`src/lock.rs`](../src/lock.rs) | The install lock and the update lock, which keep two runs out of one root | none |
+| [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `link`, `lock`, `remote`, `signature`, `version` |
 | [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `ring` |
 | [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `sha2` |
 | [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the session context, and the binary copy under the root | `config`, `dirs`, `schedule`, `serde_json` |
 | [`src/schedule.rs`](../src/schedule.rs) | Write, load, unload, and remove the hourly macOS LaunchAgent | `dirs` |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
 | [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root | `config`, `link`, `schedule`, `secretstore`, `state` |
+
+[`src/testutil.rs`](../src/testutil.rs) is built for tests alone; it holds a loopback HTTP server, a
+signer whose key a test trusts, and a zip builder.
 
 ## Module graph
 
@@ -49,12 +53,14 @@ graph LR
     provision --> url
     auth --> remote
     sync --> archive
+    sync --> lock
     sync --> remote
     sync --> state
     selfupdate --> remote
     selfupdate --> signature
     selfupdate --> version
     selfupdate --> link
+    selfupdate --> lock
     remote --> config
     remote --> auth
     link --> config
@@ -93,7 +99,7 @@ the injected `log` closure.
 ├── confidential/       0700
 │   └── config.enc      0600, the sealed endpoints, routes, and credentials
 ├── content/            the extracted content
-└── state.json          {"hash": "...", "updated_at_unix": ...}
+└── state.json          {"hash": "...", "updated_at_unix": ..., "sequence": ...}
 ```
 
 `bin/brainmaker` appears only after `link` has run. `unlink` leaves it in place, because removing
@@ -115,6 +121,7 @@ removes both before it exits. On Windows both carry the `.exe` suffix.
 |---|---|---|
 | `hash` | string | Hash of the archive that produced the current `content/` |
 | `updated_at_unix` | integer | Seconds since the Unix epoch at the last successful install |
+| `sequence` | integer | The sequence of the installed release. The file leaves this field out when the release carried none. A reinstall of the installed hash keeps the higher value. |
 
 A missing or corrupt file reads as `None`, which the caller treats as "not installed". That is not
 an error: the reinstall repairs the state.

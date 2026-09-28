@@ -69,7 +69,7 @@ token already issued stays valid for the rest of its 10 minutes.
 
 | Boundary | Untrusted input | Control |
 |---|---|---|
-| Content API to disk | The content release | Ed25519 signature over the served bytes, checked before the parse; the hash, the size, and the SHA-256 are then taken from the signed payload |
+| Content API to disk | The content release | Ed25519 signature over the served bytes, checked before the parse; the hash, the size, the SHA-256, and the sequence are then taken from the signed payload, and the sequence must be higher than the installed one unless `--force` is given |
 | Content API to disk | The hash string | Exactly 8 ASCII alphanumeric characters, checked before it enters a URL or a path |
 | Content API to disk | The zip archive | Path containment, symbolic-link rejection, permission stripping, size caps |
 | Software API to the binary | The manifest | Ed25519 signature over the served bytes, checked before the parse; then version character set and length, platform key lookup, checksum format. The manifest names no URL, so it cannot direct a download. |
@@ -256,7 +256,8 @@ under the root and its own property list. `unlink` and `uninstall` remove it.
 3. The sequence in the signed payload must be higher than the installed one, unless `--force` is
    given. The rule applies when the hash differs from the installed hash. A release with no
    sequence is refused once the installed release has one. The check runs again after the install
-   lock is taken, on the state as it stands then.
+   lock is taken, on the state as it stands then. A reinstall of the installed hash, such as one
+   after `content/` went missing, keeps the higher of the installed and the offered sequence.
 4. The signed size must be above 0 and at or below the archive cap.
 5. The downloaded file must match the signed size and the signed SHA-256. Both are checked before
    `archive::extract` opens the file.
