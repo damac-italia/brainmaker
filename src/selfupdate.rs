@@ -326,9 +326,10 @@ fn set_executable(_path: &Path) -> Result<()> {
 /// Runs the staged binary with `--version` and checks what it reports.
 ///
 /// This catches a build for the wrong architecture, a truncated file, and a
-/// manifest whose version does not match the binary it points at. The staged
-/// file already passed the checksum, and it is the file we are about to make
-/// the user's binary, so running it adds no new trust.
+/// manifest whose version does not match the binary it points at. The whole
+/// line is compared, because `0.1.1` is a part of `0.1.10`. The staged file
+/// already passed the checksum, and it is the file we are about to make the
+/// user's binary, so running it adds no new trust.
 fn verify_runs(staged: &Path, expected_version: &str) -> Result<()> {
     let output = std::process::Command::new(staged)
         .arg("--version")
@@ -350,13 +351,22 @@ fn verify_runs(staged: &Path, expected_version: &str) -> Result<()> {
 
     let reported = String::from_utf8_lossy(&output.stdout);
     let reported = reported.trim();
-    if !reported.contains(expected_version) {
+    if !reports_version(reported, expected_version) {
         bail!(
             "the manifest says version {expected_version}, but the download reports {reported:?}"
         );
     }
 
     Ok(())
+}
+
+/// True when `output` is the line that `brainmaker --version` prints for
+/// `expected_version`.
+///
+/// The line is `brainmaker <version>`, and nothing else may differ. White
+/// space around it, such as the `\r` of a Windows line end, does not count.
+fn reports_version(output: &str, expected_version: &str) -> bool {
+    output.trim() == format!("brainmaker {expected_version}")
 }
 
 #[cfg(test)]
@@ -602,5 +612,26 @@ mod tests {
 
         let text = format!("{error:#}");
         assert!(text.contains("invalid version string"), "got {text}");
+    }
+
+    #[test]
+    fn accepts_the_exact_version_line() {
+        assert!(reports_version("brainmaker 0.1.1", "0.1.1"));
+        assert!(reports_version("brainmaker 0.1.1\n", "0.1.1"));
+        // A Windows line end.
+        assert!(reports_version("brainmaker 0.1.1\r\n", "0.1.1"));
+    }
+
+    #[test]
+    fn refuses_a_version_that_only_starts_the_same() {
+        // `0.1.1` is a part of `0.1.10`, which a plain substring check misses.
+        assert!(!reports_version("brainmaker 0.1.10", "0.1.1"));
+        assert!(!reports_version("brainmaker 0.1.10\n", "0.1.1"));
+        assert!(!reports_version("brainmaker 0.1.1", "0.1.10"));
+    }
+
+    #[test]
+    fn refuses_another_program_name() {
+        assert!(!reports_version("other 0.1.1", "0.1.1"));
     }
 }
