@@ -57,6 +57,7 @@ gone. Later runs read the sealed copy and need no file.
 | Two key lists | Content and software verify against separate lists, so a content signer cannot sign a manifest |
 | Offline tolerance | Keeps the installed content and exits 0 when the server cannot be reached, so a session still starts |
 | Claude bridge | `link` puts the shared skills and the session briefing into `~/.claude`, for every project |
+| Hourly refresh | On macOS, `link` installs a LaunchAgent that runs `self-update`, then `sync`, every hour |
 | Clean removal | `uninstall` removes the bridge and everything brainmaker wrote under the root, and nothing else |
 | Self-update | Verifies the SHA-256 and the `--version` output before it swaps the binary, including the copy the hook runs |
 | Static Linux builds | `x86_64` and `arm64` link against musl, so there is no glibc version floor |
@@ -109,12 +110,13 @@ that project is open. `link` bridges it to user scope, so it applies everywhere:
 - One symbolic link per shipped skill, under `~/.claude/skills`.
 - A `SessionStart` hook in `~/.claude/settings.json` that runs `sync`, then `session-context`.
 - A marked block in `~/.claude/CLAUDE.md` naming the content directory.
+- On macOS, the hourly LaunchAgent that [Keep it current between sessions](#keep-it-current-between-sessions) describes.
 
 `session-context` prints the JSON that hook returns: the shared briefing and the working notes, each
 file capped so one growing file cannot crowd out the rest. It is registered by `link` and is not
 meant to be run by hand.
 
-`brainmaker unlink` removes all three. Both commands are idempotent, and neither touches a file it
+`brainmaker unlink` removes all of them. Both commands are idempotent, and neither touches a file it
 did not write: a skill name that already exists as a real directory is reported and skipped.
 
 `link` installs only the `SessionStart` hook. The content's other hooks are written for the vault
@@ -155,9 +157,26 @@ A relative `--dir` is made absolute before anything is written.
 `--quiet` keeps a successful run silent. A failed run still prints to stderr and exits 1. A server
 that cannot be reached is not a failure while content is installed: the installed content stays,
 and the run exits 0 with a notice that `--quiet` hides.
-`--no-update-check` drops one HTTP request per session. The hook installs no binary; run
-`self-update` yourself. `self-update` replaces the binary you ran and, when it is another file,
+`--no-update-check` drops one HTTP request per session. The hook installs no binary; on macOS the
+LaunchAgent below does, and elsewhere you run `self-update` yourself. `self-update` replaces the binary you ran and, when it is another file,
 the copy under `~/.brainmaker/bin` too, so the hook never stays on the old version.
+
+### Keep it current between sessions
+
+On macOS, `link` also writes `~/Library/LaunchAgents/it.damac.brainmaker.plist` and loads it. The
+agent runs this at minute 0 of every hour, and once at each login:
+
+```sh
+date; "/Users/you/.brainmaker/bin/brainmaker" --dir "/Users/you/.brainmaker" self-update --quiet; "/Users/you/.brainmaker/bin/brainmaker" --dir "/Users/you/.brainmaker" sync --quiet --no-update-check
+```
+
+So a new signed build reaches every linked Mac within an hour of its promotion, and the content
+stays current when no Claude session starts. `sync` runs even when `self-update` fails. The output
+goes to `~/.brainmaker/agent.log`: one date line per run, and the errors, if any.
+
+`unlink` and `uninstall` unload the agent and remove the file. With `--claude-dir`, `link` leaves
+the agent alone, so the installer's dry run starts no hourly job; `--agent-dir <PATH>` writes the
+file to `PATH` instead, and does not load it. Windows and Linux get no agent.
 
 ### Remove brainmaker from this machine
 
@@ -167,9 +186,10 @@ brainmaker uninstall
 
 `uninstall` asks first, then removes brainmaker in this order:
 
-1. What `link` wrote into `~/.claude`, exactly as `unlink` removes it.
+1. What `link` wrote, the LaunchAgent included, exactly as `unlink` removes it.
 2. What brainmaker wrote under `~/.brainmaker`: the content, the program copy that the hook runs,
-   the state file, the sealed settings, and any temporary file that a stopped run left.
+   the state file, the sealed settings, the agent log, and any temporary file that a stopped run
+   left.
 3. `~/.brainmaker` itself, when nothing else is left in it.
 
 It removes nothing that brainmaker did not write. Your own skills, hooks, and `CLAUDE.md` text
@@ -302,6 +322,8 @@ disk. Every API request then carries `Authorization: Bearer <token>`.
 | `--keep-config` | Do not remove the provisioning file after the import |
 | `--dir <PATH>` | Use `PATH` as the root instead of `~/.brainmaker` |
 | `--url <URL>` | Use `URL` as the API base |
+| `--claude-dir <PATH>` | With `link`, `unlink`, and `uninstall`, write to `PATH` instead of `~/.claude`, and leave the LaunchAgent alone |
+| `--agent-dir <PATH>` | With `link`, `unlink`, and `uninstall`, write the LaunchAgent to `PATH` and do not load it |
 | `-q`, `--quiet` | Print errors only |
 | `-h`, `--help` | Print the help text |
 | `-V`, `--version` | Print the version |
@@ -415,6 +437,9 @@ nothing about where the API is served.
 Serve `manifest.signed.json` byte for byte. The signature covers the exact bytes, so a proxy that
 reformats the JSON breaks every client. `manifest.json` is the unsigned copy, kept for reading; do
 not publish it.
+
+The workflow creates the GitHub release with `--generate-notes`, so GitHub writes the notes from
+the titles of the pull requests merged since the previous tag. Keep endpoints out of those titles.
 
 `workflow_dispatch` runs the same build without creating a release.
 

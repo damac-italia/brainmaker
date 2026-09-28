@@ -26,6 +26,7 @@ mod digest;
 mod link;
 mod provision;
 mod remote;
+mod schedule;
 mod secretstore;
 mod selfupdate;
 mod signature;
@@ -102,7 +103,8 @@ fn run(args: &Args) -> Result<()> {
                 Some(path) => path,
                 None => link::claude_dir()?,
             };
-            link::link(&config, &claude, &log)?;
+            let agents = agents(args)?;
+            link::link(&config, &claude, agents.as_ref(), &log)?;
             Ok(())
         }
         Command::Unlink => {
@@ -110,7 +112,8 @@ fn run(args: &Args) -> Result<()> {
                 Some(path) => path,
                 None => link::claude_dir()?,
             };
-            link::unlink(&config, &claude, &log)?;
+            let agents = agents(args)?;
+            link::unlink(&config, &claude, agents.as_ref(), &log)?;
             Ok(())
         }
         Command::Uninstall => unreachable!("uninstall returns before the settings load"),
@@ -129,6 +132,11 @@ fn run(args: &Args) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Where this run writes or removes the LaunchAgent, if anywhere.
+fn agents(args: &Args) -> Result<Option<schedule::Agents>> {
+    schedule::Agents::resolve(args.agent_dir.as_deref(), args.claude_dir.is_some())
 }
 
 fn status(config: &Config) -> Result<()> {
@@ -241,6 +249,7 @@ fn uninstall(args: &Args, log: &dyn Fn(&str)) -> Result<()> {
         Some(path) => path,
         None => link::claude_dir()?,
     };
+    let agents = agents(args)?;
 
     if !args.yes {
         let stdin = std::io::stdin();
@@ -250,7 +259,10 @@ fn uninstall(args: &Args, log: &dyn Fn(&str)) -> Result<()> {
                  pass --yes to remove without asking"
             );
         }
-        print!("{}", uninstall::question(layout.root(), &claude));
+        print!(
+            "{}",
+            uninstall::question(layout.root(), &claude, agents.as_ref())
+        );
         std::io::stdout()
             .flush()
             .context("cannot print the question")?;
@@ -264,7 +276,7 @@ fn uninstall(args: &Args, log: &dyn Fn(&str)) -> Result<()> {
         }
     }
 
-    uninstall::uninstall(&layout, &claude, log)?;
+    uninstall::uninstall(&layout, &claude, agents.as_ref(), log)?;
     Ok(())
 }
 

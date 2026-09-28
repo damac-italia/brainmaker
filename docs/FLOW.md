@@ -1,9 +1,9 @@
 # Flow
 
-Five runtime paths matter: loading the settings, getting an access token, the `sync` command, the
-`self-update` command, and the `uninstall` command. `status` reuses the first two paths and then reads both remote endpoints
+Six runtime paths matter: loading the settings, getting an access token, the `sync` command, the
+`self-update` command, `link` with its hourly agent, and the `uninstall` command. `status` reuses the first two paths and then reads both remote endpoints
 without writing anything. Because it writes nothing, an endpoint it cannot reach becomes a value it
-prints rather than a reason to exit: [`main.rs:183`](../src/main.rs) prints `latest    <unknown>`
+prints rather than a reason to exit: [`main.rs:191`](../src/main.rs) prints `latest    <unknown>`
 and `state     cannot check: <reason>`.
 
 ## Settings load
@@ -160,7 +160,7 @@ Steps:
 10. [`sync.rs:133`](../src/sync.rs) removes the three temporary paths, on success and on failure
     alike.
 11. [`sync.rs:139`](../src/sync.rs) writes `state.json`, only after the swap succeeded.
-12. [`main.rs:126`](../src/main.rs) runs the software check unless `--no-update-check` was given.
+12. [`main.rs:129`](../src/main.rs) runs the software check unless `--no-update-check` was given.
 
 ### The swap and its rollback
 
@@ -252,6 +252,53 @@ Steps:
 
 `--check` stops after step 6 and installs nothing.
 
+## Link and the hourly agent
+
+```mermaid
+sequenceDiagram
+    participant main
+    participant link
+    participant schedule
+    participant launchd
+    main->>schedule: Agents::resolve(--agent-dir, --claude-dir given)
+    main->>link: link(config, claude, agents, log)
+    link->>link: link skills, copy the program, write the hook and the block
+    link->>schedule: install(agents, prefix, root, log)
+    alt the property list is unchanged
+        schedule-->>link: false
+    else
+        schedule->>schedule: write the property list
+        schedule->>launchd: bootout, then bootstrap, when it loads
+        schedule-->>link: true
+    end
+    launchd->>launchd: each hour and at login, self-update then sync
+```
+
+Steps:
+
+1. [`main.rs:106`](../src/main.rs) resolves the agent location through
+   [`schedule.rs:60`](../src/schedule.rs). `--agent-dir` names a directory that is never loaded.
+   Without it, [`schedule.rs:64`](../src/schedule.rs) returns no agent on a system other than
+   macOS, or when `--claude-dir` was given.
+2. [`link.rs:136`](../src/link.rs) fails when the content directory does not exist yet.
+3. [`link.rs:144`](../src/link.rs) links the skills, and
+   [`link.rs:145`](../src/link.rs) copies the program under the root. The hook and the
+   `CLAUDE.md` block follow at [`link.rs:147`](../src/link.rs) and
+   [`link.rs:148`](../src/link.rs).
+4. [`link.rs:150`](../src/link.rs) installs the agent with the same command prefix the hook runs.
+5. [`schedule.rs:103`](../src/schedule.rs) returns with nothing changed when the property list
+   already holds the same text.
+6. [`schedule.rs:109`](../src/schedule.rs) writes the property list.
+   [`schedule.rs:114`](../src/schedule.rs) unloads an earlier copy, and
+   [`schedule.rs:115`](../src/schedule.rs) loads the new one. A load failure prints a `notice:`
+   line, and `link` still exits 0.
+7. launchd then runs `/bin/sh -c` with the script that
+   [`schedule.rs:148`](../src/schedule.rs) renders: `self-update --quiet`, then
+   `sync --quiet --no-update-check`, joined by `;`, with the output in `<root>/agent.log`.
+
+`unlink` runs the same resolve step, then `link::remove_bridge`, which unloads and removes the
+agent before it removes the skill links, the hook, and the block.
+
 ## Uninstall
 
 ```mermaid
@@ -261,11 +308,11 @@ sequenceDiagram
     participant link
     participant disk as root directory
     main->>main: ask the question, unless --yes
-    main->>uninstall: uninstall(layout, claude, log)
+    main->>uninstall: uninstall(layout, claude, agents, log)
     alt the root exists and holds neither mark
         uninstall-->>main: Report, unrecognised
     else
-        uninstall->>link: remove_bridge(content, claude)
+        uninstall->>link: remove_bridge(content, claude, agents)
         uninstall->>disk: remove content, temporaries, the program copy
         uninstall->>disk: remove state.json and config.enc
         uninstall->>disk: remove bin, confidential, the root, when empty
@@ -275,26 +322,26 @@ sequenceDiagram
 
 Steps:
 
-1. [`main.rs:86`](../src/main.rs) sends `uninstall` down its own path before `Config::load`, so no
+1. [`main.rs:87`](../src/main.rs) sends `uninstall` down its own path before `Config::load`, so no
    setting is read and no provisioning file is imported.
-2. [`main.rs:247`](../src/main.rs) fails when stdin is not a terminal and `--yes` was not given.
+2. [`main.rs:256`](../src/main.rs) fails when stdin is not a terminal and `--yes` was not given.
    Otherwise the question prints past `--quiet`, and any answer but `y` or `yes` exits 0 with
    `Nothing was removed.`
-3. [`uninstall.rs:107`](../src/uninstall.rs) stops the run with nothing changed when the root
+3. [`uninstall.rs:118`](../src/uninstall.rs) stops the run with nothing changed when the root
    exists and holds neither a parsable `state.json` nor a sealed `confidential/config.enc`.
-4. [`uninstall.rs:120`](../src/uninstall.rs) resolves the running program before any file goes,
+4. [`uninstall.rs:131`](../src/uninstall.rs) resolves the running program before any file goes,
    so it can later say whether that program was the copy under the root.
-5. [`uninstall.rs:125`](../src/uninstall.rs) removes the bridge through `link::remove_bridge`, the
-   code that `unlink` runs.
-6. [`uninstall.rs:177`](../src/uninstall.rs) lists `content/`, `.staging/`, `.trash/`,
-   `.download.zip`, the program copy and every `bin/.brainmaker*` file, then the two temporary
+5. [`uninstall.rs:136`](../src/uninstall.rs) removes the bridge through `link::remove_bridge`, the
+   code that `unlink` runs. The LaunchAgent goes first, before the program copy it runs.
+6. [`uninstall.rs:188`](../src/uninstall.rs) lists `content/`, `.staging/`, `.trash/`,
+   `.download.zip`, `agent.log`, the program copy and every `bin/.brainmaker*` file, then the two temporary
    files and the two marks, in that order.
-7. [`uninstall.rs:191`](../src/uninstall.rs) removes each path that exists. A symbolic link goes
+7. [`uninstall.rs:203`](../src/uninstall.rs) removes each path that exists. A symbolic link goes
    without its target. On Windows, a program copy that is running now yields a `notice:` line
    instead of an error.
-8. [`uninstall.rs:210`](../src/uninstall.rs) removes `bin/`, `confidential/`, and the root when
+8. [`uninstall.rs:222`](../src/uninstall.rs) removes `bin/`, `confidential/`, and the root when
    each one is empty, and names what the root still holds otherwise.
-9. [`uninstall.rs:136`](../src/uninstall.rs) prints the path of the program that ran, unless it
+9. [`uninstall.rs:147`](../src/uninstall.rs) prints the path of the program that ran, unless it
    was the copy under the root, and asks you to restart any open Claude session when the hook was
    removed.
 

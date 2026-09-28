@@ -4,12 +4,12 @@
 //!
 //! # What it removes
 //!
-//! 1. The bridge that `link` wrote into `~/.claude`, as `unlink` removes it.
-//!    This goes first: a hook left in place would name a program that is
-//!    gone, and every session start would then fail on it.
+//! 1. The bridge that `link` wrote into `~/.claude`, and its LaunchAgent, as
+//!    `unlink` removes them. These go first: a hook or an agent left in place
+//!    would name a program that is gone, and would then fail on every run.
 //! 2. What brainmaker writes under the root: the content, the program copy
-//!    that the hook runs, the state file, the sealed settings, and any
-//!    temporary file that a stopped run left behind.
+//!    that the hook runs, the state file, the sealed settings, the agent's
+//!    log, and any temporary file that a stopped run left behind.
 //! 3. The root itself, once nothing else is left in it.
 //!
 //! # What it leaves
@@ -45,6 +45,7 @@ use anyhow::{Context, Result};
 
 use crate::config::Layout;
 use crate::link;
+use crate::schedule::{self, Agents};
 use crate::secretstore;
 use crate::state;
 
@@ -70,15 +71,20 @@ pub struct Report {
 }
 
 /// The question `uninstall` asks before it removes anything.
-pub fn question(root: &Path, claude: &Path) -> String {
+///
+/// `agents` names the LaunchAgent location, when this run removes one.
+pub fn question(root: &Path, claude: &Path, agents: Option<&Agents>) -> String {
+    let agent = agents
+        .map(|agents| format!("  - the hourly LaunchAgent {}\n", agents.plist().display()))
+        .unwrap_or_default();
     format!(
         "\
 This removes brainmaker from this machine:
 
   - under {claude}: the skill links, the SessionStart hook, and the
     CLAUDE.md block that link wrote
-  - under {root}: the content, the sealed settings, the state file, and
-    the program copy that the hook runs
+{agent}  - under {root}: the content, the sealed settings, the state file, the
+    agent log, and the program copy that the hook runs
 
 Nothing else in either directory changes. Changes that you made in the
 content are lost. The sealed settings hold the client credentials, so a new
@@ -95,10 +101,15 @@ pub fn is_yes(answer: &str) -> bool {
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-/// Removes the bridge in `claude`, then what brainmaker wrote under the root
-/// of `layout`, then the root when it is empty. Changes nothing when the root
-/// exists but is not recognised.
-pub fn uninstall(layout: &Layout, claude: &Path, log: &dyn Fn(&str)) -> Result<Report> {
+/// Removes the bridge in `claude` and the agent in `agents`, then what
+/// brainmaker wrote under the root of `layout`, then the root when it is
+/// empty. Changes nothing when the root exists but is not recognised.
+pub fn uninstall(
+    layout: &Layout,
+    claude: &Path,
+    agents: Option<&Agents>,
+    log: &dyn Fn(&str),
+) -> Result<Report> {
     let root = layout.root();
     let mut report = Report::default();
 
@@ -122,7 +133,7 @@ pub fn uninstall(layout: &Layout, claude: &Path, log: &dyn Fn(&str)) -> Result<R
         .as_deref()
         .is_some_and(|exe| link::same_file(exe, &link::installed_program(root)));
 
-    report.bridge = link::remove_bridge(&layout.content_dir(), claude)?;
+    report.bridge = link::remove_bridge(&layout.content_dir(), claude, agents)?;
     if report.bridge.changed() {
         link::describe(&report.bridge, false, log);
     }
@@ -179,6 +190,7 @@ fn remove_root(
         layout.staging_dir(),
         layout.trash_dir(),
         layout.download_file(),
+        schedule::log_path(root),
     ];
     paths.extend(program_files(bin, &installed)?);
     paths.extend([
@@ -412,7 +424,7 @@ mod tests {
 
         let lines = RefCell::new(Vec::new());
         let log = |line: &str| lines.borrow_mut().push(line.to_string());
-        let report = uninstall(&layout, &claude, &log).unwrap();
+        let report = uninstall(&layout, &claude, None, &log).unwrap();
 
         assert!(report.root_removed, "left {:?}", report.left);
         assert!(!root.exists());
@@ -451,7 +463,7 @@ mod tests {
         );
         let layout = Layout::resolve(Some(&root)).unwrap();
 
-        let report = uninstall(&layout, &claude, &quiet).unwrap();
+        let report = uninstall(&layout, &claude, None, &quiet).unwrap();
 
         assert!(report.unrecognised);
         assert!(report.removed.is_empty());
@@ -479,7 +491,7 @@ mod tests {
         write(&claude.join("CLAUDE.md"), briefing);
         let layout = Layout::resolve(Some(&root)).unwrap();
 
-        let report = uninstall(&layout, &claude, &quiet).unwrap();
+        let report = uninstall(&layout, &claude, None, &quiet).unwrap();
 
         assert!(report.unrecognised);
         assert!(!report.bridge.changed(), "{:?}", report.bridge);
@@ -501,7 +513,7 @@ mod tests {
 
         let lines = RefCell::new(Vec::new());
         let log = |line: &str| lines.borrow_mut().push(line.to_string());
-        let report = uninstall(&layout, &base.join("claude"), &log).unwrap();
+        let report = uninstall(&layout, &base.join("claude"), None, &log).unwrap();
 
         assert!(report.root_removed, "left {:?}", report.left);
         assert!(fs::symlink_metadata(&root).is_err(), "the link is gone");
@@ -527,7 +539,7 @@ mod tests {
         write(&root.join("bin").join("other-tool"), b"mine\n");
         write(&root.join("confidential").join("other.key"), b"mine\n");
 
-        let report = uninstall(&layout, &base.join("claude"), &quiet).unwrap();
+        let report = uninstall(&layout, &base.join("claude"), None, &quiet).unwrap();
 
         assert!(!report.root_removed);
         assert_eq!(report.left, vec!["bin", "confidential", "notes.md"]);
@@ -561,7 +573,7 @@ mod tests {
             write(&root.join("bin").join(name), b"\n");
         }
 
-        let report = uninstall(&layout, &base.join("claude"), &quiet).unwrap();
+        let report = uninstall(&layout, &base.join("claude"), None, &quiet).unwrap();
 
         assert!(report.root_removed, "left {:?}", report.left);
         assert!(!root.exists());
@@ -578,7 +590,7 @@ mod tests {
 
         let lines = RefCell::new(Vec::new());
         let log = |line: &str| lines.borrow_mut().push(line.to_string());
-        let report = uninstall(&layout, &base.join("claude"), &log).unwrap();
+        let report = uninstall(&layout, &base.join("claude"), None, &log).unwrap();
 
         assert!(report.root_removed);
         assert_eq!(report.removed, vec![layout.store_path()]);
@@ -601,11 +613,11 @@ mod tests {
         let root = base.join("root");
         let claude = base.join("claude");
         let layout = installed(&root);
-        uninstall(&layout, &claude, &quiet).unwrap();
+        uninstall(&layout, &claude, None, &quiet).unwrap();
 
         let lines = RefCell::new(Vec::new());
         let log = |line: &str| lines.borrow_mut().push(line.to_string());
-        let second = uninstall(&layout, &claude, &log).unwrap();
+        let second = uninstall(&layout, &claude, None, &log).unwrap();
 
         assert!(!second.bridge.changed());
         assert!(second.removed.is_empty());
@@ -632,7 +644,7 @@ mod tests {
         fs::remove_dir_all(layout.content_dir()).unwrap();
         std::os::unix::fs::symlink(&vault, layout.content_dir()).unwrap();
 
-        uninstall(&layout, &base.join("claude"), &quiet).unwrap();
+        uninstall(&layout, &base.join("claude"), None, &quiet).unwrap();
 
         assert!(!root.exists());
         assert_eq!(fs::read_to_string(vault.join("note.md")).unwrap(), "mine\n");
@@ -651,9 +663,64 @@ mod tests {
 
     #[test]
     fn the_question_names_both_directories_and_defaults_to_no() {
-        let text = question(Path::new("/opt/bm"), Path::new("/home/me/.claude"));
+        let text = question(Path::new("/opt/bm"), Path::new("/home/me/.claude"), None);
         assert!(text.contains("under /opt/bm:"), "{text}");
         assert!(text.contains("under /home/me/.claude:"), "{text}");
+        assert!(!text.contains("LaunchAgent"), "{text}");
         assert!(text.ends_with("[y/N] "), "{text}");
+    }
+
+    #[test]
+    fn the_question_names_the_agent_when_the_run_removes_one() {
+        let agents = Agents::unloaded(Path::new("/home/me/Library/LaunchAgents"));
+        let text = question(
+            Path::new("/opt/bm"),
+            Path::new("/home/me/.claude"),
+            Some(&agents),
+        );
+        assert!(
+            text.contains(&format!(
+                "the hourly LaunchAgent /home/me/Library/LaunchAgents/{}.plist",
+                schedule::LABEL
+            )),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn removes_the_agent_and_its_log() {
+        let base = temp_dir("agent");
+        let root = base.join("root");
+        let layout = installed(&root);
+        let agents = Agents::unloaded(&base.join("LaunchAgents"));
+        schedule::install(&agents, "\"/x/bin/brainmaker\"", &root, &quiet).unwrap();
+        write(
+            &schedule::log_path(&root),
+            b"Mon Sep 28 17:00:00 CEST 2026\n",
+        );
+
+        let report = uninstall(&layout, &base.join("claude"), Some(&agents), &quiet).unwrap();
+
+        assert!(report.bridge.agent_changed);
+        assert!(!agents.plist().exists());
+        assert!(report.root_removed, "left {:?}", report.left);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn keeps_the_agent_under_a_root_that_carries_no_mark() {
+        // The agent, like the hook, may belong to a real install elsewhere.
+        let base = temp_dir("agent-foreign");
+        let root = base.join("site");
+        write(&root.join("content").join("post.md"), b"mine\n");
+        let layout = Layout::resolve(Some(&root)).unwrap();
+        let agents = Agents::unloaded(&base.join("LaunchAgents"));
+        schedule::install(&agents, "\"/x/bin/brainmaker\"", &base, &quiet).unwrap();
+
+        let report = uninstall(&layout, &base.join("claude"), Some(&agents), &quiet).unwrap();
+
+        assert!(report.unrecognised);
+        assert!(agents.plist().is_file());
+        fs::remove_dir_all(&base).ok();
     }
 }
