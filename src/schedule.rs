@@ -190,6 +190,168 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// The service unit and the timer unit for a systemd user timer.
+///
+/// `docs/design/scheduled-agent.md` explains each line. Only the tests call
+/// this function, so it carries `cfg(test)`. The build that follows removes
+/// that attribute.
+///
+/// The service runs one `/bin/sh -c` command. Its script is the script of
+/// `render` with a redirect in front. systemd has no shell of its own, and the
+/// redirect sends both outputs to the log on every systemd version, where
+/// `StandardOutput=append:` needs version 240. systemd reads the whole script
+/// as one quoted item; see `systemd_quote`.
+#[cfg(test)]
+fn render_systemd(prefix: &str, log: &Path) -> (String, String) {
+    let log = shell_word(&log.display().to_string());
+    let script = format!(
+        "exec >>{log} 2>&1; date; {prefix} self-update --quiet; {prefix} sync --quiet --no-update-check"
+    );
+    let service = format!(
+        "\
+# Written by brainmaker link. brainmaker unlink removes it.
+[Unit]
+Description=Update brainmaker and the shared content
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c {script}
+TimeoutStartSec=30min
+",
+        script = systemd_quote(&script),
+    );
+    let timer = "\
+# Written by brainmaker link. brainmaker unlink removes it.
+[Unit]
+Description=Run brainmaker every hour and after each login
+
+[Timer]
+OnCalendar=*-*-* *:00:00
+AccuracySec=1s
+OnStartupSec=1min
+
+[Install]
+WantedBy=timers.target
+";
+    (service, timer.to_string())
+}
+
+/// Writes `text` as one double-quoted item of a systemd command line.
+///
+/// systemd reads `\\` and `\"` inside the quotes, turns `%%` into `%` when it
+/// loads the unit, and turns `$$` into `$` when it starts the command. Each of
+/// the four characters is doubled, or escaped, so the item reaches the shell
+/// as it stands.
+#[cfg(test)]
+fn systemd_quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Writes `text` as one double-quoted shell word.
+///
+/// This is the rule of `link::shell_quote`. The build makes that function
+/// `pub(crate)` and deletes this copy.
+#[cfg(test)]
+fn shell_word(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if matches!(c, '$' | '`' | '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// The program that runs the script of the Windows task.
+///
+/// Task Scheduler starts one program for each `Exec` action, and it starts no
+/// shell of its own. The task therefore starts `cmd.exe` and hands it the
+/// script.
+#[cfg(test)]
+const WINDOWS_SHELL: &str = r"%SystemRoot%\System32\cmd.exe";
+
+/// The task definition that `schtasks.exe /Create /XML` reads.
+///
+/// `docs/design/scheduled-agent.md` explains each element. Only the tests call
+/// this function, so it carries `cfg(test)`. The build that follows removes
+/// that attribute.
+///
+/// `prefix` is the program path and the root, quoted for `cmd.exe`, and not
+/// the shell quoting of `link::command_prefix`. `user` is `DOMAIN\name` for the
+/// account that runs `link`. The build writes the text as UTF-16 with a byte
+/// order mark, because the declaration says UTF-16.
+#[cfg(test)]
+fn render_task(prefix: &str, log: &Path, user: &str) -> String {
+    let script = format!(
+        "(echo %date% %time% & {prefix} self-update --quiet & {prefix} sync --quiet --no-update-check) >> \"{}\" 2>&1",
+        log.display()
+    );
+    let arguments = format!("/d /v:off /s /c \"{script}\"");
+    let user = escape(user);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<!-- Written by brainmaker link. brainmaker unlink removes it. -->
+<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Runs brainmaker self-update, then sync, every hour and after each logon.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT1H</Interval>
+      </Repetition>
+    </TimeTrigger>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+      <Delay>PT1M</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal>
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions>
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        command = escape(WINDOWS_SHELL),
+        arguments = escape(&arguments),
+    )
+}
+
 /// Runs `launchctl <verb> gui/<uid> <plist>` for the account that owns the
 /// property list, which is the account this program runs as, since it just
 /// wrote the file or found it in its own home directory.
@@ -343,5 +505,238 @@ mod tests {
         } else {
             assert_eq!(resolved, None);
         }
+    }
+
+    /// What `link` writes on a Unix system for the root `/opt/bm`.
+    const UNIX_PREFIX: &str = "\"/opt/bm/bin/brainmaker\" --dir \"/opt/bm\"";
+
+    /// The same, for a root whose path holds a space.
+    const SPACE_PREFIX: &str =
+        "\"/home/my user/.brainmaker/bin/brainmaker\" --dir \"/home/my user/.brainmaker\"";
+
+    /// What the build writes on Windows for the root `C:\Users\me\.brainmaker`.
+    const WINDOWS_PREFIX: &str =
+        r#""C:\Users\me\.brainmaker\bin\brainmaker.exe" --dir "C:\Users\me\.brainmaker""#;
+
+    #[test]
+    fn the_systemd_units_run_the_update_and_then_the_sync() {
+        let (service, _) = render_systemd(UNIX_PREFIX, Path::new("/opt/bm/agent.log"));
+
+        let update = service.find("self-update --quiet").expect(&service);
+        let sync = service
+            .find("sync --quiet --no-update-check")
+            .expect(&service);
+        assert!(update < sync, "{service}");
+        // `;` and not `&&`, as in the property list, so a failed self-update
+        // still lets sync run.
+        assert!(
+            service.contains(
+                r#"self-update --quiet; \"/opt/bm/bin/brainmaker\" --dir \"/opt/bm\" sync"#
+            ),
+            "{service}"
+        );
+        assert!(!service.contains("&&"), "{service}");
+
+        // One command in a one-shot service. The service holds no state that
+        // would keep the timer from starting it again an hour later.
+        assert_eq!(service.matches("ExecStart=").count(), 1, "{service}");
+        assert!(
+            service.contains("\nExecStart=/bin/sh -c \"exec >>"),
+            "{service}"
+        );
+        assert!(service.contains("; date; "), "{service}");
+        assert!(service.contains("\nType=oneshot\n"), "{service}");
+        assert!(!service.contains("RemainAfterExit"), "{service}");
+        assert!(!service.contains("[Install]"), "{service}");
+        assert!(service.contains("\nTimeoutStartSec=30min\n"), "{service}");
+    }
+
+    #[test]
+    fn the_timer_fires_at_minute_zero() {
+        let (_, timer) = render_systemd(UNIX_PREFIX, Path::new("/opt/bm/agent.log"));
+
+        // Minute 0 of every hour, and the window that systemd allows stays one
+        // second wide, so the run starts in minute 0.
+        assert!(timer.contains("\nOnCalendar=*-*-* *:00:00\n"), "{timer}");
+        assert!(timer.contains("\nAccuracySec=1s\n"), "{timer}");
+        // One run after the user manager starts, which is the first login.
+        assert!(timer.contains("\nOnStartupSec=1min\n"), "{timer}");
+        // The login run makes up a missed hour, so no second one is due.
+        assert!(!timer.contains("Persistent"), "{timer}");
+        assert!(
+            timer.contains("\n[Install]\nWantedBy=timers.target\n"),
+            "{timer}"
+        );
+    }
+
+    #[test]
+    fn the_systemd_units_carry_a_path_that_holds_a_space() {
+        let (service, _) = render_systemd(
+            SPACE_PREFIX,
+            Path::new("/home/my user/.brainmaker/agent.log"),
+        );
+        let exec = service
+            .lines()
+            .find(|line| line.starts_with("ExecStart="))
+            .expect(&service);
+        // systemd reads the script as one double-quoted item, so a space
+        // cannot split it. The quotes of the shell words are escaped inside it.
+        assert_eq!(
+            exec,
+            r#"ExecStart=/bin/sh -c "exec >>\"/home/my user/.brainmaker/agent.log\" 2>&1; date; \"/home/my user/.brainmaker/bin/brainmaker\" --dir \"/home/my user/.brainmaker\" self-update --quiet; \"/home/my user/.brainmaker/bin/brainmaker\" --dir \"/home/my user/.brainmaker\" sync --quiet --no-update-check""#
+        );
+
+        // The four characters that systemd reads are doubled or escaped: the
+        // backslash and the double quote of the item, the percent sign of a
+        // specifier, and the dollar sign of a variable. The shell has already
+        // put a backslash before the dollar sign.
+        let (service, _) = render_systemd(
+            "\"/srv/50%/\\$HOME/bin/brainmaker\" --dir \"/srv/50%/\\$HOME\"",
+            Path::new("/srv/50%/$HOME/agent.log"),
+        );
+        assert!(
+            service
+                .contains(r#"\"/srv/50%%/\\$$HOME/bin/brainmaker\" --dir \"/srv/50%%/\\$$HOME\""#),
+            "{service}"
+        );
+        assert!(
+            service.contains(r#"exec >>\"/srv/50%%/\\$$HOME/agent.log\" 2>&1"#),
+            "{service}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_accepts_the_units() {
+        // Like plutil_accepts_the_property_list, this asks the tool of the
+        // platform. A system without the tool has nothing to ask.
+        let Some(tool) = ["/usr/bin/systemd-analyze", "/bin/systemd-analyze"]
+            .into_iter()
+            .find(|tool| Path::new(tool).is_file())
+        else {
+            return;
+        };
+
+        let base = temp_dir("systemd");
+        let cases = [
+            (UNIX_PREFIX, "/opt/bm"),
+            (SPACE_PREFIX, "/home/my user/.brainmaker"),
+        ];
+        for (index, (prefix, root)) in cases.into_iter().enumerate() {
+            let dir = base.join(index.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            let (service, timer) = render_systemd(prefix, &Path::new(root).join("agent.log"));
+            fs::write(dir.join("brainmaker.service"), service).unwrap();
+            fs::write(dir.join("brainmaker.timer"), timer).unwrap();
+
+            // The tool loads a timer together with the service that it names,
+            // and it searches the directory of both files.
+            let mut command = std::process::Command::new(tool);
+            command
+                .args(["verify", "--user"])
+                .arg(dir.join("brainmaker.service"))
+                .arg(dir.join("brainmaker.timer"));
+            // A user manager needs a runtime directory, and a CI runner has none.
+            if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+                command.env("XDG_RUNTIME_DIR", &dir);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_task_runs_for_the_user_and_stays_visible() {
+        let text = render_task(
+            WINDOWS_PREFIX,
+            Path::new(r"C:\Users\me\.brainmaker\agent.log"),
+            r"PC\me",
+        );
+
+        // This account, in its own session, at the least privilege. That is
+        // the one logon type that an account without administrator rights can
+        // register and run.
+        assert!(
+            text.contains(
+                "<Principal>\n      <UserId>PC\\me</UserId>\n      \
+                 <LogonType>InteractiveToken</LogonType>\n      \
+                 <RunLevel>LeastPrivilege</RunLevel>\n    </Principal>"
+            ),
+            "{text}"
+        );
+        // Every hour from minute 0 with no end, and once after this account
+        // logs on. A repetition with no Duration repeats for ever.
+        assert!(text.contains("<StartBoundary>2026-01-01T00:00:00</StartBoundary>"));
+        assert!(text.contains("<Interval>PT1H</Interval>"));
+        assert!(!text.contains("<Duration>"), "{text}");
+        assert!(
+            text.contains(
+                "<LogonTrigger>\n      <Enabled>true</Enabled>\n      \
+                 <UserId>PC\\me</UserId>\n      <Delay>PT1M</Delay>"
+            ),
+            "{text}"
+        );
+        // A laptop on battery still runs the agent. A run that the machine
+        // missed starts late. A run that is still going at the next hour is
+        // not started twice, and a hung run ends.
+        assert!(text.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        assert!(text.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+        assert!(text.contains("<StartWhenAvailable>true</StartWhenAvailable>"));
+        assert!(text.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+        assert!(text.contains("<ExecutionTimeLimit>PT30M</ExecutionTimeLimit>"));
+        // Hidden hides the task in the Task Scheduler window. It does not hide
+        // the console window, and the user should see the task.
+        assert!(!text.contains("<Hidden>"), "{text}");
+
+        // One action, because the manual does not say what the second of two
+        // actions does after the first fails. `&` runs the sync after a failed
+        // update, and `&&` would not.
+        assert_eq!(text.matches("<Exec>").count(), 1, "{text}");
+        assert!(text.contains(r"<Command>%SystemRoot%\System32\cmd.exe</Command>"));
+        assert!(
+            text.contains(
+                r#"self-update --quiet &amp; "C:\Users\me\.brainmaker\bin\brainmaker.exe" --dir "C:\Users\me\.brainmaker" sync"#
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("&amp;&amp;"), "{text}");
+        assert!(
+            text.contains(r#"&gt;&gt; "C:\Users\me\.brainmaker\agent.log" 2&gt;&amp;1"#),
+            "{text}"
+        );
+        assert!(text.starts_with("<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n"));
+    }
+
+    #[test]
+    fn the_task_escapes_a_path_for_xml() {
+        let text = render_task(
+            r#""C:\Me & You\bin\brainmaker.exe" --dir "C:\Me & You""#,
+            Path::new(r"C:\Me & You\agent.log"),
+            r"PC\Me & You",
+        );
+
+        assert!(text.contains(r"C:\Me &amp; You\agent.log"), "{text}");
+        assert!(text.contains(r"<UserId>PC\Me &amp; You</UserId>"), "{text}");
+        assert!(!text.contains("Me & You"), "{text}");
+
+        // No ampersand is left outside an entity, and the arguments hold no
+        // angle bracket, because the script redirects with `>>` and `2>&1`.
+        let left = text
+            .replace("&amp;", "")
+            .replace("&gt;", "")
+            .replace("&lt;", "");
+        assert!(!left.contains('&'), "{text}");
+        let arguments = text
+            .split("<Arguments>")
+            .nth(1)
+            .and_then(|rest| rest.split("</Arguments>").next())
+            .expect(&text);
+        assert!(!arguments.contains(['<', '>']), "{arguments}");
     }
 }
