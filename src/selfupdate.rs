@@ -217,6 +217,9 @@ pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -
     let staged = directory.join(format!(".brainmaker-update-{}{suffix}", std::process::id()));
     let backup = directory.join(format!(".brainmaker-old{suffix}"));
 
+    // Safe only because the update lock is held: no other run has a staged
+    // file in this directory, so every file of this kind is stale.
+    remove_leftovers(directory);
     check_writable(directory, &exe)?;
 
     let result = (|| -> Result<()> {
@@ -290,6 +293,31 @@ fn current_exe() -> Result<PathBuf> {
     // Follow a symbolic link, so that the swap replaces the real file rather
     // than the link.
     Ok(fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+/// Prefixes of the files that one update writes beside the program and
+/// removes before it ends.
+const LEFTOVER_PREFIXES: [&str; 2] = [".brainmaker-update-", ".brainmaker-probe-"];
+
+/// Removes the files that a stopped update left in `directory`.
+///
+/// An update that is killed never reaches its own cleanup, and its staged
+/// download can be as large as the program. The caller holds the update
+/// lock, so no other update is running, and every such file is stale.
+fn remove_leftovers(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if LEFTOVER_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Fails early when we cannot write the executable or its directory.
@@ -629,5 +657,29 @@ mod tests {
     #[test]
     fn refuses_another_program_name() {
         assert!(!reports_version("other 0.1.1", "0.1.1"));
+    }
+
+    #[test]
+    fn removes_the_files_of_a_stopped_update_and_nothing_else() {
+        let dir = testutil::temp_dir("update-leftovers");
+        for name in [
+            ".brainmaker-update-123",
+            ".brainmaker-probe-9",
+            ".brainmaker-old",
+            "brainmaker",
+            "notes.txt",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        remove_leftovers(&dir);
+
+        assert!(!dir.join(".brainmaker-update-123").exists());
+        assert!(!dir.join(".brainmaker-probe-9").exists());
+        assert!(dir.join(".brainmaker-old").exists());
+        assert!(dir.join("brainmaker").exists());
+        assert!(dir.join("notes.txt").exists());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
