@@ -85,14 +85,44 @@ pub fn content_key_count() -> usize {
     CONTENT_KEYS.len()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Keys that a test trusts in place of the compiled-in lists.
+    ///
+    /// A test signs with a key it made, so the client under test must
+    /// trust that key. The override lives in the test's own thread and
+    /// exists in no other build.
+    static TEST_KEYS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes this thread trust `keys` for both documents.
+#[cfg(test)]
+pub fn trust_in_this_test(keys: &[String]) {
+    TEST_KEYS.with(|slot| *slot.borrow_mut() = Some(keys.to_vec()));
+}
+
+/// The keys for one check: the list `compiled`, or a test's own keys.
+fn trusted(compiled: &[&str]) -> Vec<String> {
+    #[cfg(test)]
+    if let Some(keys) = TEST_KEYS.with(|slot| slot.borrow().clone()) {
+        return keys;
+    }
+    compiled.iter().map(|key| key.to_string()).collect()
+}
+
 /// Checks `signature` against `payload`, using the software keys.
 pub fn verify(payload: &[u8], signature: &str) -> Result<()> {
-    verify_with(PUBLIC_KEYS, payload, signature).context("the software manifest")
+    let keys = trusted(PUBLIC_KEYS);
+    let listed: Vec<&str> = keys.iter().map(String::as_str).collect();
+    verify_with(&listed, payload, signature).context("the software manifest")
 }
 
 /// Checks `signature` against `payload`, using the content keys.
 pub fn verify_content(payload: &[u8], signature: &str) -> Result<()> {
-    verify_with(CONTENT_KEYS, payload, signature).context("the content release")
+    let keys = trusted(CONTENT_KEYS);
+    let listed: Vec<&str> = keys.iter().map(String::as_str).collect();
+    verify_with(&listed, payload, signature).context("the content release")
 }
 
 /// Checks `signature` against `payload`, using `keys`.
