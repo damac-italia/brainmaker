@@ -109,22 +109,28 @@ fn run(args: &[&str]) -> Result<()> {
 
 /// Writes a new key, and prints the public half.
 fn keygen(key_file: &Path) -> Result<()> {
-    if key_file.exists() {
-        bail!(
-            "{} already exists. Signing with a new key needs a key rotation, \
-             so move the old file aside on purpose.",
-            key_file.display()
-        );
-    }
+    use std::io::Write;
 
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
         .map_err(|_| anyhow::anyhow!("cannot generate a key"))?;
     let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
         .map_err(|error| anyhow::anyhow!("cannot read the generated key: {error}"))?;
 
-    std::fs::write(key_file, hex(pkcs8.as_ref()))
+    let mut file = match create_owner_only(key_file) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "{} already exists. Signing with a new key needs a key rotation, \
+                 so move the old file aside on purpose.",
+                key_file.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot create {}", key_file.display()));
+        }
+    };
+    file.write_all(hex(pkcs8.as_ref()).as_bytes())
         .with_context(|| format!("cannot write {}", key_file.display()))?;
-    restrict(key_file)?;
 
     println!("Wrote the private key to {}.", key_file.display());
     println!();
@@ -136,6 +142,30 @@ fn keygen(key_file: &Path) -> Result<()> {
         key_file.display()
     );
     Ok(())
+}
+
+/// Creates `path` for writing, readable by its owner alone.
+///
+/// The file gets its mode when it is created, so no moment exists at which
+/// another account can read the key. `create_new` fails when anything is
+/// already at the path, a symbolic link included, so a key is never
+/// written through a link to another place.
+#[cfg(unix)]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Signs a manifest and writes the envelope.
@@ -423,16 +453,4 @@ fn decode_hex(text: &str) -> Result<Vec<u8>> {
         out.push(byte);
     }
     Ok(out)
-}
-
-#[cfg(unix)]
-fn restrict(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("cannot restrict {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn restrict(_path: &Path) -> Result<()> {
-    Ok(())
 }
