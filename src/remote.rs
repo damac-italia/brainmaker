@@ -150,6 +150,7 @@ pub fn fetch_text(config: &Config, url: &str, limit: u64) -> Result<String> {
 /// Streams a URL to `dest`.
 ///
 /// The download stops at `limit` bytes, and it fails when the body is larger.
+/// On every failure after the file was created, the file is removed.
 /// Returns the number of bytes written.
 pub fn download(config: &Config, url: &str, dest: &Path, limit: u64) -> Result<u64> {
     let agent = build_agent(DOWNLOAD_TIMEOUT);
@@ -174,29 +175,53 @@ pub fn download(config: &Config, url: &str, dest: &Path, limit: u64) -> Result<u
     let file = File::create(dest).with_context(|| format!("cannot create {}", dest.display()))?;
     let mut writer = BufWriter::new(file);
 
-    // Read one byte past the limit so that an oversized body fails instead of
-    // being silently truncated.
+    // The library stops the read one byte past `limit`, and it reports that as
+    // an error. It fails the first read after its own limit is used up, even
+    // when the body ends there, so the limit given to it is `limit + 1`. A body
+    // of exactly `limit` bytes then succeeds, and a longer body fails. The code
+    // below turns that failure into a message about size.
     let mut reader = response.body_mut().with_config().limit(limit + 1).reader();
 
-    let written = io::copy(&mut reader, &mut writer)
-        .with_context(|| format!("cannot write the download to {}", dest.display()))?;
+    let written = match io::copy(&mut reader, &mut writer) {
+        Ok(written) => written,
+        Err(error) => {
+            // Close the file before it is removed, so that no partial body stays.
+            drop(writer);
+            let _ = std::fs::remove_file(dest);
+            if passed_the_limit(&error) {
+                bail!("the body of {url} is larger than the limit of {limit} bytes");
+            }
+            return Err(error)
+                .with_context(|| format!("cannot write the download to {}", dest.display()));
+        }
+    };
 
     writer
         .into_inner()
-        .with_context(|| format!("cannot flush {}", dest.display()))?
-        .sync_all()
-        .with_context(|| format!("cannot sync {}", dest.display()))?;
+        .with_context(|| format!("cannot flush {}", dest.display()))
+        .and_then(|file| {
+            file.sync_all()
+                .with_context(|| format!("cannot sync {}", dest.display()))
+        })
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(dest);
+        })?;
 
-    if written > limit {
-        let _ = std::fs::remove_file(dest);
-        bail!("the body of {url} is larger than the limit of {limit} bytes");
-    }
     if written == 0 {
         let _ = std::fs::remove_file(dest);
         bail!("the body of {url} is empty");
     }
 
     Ok(written)
+}
+
+/// True when `error` is the HTTP client's report that the body passed the
+/// limit it was given.
+fn passed_the_limit(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+        .is_some_and(|inner| matches!(inner, ureq::Error::BodyExceedsLimit(_)))
 }
 
 /// Builds an agent with this client's timeouts and user agent.
@@ -538,13 +563,48 @@ mod tests {
 
         let result = download(&config, &format!("{}/f", server.base()), &dest, 999);
 
-        // Only the failure is asserted, and not its message, which can change.
-        // The callers remove the file after any error: `sync` deletes its
-        // download, and `self-update` deletes its staged binary.
+        // The message is the subject of `a_download_past_the_limit_names_the_limit`.
+        // Here the file must be gone, so that a caller that does not remove it
+        // after an error leaves no oversized body behind.
         assert!(
             result.is_err(),
             "a body of 1000 bytes passed a limit of 999"
         );
+        assert!(!dest.exists(), "the oversized body stayed in the file");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_download_past_the_limit_names_the_limit() {
+        let server = Server::start(vec![Route::get("/f", vec![7u8; 1000])]);
+        let dir = temp_dir("remote-download-names-limit");
+        let config = Config::for_test(&dir, &server.base());
+        let dest = dir.join("f.bin");
+
+        let error = download(&config, &format!("{}/f", server.base()), &dest, 999).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("is larger than the limit of 999 bytes"),
+            "got {text}"
+        );
+        assert!(!dest.exists(), "the oversized body stayed in the file");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_download_of_exactly_the_limit_succeeds() {
+        let server = Server::start(vec![Route::get("/f", vec![7u8; 1000])]);
+        let dir = temp_dir("remote-download-exact-limit");
+        let config = Config::for_test(&dir, &server.base());
+        let dest = dir.join("f.bin");
+
+        let written = download(&config, &format!("{}/f", server.base()), &dest, 1000).unwrap();
+
+        assert_eq!(written, 1000);
+        assert_eq!(std::fs::read(&dest).unwrap(), vec![7u8; 1000]);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
