@@ -292,6 +292,8 @@ fn remove_file_if_present(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::testutil::{self, Route, Server, Signer};
 
@@ -438,6 +440,52 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn installs_the_first_sequenced_release() {
+        // Nothing that is installed carries a sequence, so nothing orders the
+        // first release that does.
+        check_order(None, Some(1760000000)).unwrap();
+    }
+
+    #[test]
+    fn installs_a_higher_sequence() {
+        check_order(Some(100), Some(101)).unwrap();
+    }
+
+    #[test]
+    fn refuses_an_equal_sequence() {
+        let error = check_order(Some(100), Some(100)).unwrap_err();
+
+        let text = error.to_string();
+        assert!(text.contains("installs only a newer release"), "got {text}");
+        assert!(text.contains("sync --force"), "got {text}");
+    }
+
+    #[test]
+    fn refuses_a_lower_sequence() {
+        let error = check_order(Some(200), Some(100)).unwrap_err();
+
+        let text = error.to_string();
+        assert!(text.contains("with the sequence 100"), "got {text}");
+        assert!(text.contains("has the sequence 200"), "got {text}");
+        assert!(text.contains("installs only a newer release"), "got {text}");
+    }
+
+    #[test]
+    fn refuses_no_sequence_after_a_sequence() {
+        let error = check_order(Some(100), None).unwrap_err();
+
+        let text = error.to_string();
+        assert!(text.contains("with no sequence"), "got {text}");
+        assert!(text.contains("has the sequence 100"), "got {text}");
+        assert!(text.contains("sync --force"), "got {text}");
+    }
+
+    #[test]
+    fn installs_an_unsequenced_release_on_an_unsequenced_state() {
+        check_order(None, None).unwrap();
+    }
+
     /// Ignores the progress messages.
     fn quiet(_: &str) {}
 
@@ -455,29 +503,47 @@ mod tests {
     ///
     /// The signed release names `described` by its digest and claims `size`
     /// bytes, and the archive route serves `served`. The three differ in the
-    /// tests that publish a release that cannot be trusted.
+    /// tests that publish a release that cannot be trusted. The release
+    /// carries `sequence` when it is given, and no sequence key otherwise, as
+    /// a release from an older signer does.
     fn routes(
         signer: &Signer,
         hash: &str,
         described: &[u8],
         size: u64,
         served: &[u8],
+        sequence: Option<u64>,
     ) -> Vec<Route> {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "hash": hash,
             "sha256": digest_of(described),
             "size_bytes": size,
-        })
-        .to_string();
+        });
+        if let Some(sequence) = sequence {
+            payload["sequence"] = sequence.into();
+        }
         vec![
-            Route::get("/content/latest", signer.envelope(&payload)),
+            Route::get("/content/latest", signer.envelope(&payload.to_string())),
             Route::get(&format!("/content/{hash}.zip"), served),
         ]
     }
 
     /// The routes of a server that publishes `archive` as it stands.
     fn published(signer: &Signer, hash: &str, archive: &[u8]) -> Vec<Route> {
-        routes(signer, hash, archive, archive.len() as u64, archive)
+        routes(signer, hash, archive, archive.len() as u64, archive, None)
+    }
+
+    /// The routes of a server that publishes `archive` as it stands, in a
+    /// release that carries `sequence`.
+    fn sequenced(signer: &Signer, hash: &str, archive: &[u8], sequence: u64) -> Vec<Route> {
+        routes(
+            signer,
+            hash,
+            archive,
+            archive.len() as u64,
+            archive,
+            Some(sequence),
+        )
     }
 
     /// How many times `server` was asked for the archive of `hash`.
@@ -651,6 +717,7 @@ mod tests {
             &signed,
             signed.len() as u64,
             &served,
+            None,
         ));
         let dir = testutil::temp_dir("sync-forged");
         let config = Config::for_test(&dir, &server.base());
@@ -676,6 +743,7 @@ mod tests {
             &archive,
             archive.len() as u64 + 1,
             &archive,
+            None,
         ));
         let dir = testutil::temp_dir("sync-size");
         let config = Config::for_test(&dir, &server.base());
@@ -703,6 +771,7 @@ mod tests {
             b"other bytes",
             second.len() as u64,
             &second,
+            None,
         ));
         let dir = testutil::temp_dir("sync-failed-install");
         let config = Config::for_test(&dir, &old_server.base());
@@ -817,6 +886,202 @@ mod tests {
         assert_eq!(downloads(&server, "a1b2c3d4"), 0);
 
         drop(held);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn records_the_sequence_it_installed() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(sequenced(&signer, "a1b2c3d4", &archive, 5));
+        let dir = testutil::temp_dir("sync-records-sequence");
+        let config = Config::for_test(&dir, &server.base());
+
+        sync(&config, false, &quiet).unwrap();
+
+        let kept = state::read(&config.state_file()).unwrap();
+        assert_eq!(kept.hash, "a1b2c3d4");
+        assert_eq!(kept.sequence, Some(5));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_replayed_release() {
+        let signer = Signer::new();
+        signer.trust();
+        // The signer made release A first, with the sequence 100, and release
+        // B later, with the sequence 200. A machine that holds B is offered A.
+        let release_a = testutil::zip_of(&[("a.md", b"release a")]);
+        let release_b = testutil::zip_of(&[("b.md", b"release b")]);
+        let server_b = Server::start(sequenced(&signer, "e5f6a7b8", &release_b, 200));
+        let server_a = Server::start(sequenced(&signer, "a1b2c3d4", &release_a, 100));
+        let dir = testutil::temp_dir("sync-replay");
+        let config = Config::for_test(&dir, &server_b.base());
+        sync(&config, false, &quiet).unwrap();
+
+        let replayed = Config::for_test(&dir, &server_a.base());
+        let error = sync(&replayed, false, &quiet).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("installs only a newer release"), "got {text}");
+        assert!(config.content_dir().join("b.md").is_file());
+        assert!(!config.content_dir().join("a.md").exists());
+        let kept = state::read(&config.state_file()).unwrap();
+        assert_eq!(kept.hash, "e5f6a7b8");
+        assert_eq!(kept.sequence, Some(200));
+        assert_eq!(downloads(&server_a, "a1b2c3d4"), 0);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn force_installs_an_older_release() {
+        let signer = Signer::new();
+        signer.trust();
+        let release_a = testutil::zip_of(&[("a.md", b"release a")]);
+        let release_b = testutil::zip_of(&[("b.md", b"release b")]);
+        let server_b = Server::start(sequenced(&signer, "e5f6a7b8", &release_b, 200));
+        let server_a = Server::start(sequenced(&signer, "a1b2c3d4", &release_a, 100));
+        let dir = testutil::temp_dir("sync-replay-force");
+        let config = Config::for_test(&dir, &server_b.base());
+        sync(&config, false, &quiet).unwrap();
+
+        let older = Config::for_test(&dir, &server_a.base());
+        let outcome = sync(&older, true, &quiet).unwrap();
+
+        match outcome {
+            Outcome::Updated { previous, hash, .. } => {
+                assert_eq!(previous, Some("e5f6a7b8".to_string()));
+                assert_eq!(hash, "a1b2c3d4");
+            }
+            other => panic!("expected the older release to install, got {other:?}"),
+        }
+        assert!(config.content_dir().join("a.md").is_file());
+        assert!(!config.content_dir().join("b.md").exists());
+        let kept = state::read(&config.state_file()).unwrap();
+        assert_eq!(kept.hash, "a1b2c3d4");
+        assert_eq!(kept.sequence, Some(100));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_same_hash_is_up_to_date_whatever_its_sequence() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        // The signer signed one archive twice, and the server now serves the
+        // earlier signature.
+        let later = Server::start(sequenced(&signer, "a1b2c3d4", &archive, 200));
+        let earlier = Server::start(sequenced(&signer, "a1b2c3d4", &archive, 100));
+        let dir = testutil::temp_dir("sync-same-hash");
+        let config = Config::for_test(&dir, &later.base());
+        sync(&config, false, &quiet).unwrap();
+
+        let replayed = Config::for_test(&dir, &earlier.base());
+        let outcome = sync(&replayed, false, &quiet).unwrap();
+
+        assert_eq!(
+            outcome,
+            Outcome::UpToDate {
+                hash: "a1b2c3d4".to_string()
+            }
+        );
+        assert_eq!(downloads(&earlier, "a1b2c3d4"), 0);
+        assert_eq!(
+            state::read(&config.state_file()).unwrap().sequence,
+            Some(200)
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn installs_again_when_the_content_is_missing_whatever_the_sequence() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        let server = Server::start(sequenced(&signer, "a1b2c3d4", &archive, 200));
+        let dir = testutil::temp_dir("sync-missing-sequenced");
+        let config = Config::for_test(&dir, &server.base());
+        sync(&config, false, &quiet).unwrap();
+        fs::remove_dir_all(config.content_dir()).unwrap();
+
+        // The server offers the release that is installed, with the sequence
+        // that is installed, which is not a higher one.
+        let outcome = sync(&config, false, &quiet).unwrap();
+
+        match outcome {
+            Outcome::Updated { previous, hash, .. } => {
+                assert_eq!(previous, Some("a1b2c3d4".to_string()));
+                assert_eq!(hash, "a1b2c3d4");
+            }
+            other => panic!("expected the content to be installed again, got {other:?}"),
+        }
+        assert!(config.content_dir().join("notes.md").is_file());
+        assert_eq!(
+            state::read(&config.state_file()).unwrap().sequence,
+            Some(200)
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checks_the_order_again_after_the_lock_is_taken() {
+        let signer = Signer::new();
+        signer.trust();
+        let first = testutil::zip_of(&[("one.md", b"release one")]);
+        let second = testutil::zip_of(&[("two.md", b"release two")]);
+        let old_server = Server::start(sequenced(&signer, "a1b2c3d4", &first, 100));
+        let new_server = Server::start(sequenced(&signer, "e5f6a7b8", &second, 200));
+        let dir = testutil::temp_dir("sync-order-after-lock");
+        let config = Config::for_test(&dir, &old_server.base());
+        sync(&config, false, &quiet).unwrap();
+
+        // Another run holds the lock while this run waits with the second
+        // release in hand. That run installs a third release, with the
+        // sequence 300, and then lets go of the lock.
+        let newer = Config::for_test(&dir, &new_server.base());
+        let held = lock::acquire(&config.lock_file(), Duration::from_secs(5))
+            .unwrap()
+            .expect("nothing else holds the lock");
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // The waiting run has read its state before it asks for the
+                // release, so the state can change once the release is asked for.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !new_server
+                    .requests()
+                    .iter()
+                    .any(|(_, path, _)| path == "/content/latest")
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the waiting run never asked for the release"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let third = State::with_sequence("c9d0e1f2", Some(300));
+                state::write(&config.state_file(), &third).unwrap();
+                drop(held);
+            });
+            sync(&newer, false, &quiet)
+        });
+
+        let error = result.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("installs only a newer release"), "got {text}");
+        assert!(text.contains("has the sequence 300"), "got {text}");
+        assert!(config.content_dir().join("one.md").is_file());
+        assert!(!config.content_dir().join("two.md").exists());
+        assert_eq!(downloads(&new_server, "e5f6a7b8"), 0);
+        let kept = state::read(&config.state_file()).unwrap();
+        assert_eq!(kept.hash, "c9d0e1f2");
+        assert_eq!(kept.sequence, Some(300));
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }

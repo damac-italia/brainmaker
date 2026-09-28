@@ -577,6 +577,31 @@ mod tests {
         .to_string()
     }
 
+    /// A content release whose "sequence" is `sequence`, whatever its type.
+    fn release_with_sequence(sequence: serde_json::Value) -> String {
+        serde_json::json!({
+            "hash": "abcd1234",
+            "sha256": DIGEST,
+            "size_bytes": 1024,
+            "sequence": sequence,
+        })
+        .to_string()
+    }
+
+    /// The sequence in the payload of the envelope in `path`.
+    ///
+    /// Fails when the payload is not a content release that `check_content`
+    /// accepts.
+    fn signed_sequence(path: &Path) -> u64 {
+        let text = std::fs::read_to_string(path).unwrap();
+        let envelope: Envelope = serde_json::from_str(&text).unwrap();
+        check_content(&envelope.payload).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&envelope.payload).unwrap();
+        payload["sequence"]
+            .as_u64()
+            .expect("the payload carries a sequence")
+    }
+
     #[test]
     fn the_version_rule_is_the_client_rule() {
         let nines_64 = "9".repeat(64);
@@ -682,6 +707,114 @@ mod tests {
         .to_string();
         let error = check_content(&text).unwrap_err();
         assert!(error.to_string().contains("\"url\""), "{error:#}");
+    }
+
+    #[test]
+    fn a_content_release_may_carry_a_sequence() {
+        check_content(&release_with_sequence(serde_json::json!(5))).unwrap();
+        check_content(&release_with_sequence(serde_json::json!(u64::MAX))).unwrap();
+
+        // A release from a signer older than the sequence carries none.
+        check_content(&release(1024)).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_sequence_that_is_not_a_number() {
+        let samples = [
+            serde_json::json!("5"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+            serde_json::json!(true),
+        ];
+        for sample in samples {
+            let error = check_content(&release_with_sequence(sample.clone())).unwrap_err();
+            assert!(
+                error.to_string().contains("\"sequence\""),
+                "the sequence {sample} gave: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_content_writes_the_sequence_it_is_given_and_otherwise_the_time() {
+        let base = temp_dir("sequence");
+        let key_path = base.join("test.key");
+        let archive_path = base.join("content.zip");
+        let envelope_path = base.join("latest.json");
+        let (key, archive, envelope) = (
+            key_path.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+            envelope_path.to_str().unwrap(),
+        );
+        keygen(&key_path).unwrap();
+        std::fs::write(&archive_path, b"archive bytes").unwrap();
+
+        // A named sequence goes into the payload as it stands.
+        run(&[
+            "sign-content",
+            key,
+            archive,
+            "abcd1234",
+            envelope,
+            "1760000000",
+        ])
+        .unwrap();
+        assert_eq!(signed_sequence(&envelope_path), 1_760_000_000);
+
+        // With none named, the sequence is the time of signing.
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let before = now();
+        run(&["sign-content", key, archive, "abcd1234", envelope]).unwrap();
+        let after = now();
+        let written = signed_sequence(&envelope_path);
+        assert!(
+            before <= written && written <= after,
+            "the sequence {written} lies outside the signing time, {before} to {after}"
+        );
+
+        // The envelope is one that `verify` accepts against the signing key.
+        let public = hex(load_key(key).unwrap().public_key().as_ref());
+        verify(&envelope_path, &[public.as_str()]).unwrap();
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn sign_content_refuses_a_sequence_that_is_not_a_whole_number() {
+        let base = temp_dir("bad-sequence");
+        let key_path = base.join("test.key");
+        let archive_path = base.join("content.zip");
+        let envelope_path = base.join("latest.json");
+        let (key, archive, envelope) = (
+            key_path.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+            envelope_path.to_str().unwrap(),
+        );
+        keygen(&key_path).unwrap();
+        std::fs::write(&archive_path, b"archive bytes").unwrap();
+
+        // The last one is one more than the largest whole number a u64 holds.
+        let samples = ["", "abc", "-1", "1.5", "1e3", " 5", "18446744073709551616"];
+        for text in samples {
+            let error =
+                run(&["sign-content", key, archive, "abcd1234", envelope, text]).unwrap_err();
+            assert!(
+                error.to_string().contains("is not a whole number"),
+                "the sequence {text:?} gave: {error:#}"
+            );
+            assert!(
+                !envelope_path.exists(),
+                "an envelope was written for the sequence {text:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
