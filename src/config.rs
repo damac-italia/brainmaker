@@ -224,9 +224,70 @@ fn check_credential_value(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where brainmaker keeps its files: the root, and every path under it.
+///
+/// `Config` answers each of its paths through this. `uninstall` builds a
+/// layout from the root alone, because it must run where the settings no
+/// longer load.
+#[derive(Debug, Clone)]
+pub struct Layout {
+    root: PathBuf,
+}
+
+impl Layout {
+    /// The layout under `dir`, made absolute, or under `~/.brainmaker` when
+    /// `dir` is `None`.
+    pub fn resolve(dir: Option<&Path>) -> Result<Self> {
+        let root = match dir {
+            Some(path) => absolute(path)?,
+            None => dirs::home_dir()
+                .context("cannot locate the home directory")?
+                .join(".brainmaker"),
+        };
+        Ok(Self { root })
+    }
+
+    /// Root directory that holds the content, the state file, and the
+    /// temporary directories.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Directory that holds the extracted content.
+    pub fn content_dir(&self) -> PathBuf {
+        self.root.join("content")
+    }
+
+    /// File that records the installed hash.
+    pub fn state_file(&self) -> PathBuf {
+        self.root.join("state.json")
+    }
+
+    /// File that holds the sealed settings.
+    pub fn store_path(&self) -> PathBuf {
+        self.root.join("confidential").join("config.enc")
+    }
+
+    /// Directory that receives a fresh extraction before the swap.
+    pub fn staging_dir(&self) -> PathBuf {
+        self.root.join(".staging")
+    }
+
+    /// Directory that holds the previous content between the swap and the
+    /// delete.
+    pub fn trash_dir(&self) -> PathBuf {
+        self.root.join(".trash")
+    }
+
+    /// File that receives the downloaded archive.
+    pub fn download_file(&self) -> PathBuf {
+        self.root.join(".download.zip")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
-    root: PathBuf,
+    layout: Layout,
     base_url: String,
     routes: Routes,
     credentials: Option<Credentials>,
@@ -261,14 +322,9 @@ impl Config {
     /// The function fails when no source supplies a base URL, because this
     /// binary carries no default endpoint.
     pub fn load(options: &Options, log: &dyn Fn(&str)) -> Result<Self> {
-        let root = match options.root.clone() {
-            Some(path) => absolute(&path)?,
-            None => dirs::home_dir()
-                .context("cannot locate the home directory")?
-                .join(".brainmaker"),
-        };
+        let layout = Layout::resolve(options.root.as_deref())?;
 
-        let store = Self::store_path_for(&root);
+        let store = layout.store_path();
         let mut source = Source::Stored;
         let mut settings = Settings::default();
 
@@ -388,7 +444,7 @@ impl Config {
             Routes::load(|key| env_value(key).or_else(|| settings.get(key).map(str::to_string)))?;
 
         Ok(Self {
-            root,
+            layout,
             base_url,
             routes,
             credentials,
@@ -397,13 +453,9 @@ impl Config {
         })
     }
 
-    fn store_path_for(root: &Path) -> PathBuf {
-        root.join("confidential").join("config.enc")
-    }
-
     /// File that holds the sealed settings.
     pub fn store_path(&self) -> PathBuf {
-        Self::store_path_for(&self.root)
+        self.layout.store_path()
     }
 
     /// Where this run's settings came from.
@@ -414,33 +466,33 @@ impl Config {
     /// Root directory that holds the content, the state file, and the
     /// temporary directories.
     pub fn root(&self) -> &Path {
-        &self.root
+        self.layout.root()
     }
 
     /// Directory that holds the extracted content.
     pub fn content_dir(&self) -> PathBuf {
-        self.root.join("content")
+        self.layout.content_dir()
     }
 
     /// File that records the installed hash.
     pub fn state_file(&self) -> PathBuf {
-        self.root.join("state.json")
+        self.layout.state_file()
     }
 
     /// Directory that receives a fresh extraction before the swap.
     pub fn staging_dir(&self) -> PathBuf {
-        self.root.join(".staging")
+        self.layout.staging_dir()
     }
 
     /// Directory that holds the previous content between the swap and the
     /// delete.
     pub fn trash_dir(&self) -> PathBuf {
-        self.root.join(".trash")
+        self.layout.trash_dir()
     }
 
     /// File that receives the downloaded archive.
     pub fn download_file(&self) -> PathBuf {
-        self.root.join(".download.zip")
+        self.layout.download_file()
     }
 
     /// URL that returns the latest content hash as JSON.
@@ -558,7 +610,9 @@ mod tests {
 
     fn config_for(base_url: &str) -> Config {
         Config {
-            root: PathBuf::from("/tmp/root"),
+            layout: Layout {
+                root: PathBuf::from("/tmp/root"),
+            },
             base_url: base_url.to_string(),
             routes: Routes::default(),
             credentials: None,
@@ -586,6 +640,18 @@ mod tests {
             absolute(Path::new("/tmp/root")).unwrap(),
             PathBuf::from("/tmp/root")
         );
+    }
+
+    #[test]
+    fn the_layout_defaults_to_the_brainmaker_directory_in_home() {
+        let layout = Layout::resolve(None).unwrap();
+        assert!(layout.root().is_absolute(), "got {:?}", layout.root());
+        assert!(layout.root().ends_with(".brainmaker"), "got {layout:?}");
+
+        let named = Layout::resolve(Some(Path::new("some/root"))).unwrap();
+        assert!(named.root().is_absolute(), "got {named:?}");
+        assert_eq!(named.content_dir(), named.root().join("content"));
+        assert!(named.store_path().ends_with("confidential/config.enc"));
     }
 
     #[test]

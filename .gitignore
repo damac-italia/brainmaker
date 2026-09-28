@@ -1,8 +1,9 @@
 /target
 .DS_Store
 
-# the backup that docsgen wrote before it rewrote README.md
+# the backups that docsgen writes before it rewrites a document
 README.bak.md
+docs/*.bak.md
 
 # never commit a provisioning file: it holds the token
 brainmaker.env

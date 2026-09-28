@@ -18,6 +18,7 @@ brainmaker [COMMAND] [OPTIONS]
 | `self-update` | Replace this binary with the newest build for this platform | the binary |
 | `link` | Bridge the synced content into `~/.claude` | `~/.claude/skills`, `settings.json`, `CLAUDE.md` |
 | `unlink` | Remove what `link` wrote, and nothing else | the same three |
+| `uninstall` | Remove what `link` wrote, then what brainmaker wrote under the root, then the root when it is empty. It asks first. | the same three, and the root |
 | `session-context` | Print the `SessionStart` JSON the linked hook returns | nothing |
 
 The parser accepts one command. A second command is an error, and so is any unrecognised argument.
@@ -29,11 +30,12 @@ The parser accepts one command. A second command is an error, and so is any unre
 | `--force` | none | `sync`, `self-update` | With `sync`, download and extract even when the content is up to date. With `self-update`, reinstall the same version. |
 | `--check` | none | `self-update` | Report the newer version and install nothing |
 | `--no-update-check` | none | `sync` | Skip the software version check |
-| `--config` | `<PATH>` | all | Import the provisioning file at `PATH` |
-| `--keep-config` | none | all | Do not remove the provisioning file after the import |
+| `-y`, `--yes` | none | `uninstall` | Remove without asking first |
+| `--config` | `<PATH>` | all but `uninstall`, which rejects it | Import the provisioning file at `PATH` |
+| `--keep-config` | none | all but `uninstall`, which rejects it | Do not remove the provisioning file after the import |
 | `--dir` | `<PATH>` | all | Use `PATH` as the root instead of `~/.brainmaker` |
-| `--url` | `<URL>` | all | Use `URL` as the API base |
-| `--claude-dir` | `<PATH>` | `link`, `unlink` | Write to `PATH` instead of `~/.claude` |
+| `--url` | `<URL>` | all but `uninstall`, which rejects it | Use `URL` as the API base |
+| `--claude-dir` | `<PATH>` | `link`, `unlink`, `uninstall` | Write to `PATH` instead of `~/.claude` |
 | `-q`, `--quiet` | none | all | Print errors only |
 | `-h`, `--help` | none | — | Print the help text and exit 0 |
 | `-V`, `--version` | none | — | Print `brainmaker <version>` and exit 0 |
@@ -55,6 +57,38 @@ A server that `sync` cannot reach is treated the same way while content is insta
 prints `notice: cannot check the latest content version: ...` and
 `notice: the installed content <hash> stays in place.` to stderr, and exits 0. With nothing
 installed, or with `--force`, the failure exits 1.
+
+`uninstall` exits 0 and removes nothing when the answer to its question is not `y` or `yes`. It
+exits 1 when stdin is not a terminal and `--yes` is absent. A removal that fails part-way exits 1
+with part of the install already gone; run the command again to finish.
+
+### `uninstall` removal
+
+`uninstall` loads no settings, so it runs where the sealed store no longer opens, and it never
+imports a provisioning file. With `uninstall`, the parser rejects `--config`, `--keep-config`,
+and `--url` with `<flag> has no effect with uninstall, which loads no settings`, and the run exits
+1. It works in this order:
+
+| Step | Removes | When |
+|---|---|---|
+| 1 | The skill links, the `SessionStart` hook, and the `CLAUDE.md` block that `link` wrote, as `unlink` removes them | the root is recognised or does not exist |
+| 2 | `content/`, `.staging/`, `.trash/`, and `.download.zip` | the root is recognised |
+| 3 | `bin/brainmaker`, and every `bin/.brainmaker*` file that `link` or `self-update` left | the root is recognised |
+| 4 | `state.json.tmp`, `state.json`, `confidential/config.tmp`, and `confidential/config.enc` | the root is recognised |
+| 5 | `bin/`, `confidential/`, and then the root | each one is empty |
+
+The root is recognised when it holds a `state.json` of the shape that `sync` writes, or a
+`confidential/config.enc` that starts with the sealed header. When the root exists but is not
+recognised, the run changes nothing, step 1 included, and says so. The hook and the `CLAUDE.md`
+block do not name their root, so step 1 under a wrong `--dir` would cut off a real install
+elsewhere. Step 4 comes last because those two files are the marks: a run that stops part-way
+keeps them, and the next run still recognises the root.
+
+A root that still holds other entries after step 5 stays, and the run names them. A symbolic link
+goes without the target that it names. That includes the root: when it is a link, step 5 removes
+the link, and the directory it names stays, empty. The program that runs `uninstall` stays, unless it is
+`bin/brainmaker`, and the run prints its path. Windows cannot remove a running program, so there
+the run prints a notice and the path to delete after the command exits.
 
 ### `status` output
 

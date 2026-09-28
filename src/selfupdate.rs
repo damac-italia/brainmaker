@@ -224,7 +224,7 @@ pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -
     let _ = fs::remove_file(&backup);
     result?;
 
-    let installed = crate::link::installed_program(config);
+    let installed = crate::link::installed_program(config.root());
     if installed.is_file() && !crate::link::same_file(&exe, &installed) {
         crate::link::copy_program(&exe, &installed)?;
         log(&format!(

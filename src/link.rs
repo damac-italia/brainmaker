@@ -102,6 +102,16 @@ pub struct Report {
     pub briefing_changed: bool,
 }
 
+impl Report {
+    /// True when the run changed a file or a link.
+    pub fn changed(&self) -> bool {
+        self.settings_changed
+            || self.briefing_changed
+            || !self.linked.is_empty()
+            || !self.removed.is_empty()
+    }
+}
+
 /// The Claude configuration directory, `~/.claude`.
 pub fn claude_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("cannot find the home directory")?;
@@ -130,12 +140,20 @@ pub fn link(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Report
 
 /// Removes the bridge.
 pub fn unlink(config: &Config, claude: &Path, log: &dyn Fn(&str)) -> Result<Report> {
-    let content = config.content_dir();
-    let mut report = Report::default();
-    unlink_skills(&content, claude, &mut report)?;
-    report.settings_changed = write_settings(claude, None)?;
-    report.briefing_changed = write_briefing(&content, claude, None)?;
+    let report = remove_bridge(&config.content_dir(), claude)?;
     describe(&report, false, log);
+    Ok(report)
+}
+
+/// Removes the bridge to the content directory `content`, and prints nothing.
+///
+/// `uninstall` calls this rather than [`unlink`]: it reads no settings, so it
+/// holds no [`Config`], and it reports the bridge together with the root.
+pub fn remove_bridge(content: &Path, claude: &Path) -> Result<Report> {
+    let mut report = Report::default();
+    unlink_skills(content, claude, &mut report)?;
+    report.settings_changed = write_settings(claude, None)?;
+    report.briefing_changed = write_briefing(content, claude, None)?;
     Ok(report)
 }
 
@@ -232,15 +250,15 @@ fn floor_char_boundary(text: &str, limit: usize) -> usize {
 /// running binary already is that copy, nothing is written, so `self-update`
 /// keeps working on the file the hook runs.
 fn install_program(config: &Config) -> Result<PathBuf> {
-    let target = installed_program(config);
+    let target = installed_program(config.root());
     let current = std::env::current_exe().context("cannot find this program's own path")?;
     copy_program(&current, &target)?;
     Ok(target)
 }
 
 /// The path the hook runs: `<root>/bin/brainmaker`.
-pub fn installed_program(config: &Config) -> PathBuf {
-    config.root().join("bin").join(program_name())
+pub fn installed_program(root: &Path) -> PathBuf {
+    root.join("bin").join(program_name())
 }
 
 /// Copies the binary at `from` to `to`, unless both name one file.
@@ -587,7 +605,7 @@ fn strip_block(text: &str) -> String {
 ///
 /// `installing` picks the verb, so an unlink does not report that it wrote the
 /// very things it removed.
-fn describe(report: &Report, installing: bool, log: &dyn Fn(&str)) {
+pub fn describe(report: &Report, installing: bool, log: &dyn Fn(&str)) {
     let verb = if installing { "Wrote" } else { "Removed" };
     for name in &report.linked {
         log(&format!("Linked the skill {name}."));
@@ -610,11 +628,7 @@ fn describe(report: &Report, installing: bool, log: &dyn Fn(&str)) {
     if report.briefing_changed {
         log(&format!("{verb} the shared-content block in CLAUDE.md."));
     }
-    if !report.settings_changed
-        && !report.briefing_changed
-        && report.linked.is_empty()
-        && report.removed.is_empty()
-    {
+    if !report.changed() {
         log("Nothing to change.");
     }
 }

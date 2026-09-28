@@ -31,15 +31,17 @@ mod selfupdate;
 mod signature;
 mod state;
 mod sync;
+mod uninstall;
 mod url;
 mod version;
 
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 use cli::{Action, Args, Command};
-use config::Config;
+use config::{Config, Layout};
 
 fn main() -> ExitCode {
     let action = match cli::parse(std::env::args().skip(1)) {
@@ -79,6 +81,12 @@ fn run(args: &Args) -> Result<()> {
         }
     };
 
+    // `uninstall` loads no settings: it must also run where the sealed store
+    // no longer opens, and an import would only write what it then removes.
+    if args.command == Command::Uninstall {
+        return uninstall(args, &log);
+    }
+
     let options = config::Options {
         root: args.dir.clone(),
         base_url: args.url.clone(),
@@ -105,6 +113,7 @@ fn run(args: &Args) -> Result<()> {
             link::unlink(&config, &claude, &log)?;
             Ok(())
         }
+        Command::Uninstall => unreachable!("uninstall returns before the settings load"),
         // The hook reads stdout as JSON, so this one prints past --quiet.
         Command::SessionContext => {
             println!("{}", link::session_context(&config)?);
@@ -219,6 +228,43 @@ fn status(config: &Config) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Removes brainmaker from this machine, once the user says yes.
+///
+/// The question prints past `--quiet`, because an answer needs its question.
+/// With no terminal to ask on, only `--yes` lets the command run.
+fn uninstall(args: &Args, log: &dyn Fn(&str)) -> Result<()> {
+    let layout = Layout::resolve(args.dir.as_deref())?;
+    let claude = match args.claude_dir.clone() {
+        Some(path) => path,
+        None => link::claude_dir()?,
+    };
+
+    if !args.yes {
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            bail!(
+                "uninstall asks before it removes anything, and stdin is not a terminal; \
+                 pass --yes to remove without asking"
+            );
+        }
+        print!("{}", uninstall::question(layout.root(), &claude));
+        std::io::stdout()
+            .flush()
+            .context("cannot print the question")?;
+        let mut answer = String::new();
+        stdin
+            .read_line(&mut answer)
+            .context("cannot read the answer")?;
+        if !uninstall::is_yes(&answer) {
+            log("Nothing was removed.");
+            return Ok(());
+        }
+    }
+
+    uninstall::uninstall(&layout, &claude, log)?;
     Ok(())
 }
 
