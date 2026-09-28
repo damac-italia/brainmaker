@@ -512,9 +512,9 @@ pair resolves in one review.
 <summary>Directory layout</summary>
 
 ```text
-src/                     the crate, one module per concern (17 files)
+src/                     the crate, one module per concern
 tools/                   sign.rs, the signing tool; builds only under the sign feature
-scripts/                 make-manifest.sh, which writes the software manifest
+scripts/                 make-manifest.sh, which writes the software manifest; check.sh, which runs the CI checks
 .github/workflows/       release.yml, plus the test and dependency-review checks
 build.rs                 declares the BRAINMAKER_CONFIG_KEY rebuild dependency
 docs/                    architecture, flow, API, and security documents
@@ -526,15 +526,14 @@ Module roles are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Contributing
 
 ```bash
-cargo test
-cargo clippy --all-targets --features sign
-cargo fmt --check
+scripts/check.sh
 ```
 
-The test suite is 161 unit tests in `#[cfg(test)]` modules beside the code they cover. Pass
-`--features sign` to clippy so that the signing tool is linted too; a plain `cargo build` skips it.
-The `test` workflow runs all three commands, and it fails on an unformatted file and on a clippy
-warning, so running them locally first saves a round trip.
+The script runs `cargo fmt`, `cargo clippy`, and `cargo test` with the arguments that the `test`
+workflow uses. The unit tests are in `#[cfg(test)]` modules beside the code that they cover. The
+clippy command and the test command both have `--features sign`, so that the signing tool is covered
+too. A plain `cargo build` skips that tool. The workflow fails on an unformatted file and on a
+clippy warning. [AGENTS.md](AGENTS.md) holds the rules of the repository.
 
 A local `cargo build` uses the development key, so a locally built binary cannot open a store
 written by a release build, and the reverse also holds. That is the key binding working. Reimport
