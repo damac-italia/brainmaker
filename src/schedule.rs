@@ -352,6 +352,32 @@ fn render_task(prefix: &str, log: &Path, user: &str) -> String {
     )
 }
 
+/// Returns the tail of `text` that fits in `keep` bytes and starts at the
+/// beginning of a line.
+///
+/// The cut never falls inside a character, and never inside a line: a log
+/// that starts with half a line reads as a fault.
+///
+/// `docs/design/status-and-agent-health.md` explains the rules. When the start
+/// lands on the first byte of a line, the function still skips that line, so
+/// the result can be one line shorter than `keep` allows. Only the tests call
+/// this function, so it carries `cfg(test)`. The build that follows removes
+/// that attribute.
+#[cfg(test)]
+fn tail_of(text: &str, keep: usize) -> &str {
+    if text.len() <= keep {
+        return text;
+    }
+    let mut start = text.len() - keep;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    match text[start..].find('\n') {
+        Some(offset) => &text[start + offset + 1..],
+        None => "",
+    }
+}
+
 /// Runs `launchctl <verb> gui/<uid> <plist>` for the account that owns the
 /// property list, which is the account this program runs as, since it just
 /// wrote the file or found it in its own home directory.
@@ -738,5 +764,83 @@ mod tests {
             .and_then(|rest| rest.split("</Arguments>").next())
             .expect(&text);
         assert!(!arguments.contains(['<', '>']), "{arguments}");
+    }
+
+    #[test]
+    fn keeps_a_log_that_fits() {
+        let log = "one\ntwo\nthree\n";
+        assert_eq!(tail_of(log, log.len()), log);
+        assert_eq!(tail_of(log, log.len() + 100), log);
+        // A log with no line break is a log too, and it fits.
+        assert_eq!(tail_of("no break", 8), "no break");
+        assert_eq!(tail_of("", 0), "");
+        assert_eq!(tail_of("", 10), "");
+    }
+
+    #[test]
+    fn cuts_a_log_at_the_start_of_a_line() {
+        // Twenty lines of ten bytes each.
+        let log: String = (0..20).map(|n| format!("run {n:02} ok\n")).collect();
+        assert_eq!(log.len(), 200);
+
+        // Whatever the size, the result is the end of the log, it fits, and it
+        // starts directly after a line break of the log.
+        for keep in 0..=log.len() + 1 {
+            let tail = tail_of(&log, keep);
+            assert!(log.ends_with(tail), "keep {keep}: {tail:?} is not the end");
+            assert!(tail.len() <= keep, "keep {keep}: {tail:?} is too long");
+            let start = log.len() - tail.len();
+            assert!(
+                tail.is_empty() || start == 0 || log.as_bytes()[start - 1] == b'\n',
+                "keep {keep}: {tail:?} starts inside a line"
+            );
+            assert!(
+                tail.is_empty() || tail.starts_with("run "),
+                "keep {keep}: {tail:?} holds half a line"
+            );
+        }
+
+        // The first candidate byte is 175, inside line 17, so the cut moves on
+        // to the start of line 18.
+        assert_eq!(tail_of(&log, 25), "run 18 ok\nrun 19 ok\n");
+        // The first candidate byte is 170, the first byte of line 17. The rule
+        // still skips that line, so the result is shorter than `keep` allows.
+        assert_eq!(tail_of(&log, 30), "run 18 ok\nrun 19 ok\n");
+    }
+
+    #[test]
+    fn cuts_a_multi_byte_log_without_a_panic() {
+        // "é" takes two bytes, so each line takes three. A `keep` of 3n + 2
+        // puts the first candidate byte between the two bytes of an "é".
+        let log = "é\n".repeat(1000);
+        assert_eq!(log.len(), 3000);
+
+        for keep in 0..=log.len() + 1 {
+            let tail = tail_of(&log, keep);
+            assert!(log.ends_with(tail), "keep {keep}: not the end of the log");
+            assert!(tail.len() <= keep, "keep {keep}: {} bytes", tail.len());
+            assert!(
+                tail.is_empty() || tail.starts_with("é\n"),
+                "keep {keep}: the tail starts inside a line"
+            );
+            assert_eq!(tail.len() % 3, 0, "keep {keep}: half a line");
+        }
+
+        // 1001 is odd, and the first candidate byte is 1999, the second byte of
+        // an "é". The cut moves on to byte 2000, then to the start of the next
+        // line, which is byte 2001.
+        let tail = tail_of(&log, 1001);
+        assert_eq!(tail.len(), 999);
+        assert!(tail.starts_with("é\n"));
+    }
+
+    #[test]
+    fn returns_nothing_when_the_tail_holds_no_line_break() {
+        let log = "x".repeat(5000);
+        assert_eq!(tail_of(&log, 100), "");
+
+        // A line break that ends the log leaves nothing after it.
+        let log = format!("{}\n", "x".repeat(5000));
+        assert_eq!(tail_of(&log, 100), "");
     }
 }
