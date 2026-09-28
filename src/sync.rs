@@ -721,7 +721,9 @@ mod tests {
         // The other run, as the operating system sees it: an exclusive lock on
         // the lock file. The server now publishes the second release.
         let newer = Config::for_test(&dir, &new_server.base());
-        let held = lock::acquire(&config.lock_file(), Duration::ZERO)
+        // Another test in this binary can spawn a child process that holds a copy of the lock file
+        // until it runs `exec`, so the test waits for the lock and does not demand it at once.
+        let held = lock::acquire(&config.lock_file(), Duration::from_secs(5))
             .unwrap()
             .expect("nothing else holds the lock");
         let outcome = sync(&newer, false, &quiet).unwrap();
