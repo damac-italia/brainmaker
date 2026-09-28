@@ -126,11 +126,17 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
         return Ok(Outcome::UpToDate { hash: remote_hash });
     }
     if !force && current.as_ref().map(|s| s.hash.as_str()) != Some(remote_hash.as_str()) {
-        check_order(current.and_then(|s| s.sequence), release.sequence)?;
+        check_order(current.as_ref().and_then(|s| s.sequence), release.sequence)?;
     }
 
+    // A reinstall of the installed hash never lowers the recorded sequence.
+    let sequence = match &current {
+        Some(held) if held.hash == remote_hash => held.sequence.max(release.sequence),
+        _ => release.sequence,
+    };
+
     log(&format!("Downloading content-{remote_hash}.zip"));
-    install(config, &release, log).map(|stats| Outcome::Updated {
+    install(config, &release, sequence, log).map(|stats| Outcome::Updated {
         previous: installed,
         hash: remote_hash,
         stats,
@@ -161,9 +167,12 @@ fn check_order(installed: Option<u64>, offered: Option<u64>) -> Result<()> {
 }
 
 /// Downloads one release and replaces `content/` with it.
+///
+/// The state file then records `sequence`, which the caller has chosen.
 fn install(
     config: &Config,
     release: &remote::ContentRelease,
+    sequence: Option<u64>,
     log: &dyn Fn(&str),
 ) -> Result<archive::Stats> {
     let hash = release.hash.as_str();
@@ -219,11 +228,8 @@ fn install(
 
     let stats = result?;
 
-    state::write(
-        &config.state_file(),
-        &State::with_sequence(hash, release.sequence),
-    )
-    .context("the content was installed, but the state file could not be written")?;
+    state::write(&config.state_file(), &State::with_sequence(hash, sequence))
+        .context("the content was installed, but the state file could not be written")?;
 
     Ok(stats)
 }
@@ -1025,6 +1031,38 @@ mod tests {
             state::read(&config.state_file()).unwrap().sequence,
             Some(200)
         );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reinstall_of_the_same_hash_keeps_the_higher_sequence() {
+        let signer = Signer::new();
+        signer.trust();
+        let archive = testutil::zip_of(&[("notes.md", b"# release one")]);
+        // The signer signed one archive twice, and the server now serves the
+        // earlier signature, while the installed content is gone.
+        let later = Server::start(sequenced(&signer, "a1b2c3d4", &archive, 200));
+        let earlier = Server::start(sequenced(&signer, "a1b2c3d4", &archive, 100));
+        let dir = testutil::temp_dir("sync-reinstall-sequence");
+        let config = Config::for_test(&dir, &later.base());
+        sync(&config, false, &quiet).unwrap();
+        fs::remove_dir_all(config.content_dir()).unwrap();
+
+        let replayed = Config::for_test(&dir, &earlier.base());
+        let outcome = sync(&replayed, false, &quiet).unwrap();
+
+        match outcome {
+            Outcome::Updated { previous, hash, .. } => {
+                assert_eq!(previous, Some("a1b2c3d4".to_string()));
+                assert_eq!(hash, "a1b2c3d4");
+            }
+            other => panic!("expected the content to be installed again, got {other:?}"),
+        }
+        assert!(config.content_dir().join("notes.md").is_file());
+        let kept = state::read(&config.state_file()).unwrap();
+        assert_eq!(kept.hash, "a1b2c3d4");
+        assert_eq!(kept.sequence, Some(200));
 
         fs::remove_dir_all(&dir).unwrap();
     }
