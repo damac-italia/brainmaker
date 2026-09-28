@@ -667,6 +667,20 @@ impl Config {
             source: Source::Stored,
         }
     }
+
+    /// The same, with client credentials for a token endpoint.
+    pub fn for_test_with_credentials(root: &Path, base_url: &str, jwt_endpoint: &str) -> Self {
+        let mut config = Self::for_test(root, base_url);
+        config.credentials = Some(
+            Credentials::new(
+                jwt_endpoint.to_string(),
+                "the-client-id".to_string(),
+                "the-client-secret".to_string(),
+            )
+            .expect("the test credentials are usable"),
+        );
+        config
+    }
 }
 
 #[cfg(test)]
