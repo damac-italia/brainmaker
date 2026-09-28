@@ -45,6 +45,15 @@ use sha2::{Digest, Sha256};
 /// never touches the runner's disk.
 const KEY_ENV: &str = "BRAINMAKER_SIGNING_KEY";
 
+/// Length of a content hash. The client holds the same value as HASH_LEN
+/// in src/config.rs, and a test below fails when the two differ.
+const HASH_LEN: usize = 8;
+
+/// Largest archive that the client installs. The client holds the same
+/// value as MAX_ARCHIVE_BYTES in src/config.rs, and a test below fails
+/// when the two differ.
+const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+
 const HELP: &str = "\
 brainmaker-sign — generate a signing key, and sign what brainmaker installs
 
@@ -217,6 +226,13 @@ fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> 
     if bytes.is_empty() {
         bail!("{} is empty", archive.display());
     }
+    if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+        bail!(
+            "{} is {} bytes, past the limit of {MAX_ARCHIVE_BYTES} that every client applies",
+            archive.display(),
+            bytes.len()
+        );
+    }
 
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
@@ -258,7 +274,7 @@ fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> 
 /// Eight alphanumeric ASCII characters, which is what synapsis derives from
 /// the first 8 characters of the archive digest.
 fn check_hash(hash: &str) -> Result<()> {
-    if hash.len() != 8 || !hash.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if hash.len() != HASH_LEN || !hash.chars().all(|c| c.is_ascii_alphanumeric()) {
         bail!("the hash {hash:?} is not 8 alphanumeric ASCII characters");
     }
     Ok(())
@@ -329,7 +345,6 @@ fn load_key(key: &str) -> Result<Ed25519KeyPair> {
         .map_err(|error| anyhow::anyhow!("the signing key is not a PKCS#8 Ed25519 key: {error}"))
 }
 
-/// Fails when the manifest is not the shape brainmaker reads.
 /// Names the shape of a signed payload, or fails when it is neither shape.
 ///
 /// One envelope carries a software manifest, and another carries a content
@@ -380,6 +395,12 @@ fn check_content(text: &str) -> Result<()> {
     if size == 0 {
         bail!("the content release claims a size of 0 bytes");
     }
+    if size > MAX_ARCHIVE_BYTES {
+        bail!(
+            "the content release claims {size} bytes, past the limit of \
+             {MAX_ARCHIVE_BYTES} that every client applies"
+        );
+    }
 
     // The client derives the download address from its own base URL, so a URL
     // here would be a URL the client ignores and an operator trusts.
@@ -389,6 +410,7 @@ fn check_content(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fails when the manifest is not the shape brainmaker reads.
 fn check_manifest(text: &str) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_str(text).context("the manifest is not valid JSON")?;
@@ -397,8 +419,11 @@ fn check_manifest(text: &str) -> Result<()> {
         .get("version")
         .and_then(serde_json::Value::as_str)
         .context("the manifest has no \"version\" string")?;
-    if version.is_empty() || version.len() > 64 {
-        bail!("the manifest version {version:?} is empty or longer than 64 characters");
+    if !usable_version(version) {
+        bail!(
+            "the manifest version {version:?} is not 1 to 64 characters of ASCII letters, \
+             digits, dots, hyphens, and plus signs, so every client would refuse it"
+        );
     }
 
     let platforms = value
@@ -422,6 +447,18 @@ fn check_manifest(text: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// True for a version string that the client accepts.
+///
+/// The same rule as `version::validate` in src/version.rs. A test below
+/// fails when the two disagree.
+fn usable_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
 }
 
 fn hex(bytes: &[u8]) -> String {
