@@ -34,10 +34,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
+use ring::digest::{SHA256, digest};
 use ring::rand::SystemRandom;
 use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// Environment variable that carries the PKCS#8 key as hexadecimal.
 ///
@@ -264,9 +264,7 @@ fn sign_content(
         );
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let sha256 = hex(&hasher.finalize());
+    let sha256 = hex(digest(&SHA256, &bytes).as_ref());
 
     // The signature covers these exact bytes, and the client checks them
     // before it parses them. The field order therefore only has to stay put
