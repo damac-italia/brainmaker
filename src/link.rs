@@ -143,7 +143,7 @@ pub fn link(
     let mut report = Report::default();
     link_skills(&content, claude, &mut report)?;
     let program = install_program(config)?;
-    let prefix = command_prefix(&program, Some(config.root()));
+    let prefix = command_prefix(&program, Some(config.root()))?;
     report.settings_changed = write_settings(claude, Some(&prefix))?;
     report.briefing_changed = write_briefing(&content, claude, Some(&prefix))?;
     if let Some(agents) = agents {
@@ -459,6 +459,31 @@ fn make_symlink(source: &Path, target: &Path) -> Result<()> {
     })
 }
 
+/// Writes `text` as one double-quoted shell word.
+///
+/// Inside double quotes a shell gives a meaning to four characters: `$`, the
+/// backtick, `"`, and `\`. Each one gets a backslash in front. Every other
+/// character is written as it stands, a non-ASCII one included, because the
+/// shell reads the bytes and not an escape.
+///
+/// A control character is refused. No quoting carries a line break through
+/// both a shell and a property list, and a path that holds one is a mistake.
+fn shell_quote(text: &str) -> Result<String> {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if c.is_control() {
+            bail!("the path {text:?} holds a control character, which a hook command cannot carry");
+        }
+        if matches!(c, '$' | '`' | '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    Ok(out)
+}
+
 /// The start of every command that names the installed binary: the full path,
 /// quoted, and the root it must use.
 ///
@@ -466,11 +491,16 @@ fn make_symlink(source: &Path, target: &Path) -> Result<()> {
 /// command must carry the whole path, and a home directory may hold a space.
 /// The root is named because without it the command takes the default root,
 /// which is the wrong one whenever `link` ran with `--dir`.
-pub fn command_prefix(program: &Path, root: Option<&Path>) -> String {
-    let exe = format!("{:?}", program.display().to_string());
+///
+/// The quoting follows the shell's rules; see `shell_quote`.
+pub fn command_prefix(program: &Path, root: Option<&Path>) -> Result<String> {
+    let exe = shell_quote(&program.display().to_string())?;
     match root {
-        Some(path) => format!("{exe} --dir {:?}", path.display().to_string()),
-        None => exe,
+        Some(path) => Ok(format!(
+            "{exe} --dir {}",
+            shell_quote(&path.display().to_string())?
+        )),
+        None => Ok(exe),
     }
 }
 
@@ -836,16 +866,75 @@ mod tests {
     #[test]
     fn the_command_prefix_quotes_the_path_and_names_the_root() {
         assert_eq!(
-            command_prefix(Path::new("/opt/bm/bin/brainmaker"), None),
+            command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap(),
             "\"/opt/bm/bin/brainmaker\""
         );
         assert_eq!(
             command_prefix(
                 Path::new("/My Apps/brainmaker"),
                 Some(Path::new("/My Root"))
-            ),
+            )
+            .unwrap(),
             "\"/My Apps/brainmaker\" --dir \"/My Root\""
         );
+    }
+
+    #[test]
+    fn escapes_the_characters_that_a_shell_expands() {
+        assert_eq!(shell_quote("/a$b").unwrap(), "\"/a\\$b\"");
+        assert_eq!(shell_quote("/a`b").unwrap(), "\"/a\\`b\"");
+        assert_eq!(shell_quote("/a\"b").unwrap(), "\"/a\\\"b\"");
+        assert_eq!(shell_quote("/a\\b").unwrap(), "\"/a\\\\b\"");
+    }
+
+    #[test]
+    fn writes_a_non_ascii_path_as_it_stands() {
+        // macOS stores a file name in decomposed form: `e`, then a combining
+        // accent. The `{:?}` formatter wrote that accent as the text `\u{301}`,
+        // which a shell does not read.
+        let quoted = shell_quote("/Users/rene\u{301}/root").unwrap();
+        assert!(quoted.contains('\u{301}'), "{quoted}");
+        assert!(!quoted.contains("\\u{"), "{quoted}");
+        assert_eq!(quoted, "\"/Users/rene\u{301}/root\"");
+    }
+
+    #[test]
+    fn keeps_a_single_quote_and_a_space() {
+        assert_eq!(shell_quote("/My App's/x").unwrap(), "\"/My App's/x\"");
+    }
+
+    #[test]
+    fn refuses_a_path_that_holds_a_line_break() {
+        assert!(shell_quote("/a\nb").is_err());
+        assert!(command_prefix(Path::new("/a\nb"), None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_reads_the_quoted_path_back() {
+        // The shell that runs the hook is the judge of the quoting, so run one.
+        // The backtick path would run `echo x` if the quoting let it through.
+        for path in [
+            "/a b",
+            "/a$HOME",
+            "/a`echo x`b",
+            "/a\"b",
+            "/a\\b",
+            "/rene\u{301}",
+        ] {
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", shell_quote(path).unwrap()))
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.stdout,
+                path.as_bytes(),
+                "the shell read {path:?} back as {:?}, stderr {:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
@@ -857,7 +946,8 @@ mod tests {
         let prefix = command_prefix(
             Path::new("/opt/bm/bin/brainmaker"),
             Some(Path::new("/opt/bm")),
-        );
+        )
+        .unwrap();
 
         write_briefing(&content, &claude, Some(&prefix)).unwrap();
         let text = fs::read_to_string(claude.join("CLAUDE.md")).unwrap();
@@ -973,14 +1063,14 @@ mod tests {
         assert!(
             write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap()
         );
         assert!(
             !write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap(),
             "second run is a no-op"
@@ -1009,7 +1099,7 @@ mod tests {
         let base = temp_dir("settings-shared-group");
         let claude = base.join("claude");
         let path = claude.join("settings.json");
-        let prefix = command_prefix(Path::new("/opt/bm/bin/brainmaker"), None);
+        let prefix = command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap();
         assert!(write_settings(&claude, Some(&prefix)).unwrap());
 
         let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -1052,7 +1142,7 @@ mod tests {
         let claude = base.join("claude");
         let program = base.join("bin").join("brainmaker");
 
-        write_settings(&claude, Some(&command_prefix(&program, None))).unwrap();
+        write_settings(&claude, Some(&command_prefix(&program, None).unwrap())).unwrap();
         let text = fs::read_to_string(claude.join("settings.json")).unwrap();
 
         assert!(text.contains(program.display().to_string().as_str()));
@@ -1069,7 +1159,7 @@ mod tests {
         let claude = base.join("claude");
         let program = base.join("My Apps").join("brainmaker");
 
-        write_settings(&claude, Some(&command_prefix(&program, None))).unwrap();
+        write_settings(&claude, Some(&command_prefix(&program, None).unwrap())).unwrap();
         let value: Value =
             serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
                 .unwrap();
@@ -1089,7 +1179,7 @@ mod tests {
         assert!(
             write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap()
         );
@@ -1175,7 +1265,7 @@ mod tests {
         assert!(
             write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap()
         );
@@ -1205,7 +1295,7 @@ mod tests {
         assert!(
             write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap()
         );
@@ -1241,7 +1331,7 @@ mod tests {
         assert!(
             write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap()
         );
@@ -1277,7 +1367,7 @@ mod tests {
         assert!(
             write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap()
         );
@@ -1313,7 +1403,7 @@ mod tests {
         assert!(
             write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap()
         );
