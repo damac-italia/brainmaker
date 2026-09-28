@@ -58,6 +58,13 @@ const DEFAULT_LIFETIME: Duration = Duration::from_secs(600);
 /// arrive with a token that the server has already rejected.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(30);
 
+/// Longest lifetime we accept from the server.
+///
+/// The value reaches us from the network and is added to a clock reading. One
+/// hour is six times what the server issues, and it keeps that sum far from an
+/// overflow.
+const MAX_LIFETIME: Duration = Duration::from_secs(3600);
+
 /// Longest token we accept. A token longer than this is a server fault.
 const MAX_TOKEN_LEN: usize = 8192;
 
@@ -110,11 +117,17 @@ impl TokenCache {
     }
 
     /// Replaces the cached token.
+    ///
+    /// A lifetime that the clock cannot hold stores nothing, so the next
+    /// request asks for a new token.
     fn put(&self, token: &str, lifetime: Duration) {
+        let Some(usable_until) = Instant::now().checked_add(lifetime) else {
+            return;
+        };
         if let Ok(mut guard) = self.inner.lock() {
             *guard = Some(Cached {
                 token: token.to_string(),
-                usable_until: Instant::now() + lifetime,
+                usable_until,
             });
         }
     }
@@ -139,10 +152,24 @@ pub fn bearer(config: &Config) -> Result<Option<String>> {
     Ok(Some(token))
 }
 
+/// Returns the time for which this client uses a token.
+///
+/// `expires_in` is the server's own value, in seconds. The result is never
+/// longer than [`MAX_LIFETIME`], and it is [`EXPIRY_MARGIN`] shorter than the
+/// bounded value.
+fn usable_lifetime(expires_in: Option<u64>) -> Duration {
+    expires_in
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_LIFETIME)
+        .min(MAX_LIFETIME)
+        .saturating_sub(EXPIRY_MARGIN)
+}
+
 /// Exchanges the client credentials for a token.
 ///
-/// Returns the token and the time for which this client will use it, which is
-/// [`EXPIRY_MARGIN`] shorter than the server's own lifetime.
+/// Returns the token and the time for which this client will use it. That time
+/// comes from [`usable_lifetime`]: the server's value, cut to at most
+/// [`MAX_LIFETIME`], less [`EXPIRY_MARGIN`].
 fn request_token(credentials: &Credentials, url: &str) -> Result<(String, Duration)> {
     let agent = remote::build_agent(remote::TEXT_TIMEOUT);
 
@@ -179,11 +206,7 @@ fn request_token(credentials: &Credentials, url: &str) -> Result<(String, Durati
     let token = parsed.access_token;
     check_token(&token)?;
 
-    let lifetime = parsed
-        .expires_in
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_LIFETIME)
-        .saturating_sub(EXPIRY_MARGIN);
+    let lifetime = usable_lifetime(parsed.expires_in);
 
     Ok((token, lifetime))
 }
@@ -340,6 +363,28 @@ mod tests {
         let shown = format!("{cache:?}");
         assert!(!shown.contains("super-secret-value"), "got {shown}");
         assert_eq!(shown, "TokenCache(held)");
+    }
+
+    #[test]
+    fn bounds_the_lifetime_that_the_server_names() {
+        assert_eq!(
+            usable_lifetime(Some(u64::MAX)),
+            MAX_LIFETIME - EXPIRY_MARGIN
+        );
+        assert_eq!(
+            usable_lifetime(Some(600)),
+            Duration::from_secs(600) - EXPIRY_MARGIN
+        );
+        assert_eq!(usable_lifetime(None), DEFAULT_LIFETIME - EXPIRY_MARGIN);
+        // A lifetime shorter than the margin is zero, not negative.
+        assert_eq!(usable_lifetime(Some(5)), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_lifetime_the_clock_cannot_hold_caches_nothing() {
+        let cache = TokenCache::default();
+        cache.put("token", Duration::MAX);
+        assert!(cache.get().is_none());
     }
 
     #[test]
