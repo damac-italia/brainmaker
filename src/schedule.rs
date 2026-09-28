@@ -64,7 +64,7 @@ impl Agents {
         if !cfg!(target_os = "macos") || custom_claude {
             return Ok(None);
         }
-        let home = dirs::home_dir().context("cannot find the home directory")?;
+        let home = std::env::home_dir().context("cannot find the home directory")?;
         Ok(Some(Self {
             dir: home.join("Library").join("LaunchAgents"),
             load: true,

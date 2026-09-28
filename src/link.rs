@@ -121,7 +121,7 @@ impl Report {
 
 /// The Claude configuration directory, `~/.claude`.
 pub fn claude_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot find the home directory")?;
+    let home = std::env::home_dir().context("cannot find the home directory")?;
     Ok(home.join(".claude"))
 }
 

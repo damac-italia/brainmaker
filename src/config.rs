@@ -259,7 +259,7 @@ impl Layout {
     pub fn resolve(dir: Option<&Path>) -> Result<Self> {
         let root = match dir {
             Some(path) => absolute(path)?,
-            None => dirs::home_dir()
+            None => std::env::home_dir()
                 .context("cannot locate the home directory")?
                 .join(".brainmaker"),
         };

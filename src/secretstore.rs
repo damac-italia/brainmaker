@@ -210,7 +210,7 @@ fn machine_identity() -> (String, Binding) {
         }
     }
 
-    dirs::home_dir()
+    std::env::home_dir()
         .map(|p| (format!("home:{}", p.display()), Binding::HomePath))
         .unwrap_or_else(|| ("brainmaker:no-machine-id".to_string(), Binding::None))
 }
