@@ -474,22 +474,93 @@ pub fn command_prefix(program: &Path, root: Option<&Path>) -> String {
     }
 }
 
+/// Reads the text of `path`, or `None` when no file is there.
+///
+/// Any other failure is an error. A file that exists but cannot be read must
+/// never count as empty: the caller would then write over text it never saw.
+fn read_if_present(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "cannot read {} as text, so it stays as it is",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// Follows the symbolic links at `path` to the first path that is not one.
+///
+/// The file at the end may be missing. A link to a file that does not exist
+/// yet still names where that file goes, and `fs::canonicalize` fails on it.
+/// A chain that never ends, such as a loop of links, is an error.
+fn link_target(path: &Path) -> Result<PathBuf> {
+    const MAX_LINKS: usize = 40;
+
+    let mut current = path.to_path_buf();
+    let mut followed = 0;
+    while fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        followed += 1;
+        if followed > MAX_LINKS {
+            bail!(
+                "{} passes through more than {MAX_LINKS} symbolic links",
+                path.display()
+            );
+        }
+        let link = fs::read_link(&current)
+            .with_context(|| format!("cannot read the link {}", current.display()))?;
+        current = match current.parent() {
+            Some(parent) => parent.join(link),
+            None => link,
+        };
+    }
+    Ok(current)
+}
+
+/// Replaces `path` with `text` through a temporary file and a rename, so that
+/// a run that stops part-way leaves the previous file whole.
+///
+/// When `path` is a symbolic link, the file it names is replaced and the link
+/// stays, which is what a plain write did. The mode of an existing file is
+/// kept.
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    // Replace the file a link names, so that the link itself stays.
+    let target = link_target(path)?;
+    let parent = target
+        .parent()
+        .with_context(|| format!("{} has no parent directory", target.display()))?;
+    let name = target
+        .file_name()
+        .with_context(|| format!("{} has no file name", target.display()))?
+        .to_string_lossy();
+    let staged = parent.join(format!(".{name}.brainmaker-{}.tmp", std::process::id()));
+
+    let result = (|| -> Result<()> {
+        fs::write(&staged, text).with_context(|| format!("cannot write {}", staged.display()))?;
+        if let Ok(meta) = fs::metadata(&target) {
+            fs::set_permissions(&staged, meta.permissions())
+                .with_context(|| format!("cannot set the mode on {}", staged.display()))?;
+        }
+        fs::rename(&staged, &target)
+            .with_context(|| format!("cannot move {} to {}", staged.display(), target.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
+}
+
 /// Adds or removes the `SessionStart` hook. Returns true when the file changed.
 ///
 /// `prefix` is the [`command_prefix`] to install, or `None` to remove the hook.
 fn write_settings(claude: &Path, prefix: Option<&str>) -> Result<bool> {
     let path = claude.join("settings.json");
-    let mut root: Map<String, Value> = if path.is_file() {
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-        if text.trim().is_empty() {
-            Map::new()
-        } else {
-            serde_json::from_str(&text)
-                .with_context(|| format!("{} is not a JSON object", path.display()))?
-        }
-    } else {
-        Map::new()
+    let mut root: Map<String, Value> = match read_if_present(&path)? {
+        Some(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+            .with_context(|| format!("{} is not a JSON object", path.display()))?,
+        _ => Map::new(),
     };
     let before = root.clone();
 
@@ -548,8 +619,7 @@ fn write_settings(claude: &Path, prefix: Option<&str>) -> Result<bool> {
 
     fs::create_dir_all(claude).with_context(|| format!("cannot create {}", claude.display()))?;
     let text = serde_json::to_string_pretty(&Value::Object(root))?;
-    fs::write(&path, format!("{text}\n"))
-        .with_context(|| format!("cannot write {}", path.display()))?;
+    write_atomic(&path, &format!("{text}\n"))?;
     Ok(true)
 }
 
@@ -574,7 +644,7 @@ fn is_ours(group: &Value) -> bool {
 /// bare `brainmaker unlink` fails: nothing puts the binary on `PATH`.
 fn write_briefing(content: &Path, claude: &Path, prefix: Option<&str>) -> Result<bool> {
     let path = claude.join("CLAUDE.md");
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let existing = read_if_present(&path)?.unwrap_or_default();
     let stripped = strip_block(&existing);
 
     let updated = if let Some(prefix) = prefix {
@@ -610,7 +680,7 @@ fn write_briefing(content: &Path, claude: &Path, prefix: Option<&str>) -> Result
         fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
         return Ok(true);
     }
-    fs::write(&path, updated).with_context(|| format!("cannot write {}", path.display()))?;
+    write_atomic(&path, &updated)?;
     Ok(true)
 }
 
@@ -1006,6 +1076,190 @@ mod tests {
         assert!(claude.join("CLAUDE.md").is_file());
         assert!(write_briefing(&content, &claude, None).unwrap());
         assert!(!claude.join("CLAUDE.md").exists());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn refuses_a_briefing_that_is_not_text() {
+        // One invalid byte used to read as an empty file, and `link` then wrote
+        // its block over everything the user had kept in `CLAUDE.md`.
+        let base = temp_dir("briefing-not-text");
+        let content = base.join("content");
+        let claude = base.join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        let bytes: &[u8] = b"# Mine\n\xff\xfe\n";
+        fs::write(claude.join("CLAUDE.md"), bytes).unwrap();
+
+        let result = write_briefing(&content, &claude, Some("\"/opt/bm/bin/brainmaker\""));
+
+        assert!(
+            result.is_err(),
+            "a briefing that cannot be read is an error"
+        );
+        assert_eq!(fs::read(claude.join("CLAUDE.md")).unwrap(), bytes);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn keeps_the_key_order_of_the_settings() {
+        // Without `preserve_order` every object came back sorted by key, which
+        // turned a hand-ordered file into one large diff.
+        let base = temp_dir("settings-order");
+        let claude = base.join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        write(
+            &claude.join("settings.json"),
+            r#"{"zeta": 1, "model": "opus", "alpha": {"b": 1, "a": 2}}"#,
+        );
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+            )
+            .unwrap()
+        );
+
+        let text = fs::read_to_string(claude.join("settings.json")).unwrap();
+        let at = |key: &str| {
+            text.find(key)
+                .unwrap_or_else(|| panic!("{key} is missing from {text}"))
+        };
+        assert!(
+            at("\"zeta\"") < at("\"model\""),
+            "top level reordered: {text}"
+        );
+        assert!(
+            at("\"model\"") < at("\"alpha\""),
+            "top level reordered: {text}"
+        );
+        assert!(at("\"b\"") < at("\"a\""), "nested keys reordered: {text}");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn leaves_no_temporary_file_beside_the_settings() {
+        let base = temp_dir("settings-temp");
+        let claude = base.join("claude");
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+            )
+            .unwrap()
+        );
+
+        let names: Vec<String> = fs::read_dir(&claude)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"settings.json".to_string()),
+            "got {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".brainmaker-")),
+            "a temporary file was left behind: {names:?}"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_through_a_link_and_keeps_the_link() {
+        // A dotfiles manager keeps the real file elsewhere and links it in.
+        // Renaming over the link would swap it for a regular file.
+        let base = temp_dir("settings-link");
+        let claude = base.join("claude");
+        let real = base.join("dotfiles").join("settings.json");
+        write(&real, r#"{"model": "opus"}"#);
+        fs::create_dir_all(&claude).unwrap();
+        let link = claude.join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+            )
+            .unwrap()
+        );
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a regular file"
+        );
+        let text = fs::read_to_string(&real).unwrap();
+        assert!(
+            text.contains("brainmaker-link"),
+            "the file behind the link was not written: {text}"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_through_a_dangling_link_and_keeps_the_link() {
+        // The file behind the link is not there yet, and a plain write would
+        // have created it. The target is relative, as a dotfiles script makes it.
+        let base = temp_dir("settings-dangling");
+        let claude = base.join("claude");
+        let dotfiles = base.join("dotfiles");
+        fs::create_dir_all(&claude).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+        let link = claude.join("settings.json");
+        std::os::unix::fs::symlink("../dotfiles/settings.json", &link).unwrap();
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+            )
+            .unwrap()
+        );
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a regular file"
+        );
+        let real = dotfiles.join("settings.json");
+        assert!(real.is_file(), "the file behind the link was not created");
+        let text = fs::read_to_string(&real).unwrap();
+        assert!(
+            text.contains("brainmaker-link"),
+            "the file behind the link was not written: {text}"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_the_mode_of_the_settings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = temp_dir("settings-mode");
+        let claude = base.join("claude");
+        let path = claude.join("settings.json");
+        write(&path, r#"{"model": "opus"}"#);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+            )
+            .unwrap()
+        );
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
         fs::remove_dir_all(&base).ok();
     }
 
