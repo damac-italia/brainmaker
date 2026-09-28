@@ -553,7 +553,7 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
 General Public License for more details.
 
-Every one of the 77 crates in `Cargo.lock` carries a permissive license that GPL-3 accepts: MIT,
+Every one of the 58 crates in `Cargo.lock` carries a permissive license that GPL-3 accepts: MIT,
 Apache-2.0, ISC, BSD-3-Clause, 0BSD, Zlib, Unlicense, Unicode-3.0, CDLA-Permissive-2.0, or MPL-2.0
 without an Exhibit B notice. List them with:
 

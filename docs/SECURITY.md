@@ -328,12 +328,10 @@ truncated. The caps are constants in [`src/config.rs`](../src/config.rs).
 | Crate | Requirement | Role |
 |---|---|---|
 | `anyhow` | 1.0.104 | Error context |
-| `dirs` | 7.0.0 | Home directory lookup |
-| `ring` | 0.17 | AES-256-GCM, HKDF-SHA256, and Ed25519 verification |
+| `ring` | 0.17 | AES-256-GCM, HKDF-SHA256, SHA-256, and Ed25519 verification |
 | `serde`, `serde_json` | 1.0.229, 1.0.151 | Manifest and state parsing |
-| `sha2` | 0.11.0 | Download checksum |
 | `ureq` | 3.3.0 | HTTP client |
-| `zip` | 8.6.0 | Archive extraction, `deflate` only, default features off |
+| `zip` | 8.6.0 | Archive extraction, `deflate-flate2-zlib-rs` only, which reads and does not build a second compressor, default features off |
 
 The requirement column is the one in `Cargo.toml`. The release workflow runs
 `cargo build --release --locked`, so a release builds the versions in the committed `Cargo.lock`,
