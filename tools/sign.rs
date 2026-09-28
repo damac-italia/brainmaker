@@ -60,7 +60,7 @@ brainmaker-sign — generate a signing key, and sign what brainmaker installs
 USAGE:
     brainmaker-sign keygen <KEY-FILE>
     brainmaker-sign sign <KEY-FILE|-> <MANIFEST-FILE> <ENVELOPE-FILE>
-    brainmaker-sign sign-content <KEY-FILE|-> <ARCHIVE> <HASH> <ENVELOPE-FILE>
+    brainmaker-sign sign-content <KEY-FILE|-> <ARCHIVE> <HASH> <ENVELOPE-FILE> [SEQUENCE]
     brainmaker-sign verify <ENVELOPE-FILE> <PUBLIC-KEY>...
 
 COMMANDS:
@@ -68,7 +68,10 @@ COMMANDS:
     sign          Wrap a software manifest and its signature into the envelope
                   that brainmaker downloads
     sign-content  Digest a content archive and sign the result, giving the
-                  envelope that {base}/content/latest returns
+                  envelope that {base}/content/latest returns. The payload
+                  carries a sequence, which is the time of signing unless
+                  SEQUENCE names one. A client installs only a release with
+                  a higher sequence than the one it holds.
     verify        Check an envelope against one or more public keys, the way
                   brainmaker checks it. Run this before you publish.
 
@@ -109,8 +112,15 @@ fn run(args: &[&str]) -> Result<()> {
         ["keygen", key_file] => keygen(Path::new(key_file)),
         ["sign", key, manifest, envelope] => sign(key, Path::new(manifest), Path::new(envelope)),
         ["sign-content", key, archive, hash, envelope] => {
-            sign_content(key, Path::new(archive), hash, Path::new(envelope))
+            sign_content(key, Path::new(archive), hash, Path::new(envelope), None)
         }
+        ["sign-content", key, archive, hash, envelope, sequence] => sign_content(
+            key,
+            Path::new(archive),
+            hash,
+            Path::new(envelope),
+            Some(sequence),
+        ),
         ["verify", envelope, keys @ ..] if !keys.is_empty() => verify(Path::new(envelope), keys),
         _ => bail!("unknown arguments; run brainmaker-sign --help"),
     }
@@ -213,14 +223,34 @@ fn sign(key: &str, manifest_file: &Path, envelope_file: &Path) -> Result<()> {
 
 /// Digests `archive` and signs a content release that describes it.
 ///
-/// The signed payload carries the hash, the digest, and the size, and no URL.
-/// The client derives the download address from its own base URL, so a signed
-/// release cannot move the download to another host — the rule the software
-/// manifest already follows.
-fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> Result<()> {
+/// The signed payload carries the hash, the digest, the size, and a sequence,
+/// and no URL. The client derives the download address from its own base URL,
+/// so a signed release cannot move the download to another host — the rule the
+/// software manifest already follows.
+///
+/// The sequence orders the releases, and a client installs a release only when
+/// its sequence is higher than the one it holds. `sequence` names one. With
+/// `None`, the sequence is the time of signing in seconds since the Unix epoch,
+/// so a release signed later always carries a higher value.
+fn sign_content(
+    key: &str,
+    archive: &Path,
+    hash: &str,
+    envelope_file: &Path,
+    sequence: Option<&str>,
+) -> Result<()> {
     let pair = load_key(key)?;
 
     check_hash(hash)?;
+    let sequence: u64 = match sequence {
+        Some(text) => text
+            .parse()
+            .map_err(|_| anyhow::anyhow!("the sequence {text:?} is not a whole number"))?,
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| anyhow::anyhow!("the clock reads a time before 1970"))?
+            .as_secs(),
+    };
     let bytes =
         std::fs::read(archive).with_context(|| format!("cannot read {}", archive.display()))?;
     if bytes.is_empty() {
@@ -245,6 +275,7 @@ fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> 
         "hash": hash,
         "sha256": sha256,
         "size_bytes": bytes.len(),
+        "sequence": sequence,
     }))
     .context("cannot write the content release")?;
 
@@ -258,7 +289,7 @@ fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> 
         .with_context(|| format!("cannot write {}", envelope_file.display()))?;
 
     println!(
-        "Signed {} ({} bytes, sha256 {sha256}) into {}.",
+        "Signed {} ({} bytes, sha256 {sha256}, sequence {sequence}) into {}.",
         archive.display(),
         bytes.len(),
         envelope_file.display()
@@ -400,6 +431,16 @@ fn check_content(text: &str) -> Result<()> {
             "the content release claims {size} bytes, past the limit of \
              {MAX_ARCHIVE_BYTES} that every client applies"
         );
+    }
+
+    // The sequence is optional, because a client accepts a release from a
+    // signer that wrote none. When it is there, it must be a whole number,
+    // because a client refuses a payload with a sequence that it cannot read.
+    if value
+        .get("sequence")
+        .is_some_and(|sequence| sequence.as_u64().is_none())
+    {
+        bail!("the content release carries a \"sequence\" that is not a whole number");
     }
 
     // The client derives the download address from its own base URL, so a URL
