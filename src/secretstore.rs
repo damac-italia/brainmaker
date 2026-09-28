@@ -162,22 +162,67 @@ impl aead::NonceSequence for OneNonce {
     }
 }
 
-/// Returns a stable identifier of this machine.
+/// Where the machine identity in the file key came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Binding {
+    /// An identifier that the system gives to this machine alone.
+    Machine,
+    /// The path of the home directory. It separates the accounts of one
+    /// machine, and it is the same on any machine that has the same
+    /// account name.
+    HomePath,
+    /// A constant. The store then opens wherever the binary runs.
+    None,
+}
+
+impl Binding {
+    /// The word that `status` prints.
+    pub fn name(self) -> &'static str {
+        match self {
+            Binding::Machine => "machine identifier",
+            Binding::HomePath => "home directory path (weak)",
+            Binding::None => "none (weak)",
+        }
+    }
+
+    /// True when a copy of the store opens on another machine.
+    pub fn is_weak(self) -> bool {
+        self != Binding::Machine
+    }
+}
+
+/// Returns a stable identifier of this machine, and where it came from.
 ///
-/// The value binds the stored file to one machine. When no source is
-/// available, the function falls back to the user's home directory path, which
-/// still separates accounts on a shared machine.
-fn machine_id() -> String {
+/// The value binds the stored file to one machine. When the system gives no
+/// identifier, the function falls back to the path of the user's home
+/// directory, and when that is unknown too, to a constant. Both fallbacks are
+/// weak. A home path is easy to guess, and the constant is the same on every
+/// machine, so a copy of the stored file can open elsewhere. The [`Binding`]
+/// tells the caller which case applied.
+///
+/// The strings are part of the file key. Changing one of them makes every
+/// stored file unreadable.
+fn machine_identity() -> (String, Binding) {
     if let Some(id) = platform_machine_id() {
         let id = id.trim();
         if !id.is_empty() {
-            return id.to_string();
+            return (id.to_string(), Binding::Machine);
         }
     }
 
     dirs::home_dir()
-        .map(|p| format!("home:{}", p.display()))
-        .unwrap_or_else(|| "brainmaker:no-machine-id".to_string())
+        .map(|p| (format!("home:{}", p.display()), Binding::HomePath))
+        .unwrap_or_else(|| ("brainmaker:no-machine-id".to_string(), Binding::None))
+}
+
+/// The machine identity that goes into the file key.
+fn machine_id() -> String {
+    machine_identity().0
+}
+
+/// Reports what binds the stored file to this machine.
+pub fn binding() -> Binding {
+    machine_identity().1
 }
 
 #[cfg(target_os = "linux")]
@@ -210,7 +255,13 @@ fn platform_machine_id() -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn platform_machine_id() -> Option<String> {
-    let output = std::process::Command::new("reg")
+    // The full path, so that a program named reg earlier on PATH is never
+    // the one that answers.
+    let system_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let reg = system_root.join("System32").join("reg.exe");
+    let output = std::process::Command::new(reg)
         .args([
             "query",
             r"HKLM\SOFTWARE\Microsoft\Cryptography",
@@ -370,5 +421,31 @@ mod tests {
         let first = machine_id();
         assert!(!first.is_empty());
         assert_eq!(first, machine_id());
+    }
+
+    #[test]
+    fn the_binding_matches_the_identity() {
+        let (identity, binding) = machine_identity();
+        if identity.starts_with("home:") {
+            assert_eq!(binding, Binding::HomePath);
+        } else if identity == "brainmaker:no-machine-id" {
+            assert_eq!(binding, Binding::None);
+        } else {
+            assert_eq!(binding, Binding::Machine);
+        }
+    }
+
+    #[test]
+    fn only_a_machine_identifier_is_a_strong_binding() {
+        assert!(!Binding::Machine.is_weak());
+        assert!(Binding::HomePath.is_weak());
+        assert!(Binding::None.is_weak());
+    }
+
+    #[test]
+    fn names_a_weak_binding_as_weak() {
+        assert!(Binding::HomePath.name().contains("weak"));
+        assert!(Binding::None.name().contains("weak"));
+        assert!(!Binding::Machine.name().contains("weak"));
     }
 }

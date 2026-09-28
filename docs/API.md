@@ -124,6 +124,7 @@ the run prints a notice and the path to delete after the command exits.
 | `token url` | The token endpoint in use, or `<none>` |
 | `auth` | `absent`, or `client-credentials grant, scope sync, client id N characters, secret N characters`. Never a credential itself. |
 | `key` | `release` or `development`, naming which build key this binary carries |
+| `binding` | What ties the sealed store to this machine: `machine identifier`, `home directory path (weak)`, or `none (weak)`. A `(weak)` value means a copy of `config.enc` opens on another machine. |
 | `signing` | Both key counts, as `N trusted software key(s), N trusted content key(s)`. `0` software keys means it installs no update; `0` content keys means it installs no content. |
 | `installed` | The hash in `state.json`, or `<none>` |
 | `present` | `yes` when `content/` is a directory |

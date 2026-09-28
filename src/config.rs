@@ -370,6 +370,16 @@ impl Config {
                 "Imported the configuration from {}",
                 path.display()
             ));
+            let binding = secretstore::binding();
+            if binding.is_weak() {
+                log(&format!(
+                    "warning: this system gives no machine identifier, so the sealed settings \
+                     are bound to: {}. A copy of {} opens on another machine that has the \
+                     same binary.",
+                    binding.name(),
+                    store.display()
+                ));
+            }
 
             let mut removed = false;
             if !options.keep_config {

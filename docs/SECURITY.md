@@ -49,6 +49,15 @@ time, and an identifier of the machine. That combination covers these cases:
 - A reader who holds the file but not the binary learns nothing.
 - A `grep` over the home directory finds no URL and no credential.
 
+The identifier is the platform UUID on macOS, `/etc/machine-id` on Linux (or
+`/var/lib/dbus/machine-id` when the first file is missing), and `MachineGuid` on Windows. When the
+system gives none, which is usual in a container, the key uses the home directory path instead, and
+the first bullet point does not hold: the copy opens on any machine with the same binary and the
+same account name. When the home directory is unknown too, the key uses a constant, and the copy
+opens on any machine with the same binary. `brainmaker status` prints the source on its `binding`
+line, as `machine identifier`, `home directory path (weak)`, or `none (weak)`, and an import on a
+system with a weak binding prints a warning.
+
 **It hides nothing from the employee who runs the binary.** They hold the binary, so they hold the
 compiled-in secret, and they run on the bound machine. Anyone who receives the distribution zip can
 recover the endpoints and the client credentials. Treat all four as known to every employee who

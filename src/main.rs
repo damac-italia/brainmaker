@@ -169,6 +169,7 @@ fn status(config: &Config) -> Result<()> {
     println!("token url {}", config.token_url_summary());
     println!("auth      {}", config.credentials_summary());
     println!("key       {}", secretstore::key_class());
+    println!("binding   {}", secretstore::binding().name());
     // Both counts on one line. A second row would need its own label, and
     // "content" already names the content directory above, while any longer
     // label would not fit the column every other value starts at.
