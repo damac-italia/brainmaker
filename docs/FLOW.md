@@ -9,7 +9,7 @@ and `state     cannot check: <reason>`.
 ## Settings load
 
 Every command but `uninstall` starts here. `Config::load` runs before the dispatch in
-[`src/main.rs:96`](../src/main.rs).
+[`src/main.rs:100`](../src/main.rs).
 
 ```mermaid
 sequenceDiagram

@@ -75,7 +75,7 @@ token already issued stays valid for the rest of its 10 minutes.
 | Software API to the binary | The manifest | Ed25519 signature over the served bytes, checked before the parse; then version character set and length, platform key lookup, checksum format. The manifest names no URL, so it cannot direct a download. |
 | Software API to the binary | The replacement binary | SHA-256 match, then a `--version` run before the swap |
 | Provisioning file to the store | `KEY=VALUE` text | Size cap, key character set, TLS rule on both URLs, all-or-none credential check, character rule on both credential values, route rule on all five routes |
-| Token endpoint to a header | The access token | Length cap, printable-ASCII rule, and a `token_type` that must read `Bearer` |
+| Token endpoint to a header | The access token | Length cap, printable-ASCII rule, and a `token_type` that must read `Bearer` when the response carries one |
 | Store to the process | `config.enc` | AES-256-GCM authenticates the header and the ciphertext before any byte is used |
 
 ## Authentication and authorization
