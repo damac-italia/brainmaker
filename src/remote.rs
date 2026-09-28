@@ -289,6 +289,7 @@ fn describe(error: ureq::Error) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{Route, Server, Signer, temp_dir};
 
     /// A release the client would accept, as JSON.
     fn release(hash: &str, sha256: &str, size: u64) -> String {
@@ -374,5 +375,184 @@ mod tests {
         let body = "é".repeat(MAX_MESSAGE_CHARS + 10);
         let message = message_from_body(&body).unwrap();
         assert_eq!(message.chars().count(), MAX_MESSAGE_CHARS + 3);
+    }
+
+    /// A server whose `GET /content/latest` route answers with `body`.
+    fn serving_latest(body: impl Into<Vec<u8>>) -> Server {
+        Server::start(vec![Route::get("/content/latest", body)])
+    }
+
+    #[test]
+    fn reads_a_signed_release() {
+        let signer = Signer::new();
+        signer.trust();
+        let payload = release("25c60772", &"a".repeat(64), 1152003);
+        let server = serving_latest(signer.envelope(&payload));
+        let dir = temp_dir("remote-signed");
+
+        let read = latest_release(&Config::for_test(&dir, &server.base())).unwrap();
+
+        assert_eq!(read.hash, "25c60772");
+        assert_eq!(read.sha256, "a".repeat(64));
+        assert_eq!(read.size_bytes, 1152003);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_release_that_another_key_signed() {
+        // The client trusts one key, and a second one signs.
+        Signer::new().trust();
+        let stranger = Signer::new();
+        let payload = release("25c60772", &"a".repeat(64), 1152003);
+        let server = serving_latest(stranger.envelope(&payload));
+        let dir = temp_dir("remote-stranger");
+
+        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("cannot trust the content release"),
+            "got {text}"
+        );
+        assert!(
+            text.contains("no signature from a key this binary trusts"),
+            "got {text}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_release_whose_payload_was_altered() {
+        let signer = Signer::new();
+        signer.trust();
+        let signed: serde_json::Value =
+            serde_json::from_str(&signer.envelope(&release("25c60772", &"a".repeat(64), 1152003)))
+                .unwrap();
+        // A different release that carries the signature of the first one.
+        let forged = serde_json::json!({
+            "payload": release("25c60772", &"b".repeat(64), 1152003),
+            "signature": signed["signature"],
+        });
+        let server = serving_latest(forged.to_string());
+        let dir = temp_dir("remote-altered");
+
+        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("cannot trust the content release"),
+            "got {text}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_an_unsigned_release() {
+        let server = serving_latest(r#"{"hash":"25c60772"}"#);
+        let dir = temp_dir("remote-unsigned");
+
+        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("returned no signed content release"),
+            "got {text}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_release_that_claims_too_many_bytes() {
+        let signer = Signer::new();
+        signer.trust();
+        let payload = release("25c60772", &"a".repeat(64), MAX_ARCHIVE_BYTES + 1);
+        let server = serving_latest(signer.envelope(&payload));
+        let dir = temp_dir("remote-too-large");
+
+        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("past the limit"), "got {text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_the_server_message_for_a_404() {
+        let server = Server::start(vec![Route {
+            status: 404,
+            ..Route::get(
+                "/content/latest",
+                r#"{"error": "no content release is published"}"#,
+            )
+        }]);
+        let dir = temp_dir("remote-404");
+
+        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("HTTP 404"), "got {text}");
+        assert!(
+            text.contains("no content release is published"),
+            "got {text}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_download_writes_the_body_to_the_file() {
+        let body: Vec<u8> = (0..1000u32).map(|n| (n % 251) as u8).collect();
+        let server = Server::start(vec![Route::get("/f", body.clone())]);
+        let dir = temp_dir("remote-download");
+        let config = Config::for_test(&dir, &server.base());
+        let dest = dir.join("f.bin");
+
+        let written = download(&config, &format!("{}/f", server.base()), &dest, 2000).unwrap();
+
+        assert_eq!(written, 1000);
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_download_past_the_limit_fails_and_leaves_no_usable_file() {
+        let server = Server::start(vec![Route::get("/f", vec![7u8; 1000])]);
+        let dir = temp_dir("remote-download-limit");
+        let config = Config::for_test(&dir, &server.base());
+        let dest = dir.join("f.bin");
+
+        let result = download(&config, &format!("{}/f", server.base()), &dest, 999);
+
+        // Only the failure is asserted, and not its message, which can change.
+        // The callers remove the file after any error: `sync` deletes its
+        // download, and `self-update` deletes its staged binary.
+        assert!(
+            result.is_err(),
+            "a body of 1000 bytes passed a limit of 999"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_empty_download_fails() {
+        let server = Server::start(vec![Route::get("/f", Vec::new())]);
+        let dir = temp_dir("remote-download-empty");
+        let config = Config::for_test(&dir, &server.base());
+        let dest = dir.join("f.bin");
+
+        let error = download(&config, &format!("{}/f", server.base()), &dest, 2000).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("is empty"), "got {text}");
+        assert!(!dest.exists(), "the empty body stayed in the file");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
