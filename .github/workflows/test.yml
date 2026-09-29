@@ -26,12 +26,7 @@ jobs:
         include:
           - os: ubuntu-24.04-arm
           - os: macos-14
-          # Several tests name Unix paths, so a failure on Windows does not
-          # yet prove a defect. The job compiles and lints as a hard gate;
-          # its test step reports and does not block. Remove `experimental`
-          # once the Windows tests pass.
           - os: windows-2022
-            experimental: true
 
     steps:
       - name: Checkout
@@ -70,8 +65,4 @@ jobs:
         # BRAINMAKER_CONFIG_KEY stays unset on purpose: the tests seal and open
         # their own values with the development key, and the release workflow
         # is the only place that needs the real one.
-        #
-        # The Windows entry of the matrix is marked experimental, so a failing
-        # test there is reported and does not block a merge.
-        continue-on-error: ${{ matrix.experimental == true }}
         run: cargo test --workspace --all-targets --locked --features sign

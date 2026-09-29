@@ -532,7 +532,7 @@ against glibc, so it will not run on an older distribution.
 
 | Workflow | Trigger | What it runs |
 |---|---|---|
-| `test` | push and pull request on `master` | On three systems, `ubuntu-24.04-arm`, `macos-14`, and `windows-2022`: `cargo fmt --all --check` (on the Linux runner alone), then `cargo clippy --workspace --all-targets --locked --features sign -- -D warnings`, then `cargo test --workspace --all-targets --locked --features sign`. A failed test step on Windows is reported and does not block a merge yet. |
+| `test` | push and pull request on `master` | On three systems, `ubuntu-24.04-arm`, `macos-14`, and `windows-2022`: `cargo fmt --all --check` (on the Linux runner alone), then `cargo clippy --workspace --all-targets --locked --features sign -- -D warnings`, then `cargo test --workspace --all-targets --locked --features sign`. |
 | `dependency-review` | pull request on `master` | Blocks a pull request that introduces a dependency with a high-severity advisory |
 | `release` | a tag matching `v*`, or by hand | Builds the five platforms, writes and signs the manifest, and creates the GitHub release |
 
