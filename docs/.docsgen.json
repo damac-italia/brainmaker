@@ -1,14 +1,14 @@
 {
   "version": 1,
-  "head": "6241bf2",
+  "head": "383b445",
   "docs": {
     "README.md": {
-      "doc_hash": "b96544456a2007ab",
+      "doc_hash": "cbe0a2d86ecca176",
       "sources": {
         ".github/dependabot.yml": "e77b0c93203553cc",
         ".github/workflows/dependency-review.yml": "568eebf8eae600c9",
         ".github/workflows/release.yml": "969176c8a7a46349",
-        ".github/workflows/test.yml": "40ae5c743bce7fb6",
+        ".github/workflows/test.yml": "11bae95016de3932",
         "Cargo.lock": "fdaeb68b9f84a7e0",
         "Cargo.toml": "9854b6f5a04087e3",
         "LICENSE": "3972dc9744f6499f",
@@ -17,8 +17,8 @@
         "scripts/make-manifest.sh": "4883c40694dc1312",
         "src/auth.rs": "890c6637ff46cd5f",
         "src/cli.rs": "86561144617ede65",
-        "src/config.rs": "e0a60957e2410036",
-        "src/link.rs": "191e5af8080f8e4f",
+        "src/config.rs": "377cd5689999eac1",
+        "src/link.rs": "05b7d9420138a049",
         "src/lock.rs": "2f2f91d13aa0d68d",
         "src/main.rs": "3318d53122714a18",
         "src/provision.rs": "813af36c30031578",
@@ -27,7 +27,7 @@
         "src/selfupdate.rs": "0f3e95b4efddf443",
         "src/signature.rs": "b013f74bd811600a",
         "src/sync.rs": "343800fdd6eb67e6",
-        "src/uninstall.rs": "76ba49ff43165f4f",
+        "src/uninstall.rs": "53a43b488f2de1db",
         "src/url.rs": "27ad1cf4025280af",
         "tools/sign.rs": "e9473c4a5266058c"
       }
@@ -41,9 +41,9 @@
         "src/archive.rs": "33629f8b993e2ade",
         "src/auth.rs": "890c6637ff46cd5f",
         "src/cli.rs": "86561144617ede65",
-        "src/config.rs": "e0a60957e2410036",
+        "src/config.rs": "377cd5689999eac1",
         "src/digest.rs": "6e632df06f578528",
-        "src/link.rs": "191e5af8080f8e4f",
+        "src/link.rs": "05b7d9420138a049",
         "src/lock.rs": "2f2f91d13aa0d68d",
         "src/main.rs": "3318d53122714a18",
         "src/provision.rs": "813af36c30031578",
@@ -55,19 +55,19 @@
         "src/state.rs": "cd5bbf022f126bd8",
         "src/sync.rs": "343800fdd6eb67e6",
         "src/testutil.rs": "48825165b216fa1c",
-        "src/uninstall.rs": "76ba49ff43165f4f",
+        "src/uninstall.rs": "53a43b488f2de1db",
         "src/url.rs": "27ad1cf4025280af",
         "src/version.rs": "6bfa971eabf2a0fe",
         "tools/sign.rs": "e9473c4a5266058c"
       }
     },
     "docs/FLOW.md": {
-      "doc_hash": "f6438c851b332975",
+      "doc_hash": "eb0c64c56c103d13",
       "sources": {
         "src/archive.rs": "33629f8b993e2ade",
         "src/auth.rs": "890c6637ff46cd5f",
-        "src/config.rs": "e0a60957e2410036",
-        "src/link.rs": "191e5af8080f8e4f",
+        "src/config.rs": "377cd5689999eac1",
+        "src/link.rs": "05b7d9420138a049",
         "src/lock.rs": "2f2f91d13aa0d68d",
         "src/main.rs": "3318d53122714a18",
         "src/provision.rs": "813af36c30031578",
@@ -78,7 +78,7 @@
         "src/signature.rs": "b013f74bd811600a",
         "src/state.rs": "cd5bbf022f126bd8",
         "src/sync.rs": "343800fdd6eb67e6",
-        "src/uninstall.rs": "76ba49ff43165f4f",
+        "src/uninstall.rs": "53a43b488f2de1db",
         "src/url.rs": "27ad1cf4025280af"
       }
     },
@@ -88,8 +88,8 @@
         "scripts/make-manifest.sh": "4883c40694dc1312",
         "src/auth.rs": "890c6637ff46cd5f",
         "src/cli.rs": "86561144617ede65",
-        "src/config.rs": "e0a60957e2410036",
-        "src/link.rs": "191e5af8080f8e4f",
+        "src/config.rs": "377cd5689999eac1",
+        "src/link.rs": "05b7d9420138a049",
         "src/main.rs": "3318d53122714a18",
         "src/provision.rs": "813af36c30031578",
         "src/remote.rs": "83304e3fb578cdfb",
@@ -98,7 +98,7 @@
         "src/selfupdate.rs": "0f3e95b4efddf443",
         "src/signature.rs": "b013f74bd811600a",
         "src/sync.rs": "343800fdd6eb67e6",
-        "src/uninstall.rs": "76ba49ff43165f4f",
+        "src/uninstall.rs": "53a43b488f2de1db",
         "src/url.rs": "27ad1cf4025280af",
         "tools/sign.rs": "e9473c4a5266058c"
       }
@@ -109,14 +109,14 @@
         ".github/dependabot.yml": "e77b0c93203553cc",
         ".github/workflows/dependency-review.yml": "568eebf8eae600c9",
         ".github/workflows/release.yml": "969176c8a7a46349",
-        ".github/workflows/test.yml": "40ae5c743bce7fb6",
+        ".github/workflows/test.yml": "11bae95016de3932",
         "Cargo.toml": "9854b6f5a04087e3",
         "build.rs": "3301704cc0f88c5e",
         "src/archive.rs": "33629f8b993e2ade",
         "src/auth.rs": "890c6637ff46cd5f",
-        "src/config.rs": "e0a60957e2410036",
+        "src/config.rs": "377cd5689999eac1",
         "src/digest.rs": "6e632df06f578528",
-        "src/link.rs": "191e5af8080f8e4f",
+        "src/link.rs": "05b7d9420138a049",
         "src/lock.rs": "2f2f91d13aa0d68d",
         "src/provision.rs": "813af36c30031578",
         "src/remote.rs": "83304e3fb578cdfb",
@@ -126,7 +126,7 @@
         "src/signature.rs": "b013f74bd811600a",
         "src/state.rs": "cd5bbf022f126bd8",
         "src/sync.rs": "343800fdd6eb67e6",
-        "src/uninstall.rs": "76ba49ff43165f4f",
+        "src/uninstall.rs": "53a43b488f2de1db",
         "src/url.rs": "27ad1cf4025280af",
         "tools/sign.rs": "e9473c4a5266058c"
       }

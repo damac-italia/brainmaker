@@ -338,13 +338,13 @@ Steps:
 2. [`link.rs:136`](../src/link.rs) fails when the content directory does not exist yet.
 3. [`link.rs:144`](../src/link.rs) links the skills, and
    [`link.rs:145`](../src/link.rs) copies the program under the root.
-4. [`link.rs:146`](../src/link.rs) builds the command prefix. [`link.rs:471`](../src/link.rs)
+4. [`link.rs:146`](../src/link.rs) builds the command prefix. [`link.rs:485`](../src/link.rs)
    writes each path as one double-quoted shell word, puts a backslash before `$`, the backtick,
    `"`, and `\`, and refuses a path that holds a control character.
 5. [`link.rs:147`](../src/link.rs) writes the hook into `settings.json`, and
    [`link.rs:148`](../src/link.rs) writes the block into `CLAUDE.md`. A file that exists but cannot
    be read as text fails the run and stays as it is. A `CLAUDE.md` whose markers are not one start
-   followed by one end fails the run too. [`link.rs:558`](../src/link.rs) writes each file through
+   followed by one end fails the run too. [`link.rs:572`](../src/link.rs) writes each file through
    a temporary file and a rename, keeps the mode of an existing file, and keeps a symbolic link as
    a link.
 6. [`link.rs:150`](../src/link.rs) installs the agent with the same command prefix the hook runs.
