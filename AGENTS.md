@@ -57,8 +57,9 @@ A plain `cargo test` skips `tools/sign.rs`. The script does not skip it.
 The release builds macOS, Linux, and Windows. Code under `#[cfg(target_os = ...)]` or
 `#[cfg(windows)]` does not compile on the other systems, so a local run does not check it.
 
-The `test` workflow runs on Linux, macOS, and Windows. A failed test on Windows is reported. It does
-not block a merge yet.
+The `test` workflow runs on Linux, macOS, and Windows. A failed test on any of the three systems
+blocks a merge. A path in a test must suit each system: build it with `Path::join`, and do not
+write `/` as a separator.
 
 ## Tests that need a server
 
