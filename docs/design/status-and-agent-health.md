@@ -1,6 +1,7 @@
 # Design: a machine-readable status, the health of the agent, and a bounded log
 
-Status: proposal. This document builds nothing and changes no behavior.
+Status: proposal, with every decision answered on 2026-09-29. This document builds nothing and changes no
+behavior.
 
 Since version 0.1.6, a LaunchAgent installs signed builds every hour with no person present. Three gaps
 make that agent hard to watch.
@@ -927,6 +928,22 @@ first.
    `status --json`.
 9. **D-9. Is the log cut in place at the start of `sync`, with a cap of 1 MiB and a target of 256 KiB?**
    The recommendation is yes.
+
+### Answers
+
+The maintainer answered every decision on 2026-09-29, and took each recommendation.
+
+| ID | Answer |
+|---|---|
+| D-1 | No. The JSON does not carry the lengths of the credentials. |
+| D-2 | Yes. `not_newer` names a release that plan 009 refuses. |
+| D-3 | Yes. The default JSON omits `api_base`, `token_url`, and the two reason texts. `--endpoints` adds them. |
+| D-4 | Yes to both. The JSON carries `"schema": 1`, and the flags are `--json` and `--endpoints`. |
+| D-5 | A new command writes the log lines (product decision 7 of scheduled-agent.md). The `date -u` line is the fallback. |
+| D-6 | Yes. The agent's `sync` drops `--quiet`, in the same change as D-5. |
+| D-7 | Yes. `status` prints the time and `error logged` only, never the last error line. |
+| D-8 | No. `self-update --check` keeps its exit codes. The answer comes from `status --json`. |
+| D-9 | Yes. `sync` cuts the log in place at its start, with a cap of 1 MiB and a target of 256 KiB. |
 
 ### Not verified
 

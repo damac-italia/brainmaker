@@ -1,6 +1,7 @@
 # Design: the hourly agent on Linux and Windows
 
-Status: proposal. This document builds nothing and changes no behavior.
+Status: proposal, with product decisions 1, 5, 6, and 7 answered on 2026-09-29. This document builds
+nothing and changes no behavior.
 
 The release builds five platforms. Only macOS gets the hourly agent: `link` writes a LaunchAgent
 there. On Linux and on Windows, the content updates only when a Claude session starts, and the binary
@@ -891,6 +892,22 @@ changes and the test that proves it.
    reaches every linked Linux and Windows machine within an hour, with no person in between. The five
    controls of `self-update` are then the only gate on all three systems, and the signing key decides. The
    build must change that sentence, and the maintainer must read the new one.
+
+### Answers
+
+The maintainer answered four product decisions on 2026-09-29. The others stay open.
+
+| Decision | Answer |
+|---|---|
+| 1 | Yes. The team runs Windows today, so the Windows half does not wait. |
+| 2 | Open. |
+| 3 | Open. |
+| 4 | Open. The recommendation stays no. |
+| 5 | No. The fleet has no Linux machine without systemd. The notice of section Linux 7 stays, because a container or WSL can run `link`. |
+| 6 | No. No machine needs a proxy. |
+| 7 | Yes. One new command replaces the shell layers on all three systems. Decision D-5 of status-and-agent-health.md took this answer. |
+| 8 | Open. |
+| 9 | Open. This is a security decision. |
 
 ### Not verified
 
