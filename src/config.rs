@@ -724,11 +724,10 @@ mod tests {
         let root = absolute(Path::new("some/root")).unwrap();
         assert!(root.is_absolute(), "got {}", root.display());
         assert!(root.ends_with("some/root"), "got {}", root.display());
-        // An absolute root is kept as it is.
-        assert_eq!(
-            absolute(Path::new("/tmp/root")).unwrap(),
-            PathBuf::from("/tmp/root")
-        );
+        // An absolute root is kept as it is. "/tmp/root" is not absolute on
+        // Windows, which wants a drive, so the temporary directory stands in.
+        let fixed = std::env::temp_dir().join("root");
+        assert_eq!(absolute(&fixed).unwrap(), fixed);
     }
 
     #[test]

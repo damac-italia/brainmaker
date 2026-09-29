@@ -286,7 +286,7 @@ fn remove(path: &Path) -> Result<bool> {
         }
     };
     if meta.is_symlink() {
-        remove_link(path)
+        link::remove_link(path)
     } else if meta.is_dir() {
         fs::remove_dir_all(path)
     } else {
@@ -294,20 +294,6 @@ fn remove(path: &Path) -> Result<bool> {
     }
     .with_context(|| format!("cannot remove {}", path.display()))?;
     Ok(true)
-}
-
-/// Removes the symbolic link `path`, and not what it names.
-fn remove_link(path: &Path) -> std::io::Result<()> {
-    let removed = fs::remove_file(path);
-    // Windows keeps a link to a directory as a directory entry, which only
-    // remove_dir takes away. It removes the link, never the target.
-    #[cfg(windows)]
-    {
-        if removed.is_err() {
-            return fs::remove_dir(path);
-        }
-    }
-    removed
 }
 
 /// Removes the directory `path` when it is empty. Returns the names it still
@@ -331,7 +317,7 @@ fn remove_if_empty(path: &Path) -> Result<Vec<String>> {
     if names.is_empty() {
         let is_link = fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink());
         if is_link {
-            remove_link(path)
+            link::remove_link(path)
         } else {
             fs::remove_dir(path)
         }
@@ -687,11 +673,11 @@ mod tests {
             Path::new("/home/me/.claude"),
             Some(&agents),
         );
+        // The separator before the file name is the platform's own.
+        let plist =
+            Path::new("/home/me/Library/LaunchAgents").join(format!("{}.plist", schedule::LABEL));
         assert!(
-            text.contains(&format!(
-                "the hourly LaunchAgent /home/me/Library/LaunchAgents/{}.plist",
-                schedule::LABEL
-            )),
+            text.contains(&format!("the hourly LaunchAgent {}", plist.display())),
             "{text}"
         );
     }
