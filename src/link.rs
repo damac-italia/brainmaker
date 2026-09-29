@@ -1159,10 +1159,20 @@ mod tests {
         write_settings(&claude, Some(&command_prefix(&program, None).unwrap())).unwrap();
         let text = fs::read_to_string(claude.join("settings.json")).unwrap();
 
-        // settings.json holds the path as a JSON string, where each backslash
-        // of a Windows path is doubled.
-        let escaped = serde_json::to_string(&program.display().to_string()).unwrap();
-        assert!(text.contains(escaped.trim_matches('"')), "{text}");
+        // Every command starts with the full path, quoted for the shell. The
+        // text of the file cannot be searched for the path itself: on Windows
+        // the shell quoting and then JSON each double a backslash.
+        let prefix = command_prefix(&program, None).unwrap();
+        assert!(prefix.contains("hook-path"), "{prefix}");
+        let settings: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let hooks = settings["hooks"]["SessionStart"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert!(!hooks.is_empty(), "{text}");
+        for hook in hooks {
+            let command = hook["command"].as_str().unwrap();
+            assert!(command.starts_with(&format!("{prefix} ")), "{command}");
+        }
         assert!(
             !text.contains("\"brainmaker sync"),
             "the command must not start with a bare name: {text}"
