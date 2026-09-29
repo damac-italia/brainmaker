@@ -378,7 +378,7 @@ fn link_skills(content: &Path, claude: &Path, report: &mut Report) -> Result<()>
                     report.unchanged.push(name);
                 } else if current.starts_with(content) {
                     // Ours, but pointing at an older layout. Replace it.
-                    fs::remove_file(&target)
+                    remove_link(&target)
                         .with_context(|| format!("cannot remove {}", target.display()))?;
                     make_symlink(&source, &target)?;
                     report.linked.push(name);
@@ -418,13 +418,27 @@ fn unlink_skills(content: &Path, claude: &Path, report: &mut Report) -> Result<(
         }
         // Only a link into the content directory is ours.
         if fs::read_link(&path).is_ok_and(|target| target.starts_with(content)) {
-            fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+            remove_link(&path).with_context(|| format!("cannot remove {}", path.display()))?;
             report
                 .removed
                 .push(entry.file_name().to_string_lossy().into_owned());
         }
     }
     Ok(())
+}
+
+/// Removes the symbolic link `path`, and not what it names.
+pub(crate) fn remove_link(path: &Path) -> std::io::Result<()> {
+    let removed = fs::remove_file(path);
+    // Windows keeps a link to a directory as a directory entry, which only
+    // remove_dir takes away. It removes the link, never the target.
+    #[cfg(windows)]
+    {
+        if removed.is_err() {
+            return fs::remove_dir(path);
+        }
+    }
+    removed
 }
 
 /// Every directory under `root` that holds a `SKILL.md`, by name.
@@ -1145,7 +1159,10 @@ mod tests {
         write_settings(&claude, Some(&command_prefix(&program, None).unwrap())).unwrap();
         let text = fs::read_to_string(claude.join("settings.json")).unwrap();
 
-        assert!(text.contains(program.display().to_string().as_str()));
+        // settings.json holds the path as a JSON string, where each backslash
+        // of a Windows path is doubled.
+        let escaped = serde_json::to_string(&program.display().to_string()).unwrap();
+        assert!(text.contains(escaped.trim_matches('"')), "{text}");
         assert!(
             !text.contains("\"brainmaker sync"),
             "the command must not start with a bare name: {text}"
