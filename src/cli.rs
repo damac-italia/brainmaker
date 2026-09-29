@@ -148,6 +148,37 @@ impl Default for Args {
     }
 }
 
+/// Takes the value of `flag` from the arguments.
+///
+/// A value that starts with a hyphen is refused: it is the next flag, and the
+/// value that the user meant is missing. `given` says whether the flag has
+/// appeared before; a second appearance is refused, because only one of the
+/// two values could take effect.
+fn value_of(
+    flag: &str,
+    noun: &str,
+    given: bool,
+    iter: &mut impl Iterator<Item = String>,
+) -> Result<String> {
+    if given {
+        bail!("{flag} is given twice; give it once");
+    }
+    match iter.next() {
+        Some(value) if value.starts_with('-') => {
+            // Only a path can be written out with ./ in front of its hyphen.
+            if noun == "a path" {
+                bail!(
+                    "{flag} needs {noun}, and {value:?} is another option. \
+                     Write a path that starts with a hyphen as ./{value}"
+                );
+            }
+            bail!("{flag} needs {noun}, and {value:?} is another option")
+        }
+        Some(value) => Ok(value),
+        None => bail!("{flag} needs {noun}"),
+    }
+}
+
 /// Parses the arguments that follow the program name.
 pub fn parse<I, S>(raw: I) -> Result<Action>
 where
@@ -156,7 +187,7 @@ where
 {
     let mut args = Args::default();
     let mut command_seen = false;
-    let mut iter = raw.into_iter().map(Into::into).peekable();
+    let mut iter = raw.into_iter().map(Into::into);
 
     while let Some(item) = iter.next() {
         match item.as_str() {
@@ -169,33 +200,28 @@ where
             "--keep-config" => args.keep_config = true,
             "-q" | "--quiet" => args.quiet = true,
             "--config" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--config needs a path"))?;
+                let value = value_of("--config", "a path", args.config.is_some(), &mut iter)?;
                 args.config = Some(PathBuf::from(value));
             }
             "--dir" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--dir needs a path"))?;
+                let value = value_of("--dir", "a path", args.dir.is_some(), &mut iter)?;
                 args.dir = Some(PathBuf::from(value));
             }
             "--claude-dir" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--claude-dir needs a path"))?;
+                let value = value_of(
+                    "--claude-dir",
+                    "a path",
+                    args.claude_dir.is_some(),
+                    &mut iter,
+                )?;
                 args.claude_dir = Some(PathBuf::from(value));
             }
             "--agent-dir" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--agent-dir needs a path"))?;
+                let value = value_of("--agent-dir", "a path", args.agent_dir.is_some(), &mut iter)?;
                 args.agent_dir = Some(PathBuf::from(value));
             }
             "--url" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--url needs a URL"))?;
+                let value = value_of("--url", "a URL", args.url.is_some(), &mut iter)?;
                 args.url = Some(value);
             }
             "sync" if !command_seen => {
@@ -230,20 +256,68 @@ where
         }
     }
 
-    // uninstall loads no settings, so a settings flag would do nothing. Refuse
-    // it rather than let the user believe it took effect.
-    if args.command == Command::Uninstall {
-        let ignored = [
-            ("--config", args.config.is_some()),
-            ("--keep-config", args.keep_config),
-            ("--url", args.url.is_some()),
-        ];
-        if let Some((flag, _)) = ignored.iter().find(|(_, given)| *given) {
-            bail!("{flag} has no effect with uninstall, which loads no settings");
-        }
-    }
+    check_options(&args)?;
 
     Ok(Action::Run(args))
+}
+
+/// Fails for an option that has no effect with the command.
+///
+/// An option that is accepted and ignored lets the user believe it took
+/// effect. The table is the "Applies to" column of the option table in
+/// docs/API.md.
+fn check_options(args: &Args) -> Result<()> {
+    use Command::*;
+
+    // The commands that load settings. uninstall does not, so a settings flag
+    // would do nothing there.
+    let all_but_uninstall: &[Command] = &[Sync, Status, SelfUpdate, Link, Unlink, SessionContext];
+
+    let given: [(&str, bool, &[Command]); 9] = [
+        ("--force", args.force, &[Sync, SelfUpdate]),
+        ("--check", args.check_only, &[SelfUpdate]),
+        ("--no-update-check", args.no_update_check, &[Sync]),
+        ("--yes", args.yes, &[Uninstall]),
+        ("--config", args.config.is_some(), all_but_uninstall),
+        ("--keep-config", args.keep_config, all_but_uninstall),
+        ("--url", args.url.is_some(), all_but_uninstall),
+        (
+            "--claude-dir",
+            args.claude_dir.is_some(),
+            &[Link, Unlink, Uninstall],
+        ),
+        (
+            "--agent-dir",
+            args.agent_dir.is_some(),
+            &[Link, Unlink, Uninstall],
+        ),
+    ];
+
+    for (flag, is_given, commands) in given {
+        if is_given && !commands.contains(&args.command) {
+            if args.command == Uninstall {
+                bail!("{flag} has no effect with uninstall, which loads no settings");
+            }
+            bail!(
+                "{flag} has no effect with {}; run brainmaker --help",
+                name_of(args.command)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The word that the user types for the command.
+fn name_of(command: Command) -> &'static str {
+    match command {
+        Command::Sync => "sync",
+        Command::Status => "status",
+        Command::SelfUpdate => "self-update",
+        Command::Link => "link",
+        Command::Unlink => "unlink",
+        Command::Uninstall => "uninstall",
+        Command::SessionContext => "session-context",
+    }
 }
 
 #[cfg(test)]
@@ -371,5 +445,123 @@ mod tests {
     fn rejects_an_option_without_its_value() {
         assert!(parse(["--dir"]).is_err());
         assert!(parse(["--url"]).is_err());
+    }
+
+    #[test]
+    fn refuses_an_option_as_the_value_of_another() {
+        // Before, this set the root to a directory named "--yes" and dropped
+        // the --yes that the user meant.
+        let error = parse(["uninstall", "--dir", "--yes"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--dir needs a path"), "{error}");
+
+        let error = parse(["--url", "-q"]).unwrap_err().to_string();
+        assert!(error.contains("--url needs a URL"), "{error}");
+        assert!(!error.contains("./"), "{error}");
+
+        let error = parse(["link", "--claude-dir", "--agent-dir", "/x"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--claude-dir needs a path"), "{error}");
+    }
+
+    #[test]
+    fn accepts_a_relative_path_that_starts_with_a_hyphen_when_it_is_written_out() {
+        let args = run(&["--dir", "./-odd"]);
+        assert_eq!(args.dir, Some(PathBuf::from("./-odd")));
+    }
+
+    #[test]
+    fn refuses_a_value_option_that_is_given_twice() {
+        // Each line uses a command that the option applies to, so the repeat is
+        // the only reason to refuse it.
+        for items in [
+            &["sync", "--config", "/a", "--config", "/b"][..],
+            &["sync", "--dir", "/a", "--dir", "/b"][..],
+            &["link", "--claude-dir", "/a", "--claude-dir", "/b"][..],
+            &["link", "--agent-dir", "/a", "--agent-dir", "/b"][..],
+            &["sync", "--url", "https://x/a", "--url", "https://x/b"][..],
+        ] {
+            let error = parse(items.iter().copied()).unwrap_err().to_string();
+            assert!(error.contains("is given twice"), "{items:?}: {error}");
+            assert!(error.contains(items[1]), "{items:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn accepts_a_switch_that_is_given_twice() {
+        // A repeated switch has one meaning, so it stays valid.
+        assert!(run(&["sync", "--quiet", "-q"]).quiet);
+    }
+
+    #[test]
+    fn refuses_an_option_that_has_no_effect_with_the_command() {
+        for (items, flag, command) in [
+            (&["sync", "--check"][..], "--check", "sync"),
+            (&["status", "--force"][..], "--force", "status"),
+            (
+                &["self-update", "--no-update-check"][..],
+                "--no-update-check",
+                "self-update",
+            ),
+            (&["link", "--yes"][..], "--yes", "link"),
+            (&["sync", "--claude-dir", "/x"][..], "--claude-dir", "sync"),
+            (
+                &["status", "--agent-dir", "/x"][..],
+                "--agent-dir",
+                "status",
+            ),
+        ] {
+            let error = parse(items.iter().copied()).unwrap_err().to_string();
+            let expected = format!("{flag} has no effect with {command}");
+            assert!(error.contains(&expected), "{items:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_default_command_takes_the_sync_options() {
+        assert!(run(&["--force"]).force);
+        assert!(run(&["--no-update-check"]).no_update_check);
+
+        let error = parse(["--check"]).unwrap_err().to_string();
+        assert!(error.contains("--check has no effect with sync"), "{error}");
+    }
+
+    #[test]
+    fn accepts_every_command_line_that_brainmaker_writes() {
+        // The SessionStart hook, the LaunchAgent, and the unlink line in the
+        // CLAUDE.md block run these lines on every installed machine (see
+        // src/link.rs and src/schedule.rs). Each one is shown without the
+        // program name, and /opt/bm is the root.
+        let args = run(&["--dir", "/opt/bm", "sync", "--quiet", "--no-update-check"]);
+        assert_eq!(args.command, Command::Sync);
+        assert!(args.quiet);
+        assert!(args.no_update_check);
+        assert_eq!(args.dir, Some(PathBuf::from("/opt/bm")));
+
+        let args = run(&["--dir", "/opt/bm", "session-context"]);
+        assert_eq!(args.command, Command::SessionContext);
+        assert_eq!(args.dir, Some(PathBuf::from("/opt/bm")));
+
+        let args = run(&["--dir", "/opt/bm", "self-update", "--quiet"]);
+        assert_eq!(args.command, Command::SelfUpdate);
+        assert!(args.quiet);
+        assert_eq!(args.dir, Some(PathBuf::from("/opt/bm")));
+
+        let args = run(&["--dir", "/opt/bm", "unlink"]);
+        assert_eq!(args.command, Command::Unlink);
+        assert_eq!(args.dir, Some(PathBuf::from("/opt/bm")));
+    }
+
+    #[test]
+    fn help_and_version_win_over_every_other_argument() {
+        // The option check runs after the loop, so a help or version request
+        // returns before it can refuse an option that has no effect.
+        assert_eq!(parse(["sync", "--check", "--help"]).unwrap(), Action::Help);
+        assert_eq!(
+            parse(["sync", "--check", "--version"]).unwrap(),
+            Action::Version
+        );
     }
 }

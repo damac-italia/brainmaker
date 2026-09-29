@@ -24,6 +24,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -35,6 +36,12 @@ use crate::version;
 
 /// Version of this binary.
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How long a run waits for another run to finish replacing the program.
+///
+/// The download of a binary is the long step, so this matches the wait of the
+/// content install.
+const UPDATE_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// One platform's build in the manifest.
 ///
@@ -175,12 +182,26 @@ impl Build {
 /// The function verifies the SHA-256 and runs the new binary with `--version`
 /// before it swaps. Returns the path it replaced.
 ///
+/// The function holds the update lock until it returns, so two runs never
+/// replace the program at once. It waits up to `UPDATE_LOCK_WAIT` for that
+/// lock, and returns an error when another run still holds it.
+///
 /// When `link` has installed a copy under the root and the running binary is
 /// another file, that copy is replaced too. The hook runs the copy, and an
 /// update that reached only the file the user happened to run would leave
 /// every session on the old version.
 pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -> Result<PathBuf> {
     let expected_sum = build.checksum()?;
+
+    // One update at a time. Two runs would each remove the other's backup.
+    let Some(_lock) = crate::lock::acquire(&config.update_lock_file(), UPDATE_LOCK_WAIT)? else {
+        bail!(
+            "another brainmaker run is replacing the program under {}; \
+             run the command again when it ends",
+            config.root().display()
+        );
+    };
+
     let url = config.binary_url(latest, &platform_key());
 
     let exe = current_exe()?;
@@ -196,6 +217,9 @@ pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -
     let staged = directory.join(format!(".brainmaker-update-{}{suffix}", std::process::id()));
     let backup = directory.join(format!(".brainmaker-old{suffix}"));
 
+    // Safe only because the update lock is held: no other run has a staged
+    // file in this directory, so every file of this kind is stale.
+    remove_leftovers(directory);
     check_writable(directory, &exe)?;
 
     let result = (|| -> Result<()> {
@@ -204,11 +228,7 @@ pub fn apply(config: &Config, latest: &str, build: &Build, log: &dyn Fn(&str)) -
         log(&format!("Downloaded {bytes} bytes."));
 
         let actual_sum = crate::digest::sha256_of(&staged)?;
-        if actual_sum != expected_sum {
-            bail!(
-                "the SHA-256 of the download is {actual_sum}, but the manifest says {expected_sum}"
-            );
-        }
+        crate::digest::check_matches(&actual_sum, &expected_sum, "the manifest")?;
         log("The SHA-256 matches the manifest.");
 
         set_executable(&staged)?;
@@ -275,6 +295,31 @@ fn current_exe() -> Result<PathBuf> {
     Ok(fs::canonicalize(&exe).unwrap_or(exe))
 }
 
+/// Prefixes of the files that one update writes beside the program and
+/// removes before it ends.
+const LEFTOVER_PREFIXES: [&str; 2] = [".brainmaker-update-", ".brainmaker-probe-"];
+
+/// Removes the files that a stopped update left in `directory`.
+///
+/// An update that is killed never reaches its own cleanup, and its staged
+/// download can be as large as the program. The caller holds the update
+/// lock, so no other update is running, and every such file is stale.
+fn remove_leftovers(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if LEFTOVER_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Fails early when we cannot write the executable or its directory.
 fn check_writable(directory: &Path, exe: &Path) -> Result<()> {
     let probe = directory.join(format!(".brainmaker-probe-{}", std::process::id()));
@@ -305,9 +350,10 @@ fn set_executable(_path: &Path) -> Result<()> {
 /// Runs the staged binary with `--version` and checks what it reports.
 ///
 /// This catches a build for the wrong architecture, a truncated file, and a
-/// manifest whose version does not match the binary it points at. The staged
-/// file already passed the checksum, and it is the file we are about to make
-/// the user's binary, so running it adds no new trust.
+/// manifest whose version does not match the binary it points at. The whole
+/// line is compared, because `0.1.1` is a part of `0.1.10`. The staged file
+/// already passed the checksum, and it is the file we are about to make the
+/// user's binary, so running it adds no new trust.
 fn verify_runs(staged: &Path, expected_version: &str) -> Result<()> {
     let output = std::process::Command::new(staged)
         .arg("--version")
@@ -329,7 +375,7 @@ fn verify_runs(staged: &Path, expected_version: &str) -> Result<()> {
 
     let reported = String::from_utf8_lossy(&output.stdout);
     let reported = reported.trim();
-    if !reported.contains(expected_version) {
+    if !reports_version(reported, expected_version) {
         bail!(
             "the manifest says version {expected_version}, but the download reports {reported:?}"
         );
@@ -338,9 +384,19 @@ fn verify_runs(staged: &Path, expected_version: &str) -> Result<()> {
     Ok(())
 }
 
+/// True when `output` is the line that `brainmaker --version` prints for
+/// `expected_version`.
+///
+/// The line is `brainmaker <version>`, and nothing else may differ. White
+/// space around it, such as the `\r` of a Windows line end, does not count.
+fn reports_version(output: &str, expected_version: &str) -> bool {
+    output.trim() == format!("brainmaker {expected_version}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{self, Route, Server, Signer};
 
     fn build() -> Build {
         Build {
@@ -446,6 +502,183 @@ mod tests {
         let missing = dir.join("absent");
         assert!(swap(&exe, &missing, &backup).is_err());
         assert_eq!(fs::read(&exe).unwrap(), b"new");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A software manifest for `version`, with one build for each of `platforms`.
+    fn manifest(version: &str, platforms: &[&str]) -> String {
+        let builds: serde_json::Map<String, serde_json::Value> = platforms
+            .iter()
+            .map(|platform| {
+                (
+                    platform.to_string(),
+                    serde_json::json!({ "sha256": "c".repeat(64) }),
+                )
+            })
+            .collect();
+        serde_json::json!({ "version": version, "platforms": builds }).to_string()
+    }
+
+    /// Runs `check` against a server that publishes `payload`, signed by `signer`.
+    fn check_against(signer: &Signer, payload: &str) -> Result<Check> {
+        let server = Server::start(vec![Route::get(
+            "/software/brainmaker",
+            signer.envelope(payload),
+        )]);
+        let dir = testutil::temp_dir("update-check");
+        let result = check(&Config::for_test(&dir, &server.base()));
+        fs::remove_dir_all(&dir).unwrap();
+        result
+    }
+
+    #[test]
+    fn offers_a_newer_version_for_this_platform() {
+        let signer = Signer::new();
+        signer.trust();
+        let platform = platform_key();
+        let payload = manifest("999.0.0", &[platform.as_str()]);
+
+        match check_against(&signer, &payload).unwrap() {
+            Check::Newer {
+                latest,
+                platform: offered_for,
+                build,
+            } => {
+                assert_eq!(latest, "999.0.0");
+                assert_eq!(offered_for, platform);
+                assert_eq!(build.sha256, "c".repeat(64));
+            }
+            other => panic!("expected a newer version, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offers_nothing_for_the_running_version() {
+        let signer = Signer::new();
+        signer.trust();
+        let platform = platform_key();
+        let payload = manifest(CURRENT_VERSION, &[platform.as_str()]);
+
+        match check_against(&signer, &payload).unwrap() {
+            Check::UpToDate { version, build, .. } => {
+                assert_eq!(version, CURRENT_VERSION);
+                assert!(build.is_some(), "the manifest lists this platform");
+            }
+            other => panic!("expected the running version to stand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn offers_nothing_for_an_older_version() {
+        // A replayed manifest from an earlier release, which carries a valid
+        // signature, must not move the binary back.
+        let signer = Signer::new();
+        signer.trust();
+        let platform = platform_key();
+        let payload = manifest("0.0.1", &[platform.as_str()]);
+
+        match check_against(&signer, &payload).unwrap() {
+            Check::UpToDate { version, .. } => assert_eq!(version, "0.0.1"),
+            other => panic!("expected no update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn names_the_platforms_when_this_one_is_absent() {
+        let signer = Signer::new();
+        signer.trust();
+        let payload = manifest("999.0.0", &["plan9-mips"]);
+
+        match check_against(&signer, &payload).unwrap() {
+            Check::NewerElsewhere {
+                latest,
+                platform,
+                offered,
+            } => {
+                assert_eq!(latest, "999.0.0");
+                assert_eq!(platform, platform_key());
+                assert_eq!(offered, vec!["plan9-mips".to_string()]);
+            }
+            other => panic!("expected a version for other platforms, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refuses_a_manifest_that_the_content_key_signed() {
+        // The harness makes the client trust one key for both documents, so it
+        // cannot give the content key a role of its own. This test covers the
+        // rule one level down: a manifest that a key outside the trusted set
+        // signed is refused. `the_two_key_lists_share_no_key` covers the rule
+        // that the content key is not in the software list.
+        let signer = Signer::new();
+        Signer::new().trust();
+        let platform = platform_key();
+        let payload = manifest("999.0.0", &[platform.as_str()]);
+
+        let error = check_against(&signer, &payload).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("cannot trust the software manifest"),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_version_with_a_forbidden_character() {
+        let signer = Signer::new();
+        signer.trust();
+        let platform = platform_key();
+        let payload = manifest("1.0.0/../x", &[platform.as_str()]);
+
+        let error = check_against(&signer, &payload).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("invalid version string"), "got {text}");
+    }
+
+    #[test]
+    fn accepts_the_exact_version_line() {
+        assert!(reports_version("brainmaker 0.1.1", "0.1.1"));
+        assert!(reports_version("brainmaker 0.1.1\n", "0.1.1"));
+        // A Windows line end.
+        assert!(reports_version("brainmaker 0.1.1\r\n", "0.1.1"));
+    }
+
+    #[test]
+    fn refuses_a_version_that_only_starts_the_same() {
+        // `0.1.1` is a part of `0.1.10`, which a plain substring check misses.
+        assert!(!reports_version("brainmaker 0.1.10", "0.1.1"));
+        assert!(!reports_version("brainmaker 0.1.10\n", "0.1.1"));
+        assert!(!reports_version("brainmaker 0.1.1", "0.1.10"));
+    }
+
+    #[test]
+    fn refuses_another_program_name() {
+        assert!(!reports_version("other 0.1.1", "0.1.1"));
+    }
+
+    #[test]
+    fn removes_the_files_of_a_stopped_update_and_nothing_else() {
+        let dir = testutil::temp_dir("update-leftovers");
+        for name in [
+            ".brainmaker-update-123",
+            ".brainmaker-probe-9",
+            ".brainmaker-old",
+            "brainmaker",
+            "notes.txt",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        remove_leftovers(&dir);
+
+        assert!(!dir.join(".brainmaker-update-123").exists());
+        assert!(!dir.join(".brainmaker-probe-9").exists());
+        assert!(dir.join(".brainmaker-old").exists());
+        assert!(dir.join("brainmaker").exists());
+        assert!(dir.join("notes.txt").exists());
 
         fs::remove_dir_all(&dir).unwrap();
     }

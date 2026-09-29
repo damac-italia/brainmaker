@@ -24,6 +24,7 @@ mod cli;
 mod config;
 mod digest;
 mod link;
+mod lock;
 mod provision;
 mod remote;
 mod schedule;
@@ -32,6 +33,8 @@ mod selfupdate;
 mod signature;
 mod state;
 mod sync;
+#[cfg(test)]
+mod testutil;
 mod uninstall;
 mod url;
 mod version;
@@ -166,6 +169,7 @@ fn status(config: &Config) -> Result<()> {
     println!("token url {}", config.token_url_summary());
     println!("auth      {}", config.credentials_summary());
     println!("key       {}", secretstore::key_class());
+    println!("binding   {}", secretstore::binding().name());
     // Both counts on one line. A second row would need its own label, and
     // "content" already names the content directory above, while any longer
     // label would not fit the column every other value starts at.
@@ -386,6 +390,12 @@ fn report(config: &Config, outcome: &sync::Outcome, quiet: bool) {
         // exit code stays 0. Quiet suppresses it, as it does the software one.
         sync::Outcome::Unreachable { hash, error } => {
             eprintln!("notice: cannot check the latest content version: {error}");
+            eprintln!("notice: the installed content {hash} stays in place.");
+        }
+        // A notice, for the same reason: another run is installing, and the
+        // content on disk stays usable. The exit code stays 0.
+        sync::Outcome::Busy { hash } => {
+            eprintln!("notice: another brainmaker run is installing content.");
             eprintln!("notice: the installed content {hash} stays in place.");
         }
         sync::Outcome::Updated {

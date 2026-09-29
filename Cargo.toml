@@ -2,6 +2,8 @@
 name = "brainmaker"
 version = "0.1.6"
 edition = "2024"
+# File::try_lock, which the run lock uses, is stable since this version.
+rust-version = "1.89"
 description = "Keeps ~/.brainmaker/content in step with the content API"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/damac-italia/brainmaker"
@@ -31,10 +33,10 @@ sign = []
 
 [dependencies]
 anyhow = "1.0.104"
-dirs = "7.0.0"
 ring = "0.17"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-sha2 = "0.11.0"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 ureq = "3.3.0"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# Reading only. The "deflate" feature would also build the zopfli
+# compressor, which nothing here calls.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

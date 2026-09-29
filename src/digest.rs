@@ -12,7 +12,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
+use ring::digest::{Context as DigestContext, SHA256};
 
 /// Length of a SHA-256 written as hexadecimal.
 const SHA256_HEX_LEN: usize = 64;
@@ -24,7 +24,7 @@ const SHA256_HEX_LEN: usize = 64;
 pub fn sha256_of(path: &Path) -> Result<String> {
     let file = fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
+    let mut hasher = DigestContext::new(&SHA256);
     let mut buffer = [0u8; 64 * 1024];
 
     loop {
@@ -37,13 +37,12 @@ pub fn sha256_of(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
 
-    Ok(hex(&hasher.finalize()))
+    Ok(hex(hasher.finish().as_ref()))
 }
 
 /// Writes bytes as lower-case hexadecimal.
 ///
-/// `sha2` returns an array that carries no `LowerHex`, so the conversion is
-/// written out rather than formatted.
+/// `ring` returns the digest as bytes, so the conversion is written out.
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(bytes.len() * 2);

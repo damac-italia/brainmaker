@@ -121,7 +121,7 @@ impl Report {
 
 /// The Claude configuration directory, `~/.claude`.
 pub fn claude_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("cannot find the home directory")?;
+    let home = std::env::home_dir().context("cannot find the home directory")?;
     Ok(home.join(".claude"))
 }
 
@@ -143,7 +143,7 @@ pub fn link(
     let mut report = Report::default();
     link_skills(&content, claude, &mut report)?;
     let program = install_program(config)?;
-    let prefix = command_prefix(&program, Some(config.root()));
+    let prefix = command_prefix(&program, Some(config.root()))?;
     report.settings_changed = write_settings(claude, Some(&prefix))?;
     report.briefing_changed = write_briefing(&content, claude, Some(&prefix))?;
     if let Some(agents) = agents {
@@ -459,6 +459,31 @@ fn make_symlink(source: &Path, target: &Path) -> Result<()> {
     })
 }
 
+/// Writes `text` as one double-quoted shell word.
+///
+/// Inside double quotes a shell gives a meaning to four characters: `$`, the
+/// backtick, `"`, and `\`. Each one gets a backslash in front. Every other
+/// character is written as it stands, a non-ASCII one included, because the
+/// shell reads the bytes and not an escape.
+///
+/// A control character is refused. No quoting carries a line break through
+/// both a shell and a property list, and a path that holds one is a mistake.
+fn shell_quote(text: &str) -> Result<String> {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        if c.is_control() {
+            bail!("the path {text:?} holds a control character, which a hook command cannot carry");
+        }
+        if matches!(c, '$' | '`' | '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    Ok(out)
+}
+
 /// The start of every command that names the installed binary: the full path,
 /// quoted, and the root it must use.
 ///
@@ -466,12 +491,95 @@ fn make_symlink(source: &Path, target: &Path) -> Result<()> {
 /// command must carry the whole path, and a home directory may hold a space.
 /// The root is named because without it the command takes the default root,
 /// which is the wrong one whenever `link` ran with `--dir`.
-pub fn command_prefix(program: &Path, root: Option<&Path>) -> String {
-    let exe = format!("{:?}", program.display().to_string());
+///
+/// The quoting follows the shell's rules; see `shell_quote`.
+pub fn command_prefix(program: &Path, root: Option<&Path>) -> Result<String> {
+    let exe = shell_quote(&program.display().to_string())?;
     match root {
-        Some(path) => format!("{exe} --dir {:?}", path.display().to_string()),
-        None => exe,
+        Some(path) => Ok(format!(
+            "{exe} --dir {}",
+            shell_quote(&path.display().to_string())?
+        )),
+        None => Ok(exe),
     }
+}
+
+/// Reads the text of `path`, or `None` when no file is there.
+///
+/// Any other failure is an error. A file that exists but cannot be read must
+/// never count as empty: the caller would then write over text it never saw.
+fn read_if_present(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "cannot read {} as text, so it stays as it is",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// Follows the symbolic links at `path` to the first path that is not one.
+///
+/// The file at the end may be missing. A link to a file that does not exist
+/// yet still names where that file goes, and `fs::canonicalize` fails on it.
+/// A chain that never ends, such as a loop of links, is an error.
+fn link_target(path: &Path) -> Result<PathBuf> {
+    const MAX_LINKS: usize = 40;
+
+    let mut current = path.to_path_buf();
+    let mut followed = 0;
+    while fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        followed += 1;
+        if followed > MAX_LINKS {
+            bail!(
+                "{} passes through more than {MAX_LINKS} symbolic links",
+                path.display()
+            );
+        }
+        let link = fs::read_link(&current)
+            .with_context(|| format!("cannot read the link {}", current.display()))?;
+        current = match current.parent() {
+            Some(parent) => parent.join(link),
+            None => link,
+        };
+    }
+    Ok(current)
+}
+
+/// Replaces `path` with `text` through a temporary file and a rename, so that
+/// a run that stops part-way leaves the previous file whole.
+///
+/// When `path` is a symbolic link, the file it names is replaced and the link
+/// stays, which is what a plain write did. The mode of an existing file is
+/// kept.
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    // Replace the file a link names, so that the link itself stays.
+    let target = link_target(path)?;
+    let parent = target
+        .parent()
+        .with_context(|| format!("{} has no parent directory", target.display()))?;
+    let name = target
+        .file_name()
+        .with_context(|| format!("{} has no file name", target.display()))?
+        .to_string_lossy();
+    let staged = parent.join(format!(".{name}.brainmaker-{}.tmp", std::process::id()));
+
+    let result = (|| -> Result<()> {
+        fs::write(&staged, text).with_context(|| format!("cannot write {}", staged.display()))?;
+        if let Ok(meta) = fs::metadata(&target) {
+            fs::set_permissions(&staged, meta.permissions())
+                .with_context(|| format!("cannot set the mode on {}", staged.display()))?;
+        }
+        fs::rename(&staged, &target)
+            .with_context(|| format!("cannot move {} to {}", staged.display(), target.display()))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
 }
 
 /// Adds or removes the `SessionStart` hook. Returns true when the file changed.
@@ -479,28 +587,32 @@ pub fn command_prefix(program: &Path, root: Option<&Path>) -> String {
 /// `prefix` is the [`command_prefix`] to install, or `None` to remove the hook.
 fn write_settings(claude: &Path, prefix: Option<&str>) -> Result<bool> {
     let path = claude.join("settings.json");
-    let mut root: Map<String, Value> = if path.is_file() {
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
-        if text.trim().is_empty() {
-            Map::new()
-        } else {
-            serde_json::from_str(&text)
-                .with_context(|| format!("{} is not a JSON object", path.display()))?
-        }
-    } else {
-        Map::new()
+    let mut root: Map<String, Value> = match read_if_present(&path)? {
+        Some(text) if !text.trim().is_empty() => serde_json::from_str(&text)
+            .with_context(|| format!("{} is not a JSON object", path.display()))?,
+        _ => Map::new(),
     };
     let before = root.clone();
 
-    // Drop any matcher group this module wrote before, so a second run neither
-    // duplicates the hook nor keeps a command from an older version.
+    // Drop any hook entry this module wrote before, so a second run neither
+    // duplicates the hook nor keeps a command from an older version. Single
+    // entries go, so a command the user added to the same group stays. A group
+    // goes only when this run removed its last entry: a group that was already
+    // empty belongs to the user.
     let hooks = root.entry("hooks").or_insert_with(|| json!({}));
     let Some(hooks) = hooks.as_object_mut() else {
         bail!("the \"hooks\" value in {} is not an object", path.display());
     };
     if let Some(Value::Array(groups)) = hooks.get_mut("SessionStart") {
-        groups.retain(|group| !is_ours(group));
+        groups.retain_mut(|group| {
+            let Some(Value::Array(entries)) = group.get_mut("hooks") else {
+                return true;
+            };
+            let held = entries.len();
+            entries.retain(|entry| !is_ours(entry));
+            let removed_any = entries.len() < held;
+            !(removed_any && entries.is_empty())
+        });
         if groups.is_empty() {
             hooks.remove("SessionStart");
         }
@@ -548,23 +660,18 @@ fn write_settings(claude: &Path, prefix: Option<&str>) -> Result<bool> {
 
     fs::create_dir_all(claude).with_context(|| format!("cannot create {}", claude.display()))?;
     let text = serde_json::to_string_pretty(&Value::Object(root))?;
-    fs::write(&path, format!("{text}\n"))
-        .with_context(|| format!("cannot write {}", path.display()))?;
+    write_atomic(&path, &format!("{text}\n"))?;
     Ok(true)
 }
 
-/// True when this module wrote the matcher group.
-fn is_ours(group: &Value) -> bool {
-    group
-        .get("hooks")
-        .and_then(Value::as_array)
-        .is_some_and(|list| {
-            list.iter().any(|hook| {
-                hook.get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(|command| command.contains(MARKER))
-            })
-        })
+/// True when this module wrote the hook entry.
+///
+/// Every command that `link` writes ends with the marker as a shell comment.
+/// A command that only mentions the marker somewhere else is the user's own.
+fn is_ours(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| command.trim_end().ends_with(&format!("# {MARKER}")))
 }
 
 /// Adds or removes the marked block in `CLAUDE.md`. Returns true on a change.
@@ -574,8 +681,8 @@ fn is_ours(group: &Value) -> bool {
 /// bare `brainmaker unlink` fails: nothing puts the binary on `PATH`.
 fn write_briefing(content: &Path, claude: &Path, prefix: Option<&str>) -> Result<bool> {
     let path = claude.join("CLAUDE.md");
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let stripped = strip_block(&existing);
+    let existing = read_if_present(&path)?.unwrap_or_default();
+    let stripped = strip_block(&existing, &path)?;
 
     let updated = if let Some(prefix) = prefix {
         let block = format!(
@@ -610,20 +717,31 @@ fn write_briefing(content: &Path, claude: &Path, prefix: Option<&str>) -> Result
         fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
         return Ok(true);
     }
-    fs::write(&path, updated).with_context(|| format!("cannot write {}", path.display()))?;
+    write_atomic(&path, &updated)?;
     Ok(true)
 }
 
 /// Returns `text` without the marked block, if it holds one.
-fn strip_block(text: &str) -> String {
-    let (Some(start), Some(end)) = (text.find(BLOCK_START), text.find(BLOCK_END)) else {
-        return text.to_string();
-    };
-    if end < start {
-        return text.to_string();
+///
+/// The text must hold no marker, or one start marker followed by one end
+/// marker. Any other shape is an error and removes nothing: a guess at which
+/// markers belong together would delete text that the user wrote.
+fn strip_block(text: &str, path: &Path) -> Result<String> {
+    let starts = text.matches(BLOCK_START).count();
+    let ends = text.matches(BLOCK_END).count();
+    match (starts, ends, text.find(BLOCK_START), text.find(BLOCK_END)) {
+        (0, 0, _, _) => Ok(text.to_string()),
+        (1, 1, Some(start), Some(end)) if start < end => {
+            let after = end + BLOCK_END.len();
+            Ok(format!("{}{}", &text[..start], &text[after..]))
+        }
+        _ => bail!(
+            "{} holds a damaged brainmaker block: {starts} start marker(s) and {ends} end \
+             marker(s). Remove the lines that hold \"{MARKER}\" from the file by hand, then \
+             run the command again",
+            path.display()
+        ),
     }
-    let after = end + BLOCK_END.len();
-    format!("{}{}", &text[..start], &text[after..])
 }
 
 /// Prints what the run changed.
@@ -748,16 +866,75 @@ mod tests {
     #[test]
     fn the_command_prefix_quotes_the_path_and_names_the_root() {
         assert_eq!(
-            command_prefix(Path::new("/opt/bm/bin/brainmaker"), None),
+            command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap(),
             "\"/opt/bm/bin/brainmaker\""
         );
         assert_eq!(
             command_prefix(
                 Path::new("/My Apps/brainmaker"),
                 Some(Path::new("/My Root"))
-            ),
+            )
+            .unwrap(),
             "\"/My Apps/brainmaker\" --dir \"/My Root\""
         );
+    }
+
+    #[test]
+    fn escapes_the_characters_that_a_shell_expands() {
+        assert_eq!(shell_quote("/a$b").unwrap(), "\"/a\\$b\"");
+        assert_eq!(shell_quote("/a`b").unwrap(), "\"/a\\`b\"");
+        assert_eq!(shell_quote("/a\"b").unwrap(), "\"/a\\\"b\"");
+        assert_eq!(shell_quote("/a\\b").unwrap(), "\"/a\\\\b\"");
+    }
+
+    #[test]
+    fn writes_a_non_ascii_path_as_it_stands() {
+        // macOS stores a file name in decomposed form: `e`, then a combining
+        // accent. The `{:?}` formatter wrote that accent as the text `\u{301}`,
+        // which a shell does not read.
+        let quoted = shell_quote("/Users/rene\u{301}/root").unwrap();
+        assert!(quoted.contains('\u{301}'), "{quoted}");
+        assert!(!quoted.contains("\\u{"), "{quoted}");
+        assert_eq!(quoted, "\"/Users/rene\u{301}/root\"");
+    }
+
+    #[test]
+    fn keeps_a_single_quote_and_a_space() {
+        assert_eq!(shell_quote("/My App's/x").unwrap(), "\"/My App's/x\"");
+    }
+
+    #[test]
+    fn refuses_a_path_that_holds_a_line_break() {
+        assert!(shell_quote("/a\nb").is_err());
+        assert!(command_prefix(Path::new("/a\nb"), None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_reads_the_quoted_path_back() {
+        // The shell that runs the hook is the judge of the quoting, so run one.
+        // The backtick path would run `echo x` if the quoting let it through.
+        for path in [
+            "/a b",
+            "/a$HOME",
+            "/a`echo x`b",
+            "/a\"b",
+            "/a\\b",
+            "/rene\u{301}",
+        ] {
+            let output = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", shell_quote(path).unwrap()))
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.stdout,
+                path.as_bytes(),
+                "the shell read {path:?} back as {:?}, stderr {:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
@@ -769,7 +946,8 @@ mod tests {
         let prefix = command_prefix(
             Path::new("/opt/bm/bin/brainmaker"),
             Some(Path::new("/opt/bm")),
-        );
+        )
+        .unwrap();
 
         write_briefing(&content, &claude, Some(&prefix)).unwrap();
         let text = fs::read_to_string(claude.join("CLAUDE.md")).unwrap();
@@ -885,14 +1063,14 @@ mod tests {
         assert!(
             write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap()
         );
         assert!(
             !write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap(),
             "second run is a no-op"
@@ -915,6 +1093,48 @@ mod tests {
     }
 
     #[test]
+    fn unlink_keeps_a_command_the_user_added_to_our_group() {
+        // `unlink` used to drop the whole group, so a command the user had put
+        // beside ours went with it.
+        let base = temp_dir("settings-shared-group");
+        let claude = base.join("claude");
+        let path = claude.join("settings.json");
+        let prefix = command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap();
+        assert!(write_settings(&claude, Some(&prefix)).unwrap());
+
+        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value
+            .pointer_mut("/hooks/SessionStart/0/hooks")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .push(json!({"type": "command", "command": "echo mine"}));
+        write(&path, &serde_json::to_string_pretty(&value).unwrap());
+
+        assert!(write_settings(&claude, None).unwrap());
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("echo mine"), "{text}");
+        assert!(!text.contains(MARKER), "{text}");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn keeps_a_command_that_only_mentions_the_marker() {
+        // A command that names the marker anywhere but at the end is the
+        // user's own, and `unlink` used to drop its group.
+        let base = temp_dir("settings-mention");
+        let claude = base.join("claude");
+        let path = claude.join("settings.json");
+        let original = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "grep brainmaker-link ~/.claude/settings.json"}]}]}}"#;
+        write(&path, original);
+
+        assert!(!write_settings(&claude, None).unwrap());
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn the_hook_names_the_binary_by_its_full_path() {
         // A bare name fails: nothing puts this binary on PATH, and a shell
         // answers "brainmaker: command not found" at every session start.
@@ -922,7 +1142,7 @@ mod tests {
         let claude = base.join("claude");
         let program = base.join("bin").join("brainmaker");
 
-        write_settings(&claude, Some(&command_prefix(&program, None))).unwrap();
+        write_settings(&claude, Some(&command_prefix(&program, None).unwrap())).unwrap();
         let text = fs::read_to_string(claude.join("settings.json")).unwrap();
 
         assert!(text.contains(program.display().to_string().as_str()));
@@ -939,7 +1159,7 @@ mod tests {
         let claude = base.join("claude");
         let program = base.join("My Apps").join("brainmaker");
 
-        write_settings(&claude, Some(&command_prefix(&program, None))).unwrap();
+        write_settings(&claude, Some(&command_prefix(&program, None).unwrap())).unwrap();
         let value: Value =
             serde_json::from_str(&fs::read_to_string(claude.join("settings.json")).unwrap())
                 .unwrap();
@@ -959,7 +1179,7 @@ mod tests {
         assert!(
             write_settings(
                 &claude,
-                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None))
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
             )
             .unwrap()
         );
@@ -1010,10 +1230,256 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_briefing_that_is_not_text() {
+        // One invalid byte used to read as an empty file, and `link` then wrote
+        // its block over everything the user had kept in `CLAUDE.md`.
+        let base = temp_dir("briefing-not-text");
+        let content = base.join("content");
+        let claude = base.join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        let bytes: &[u8] = b"# Mine\n\xff\xfe\n";
+        fs::write(claude.join("CLAUDE.md"), bytes).unwrap();
+
+        let result = write_briefing(&content, &claude, Some("\"/opt/bm/bin/brainmaker\""));
+
+        assert!(
+            result.is_err(),
+            "a briefing that cannot be read is an error"
+        );
+        assert_eq!(fs::read(claude.join("CLAUDE.md")).unwrap(), bytes);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn keeps_the_key_order_of_the_settings() {
+        // Without `preserve_order` every object came back sorted by key, which
+        // turned a hand-ordered file into one large diff.
+        let base = temp_dir("settings-order");
+        let claude = base.join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        write(
+            &claude.join("settings.json"),
+            r#"{"zeta": 1, "model": "opus", "alpha": {"b": 1, "a": 2}}"#,
+        );
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
+            )
+            .unwrap()
+        );
+
+        let text = fs::read_to_string(claude.join("settings.json")).unwrap();
+        let at = |key: &str| {
+            text.find(key)
+                .unwrap_or_else(|| panic!("{key} is missing from {text}"))
+        };
+        assert!(
+            at("\"zeta\"") < at("\"model\""),
+            "top level reordered: {text}"
+        );
+        assert!(
+            at("\"model\"") < at("\"alpha\""),
+            "top level reordered: {text}"
+        );
+        assert!(at("\"b\"") < at("\"a\""), "nested keys reordered: {text}");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn leaves_no_temporary_file_beside_the_settings() {
+        let base = temp_dir("settings-temp");
+        let claude = base.join("claude");
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
+            )
+            .unwrap()
+        );
+
+        let names: Vec<String> = fs::read_dir(&claude)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"settings.json".to_string()),
+            "got {names:?}"
+        );
+        assert!(
+            names.iter().all(|name| !name.contains(".brainmaker-")),
+            "a temporary file was left behind: {names:?}"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_through_a_link_and_keeps_the_link() {
+        // A dotfiles manager keeps the real file elsewhere and links it in.
+        // Renaming over the link would swap it for a regular file.
+        let base = temp_dir("settings-link");
+        let claude = base.join("claude");
+        let real = base.join("dotfiles").join("settings.json");
+        write(&real, r#"{"model": "opus"}"#);
+        fs::create_dir_all(&claude).unwrap();
+        let link = claude.join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
+            )
+            .unwrap()
+        );
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a regular file"
+        );
+        let text = fs::read_to_string(&real).unwrap();
+        assert!(
+            text.contains("brainmaker-link"),
+            "the file behind the link was not written: {text}"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_through_a_dangling_link_and_keeps_the_link() {
+        // The file behind the link is not there yet, and a plain write would
+        // have created it. The target is relative, as a dotfiles script makes it.
+        let base = temp_dir("settings-dangling");
+        let claude = base.join("claude");
+        let dotfiles = base.join("dotfiles");
+        fs::create_dir_all(&claude).unwrap();
+        fs::create_dir_all(&dotfiles).unwrap();
+        let link = claude.join("settings.json");
+        std::os::unix::fs::symlink("../dotfiles/settings.json", &link).unwrap();
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
+            )
+            .unwrap()
+        );
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by a regular file"
+        );
+        let real = dotfiles.join("settings.json");
+        assert!(real.is_file(), "the file behind the link was not created");
+        let text = fs::read_to_string(&real).unwrap();
+        assert!(
+            text.contains("brainmaker-link"),
+            "the file behind the link was not written: {text}"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_the_mode_of_the_settings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = temp_dir("settings-mode");
+        let claude = base.join("claude");
+        let path = claude.join("settings.json");
+        write(&path, r#"{"model": "opus"}"#);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            write_settings(
+                &claude,
+                Some(&command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap())
+            )
+            .unwrap()
+        );
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "got {mode:o}");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     fn strips_a_block_and_leaves_text_that_holds_none() {
-        assert_eq!(strip_block("plain"), "plain");
+        let path = Path::new("CLAUDE.md");
+        assert_eq!(strip_block("plain", path).unwrap(), "plain");
         let text = format!("a\n{BLOCK_START}\nx\n{BLOCK_END}\nb");
-        assert_eq!(strip_block(&text), "a\n\nb");
+        assert_eq!(strip_block(&text, path).unwrap(), "a\n\nb");
+    }
+
+    #[test]
+    fn refuses_a_start_marker_with_no_end() {
+        let text = format!("mine\n{BLOCK_START}\nx\n");
+
+        let error = strip_block(&text, Path::new("CLAUDE.md")).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("1 start marker(s) and 0 end marker(s)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn refuses_an_end_marker_before_the_start() {
+        let text = format!("{BLOCK_END}\nmine\n{BLOCK_START}\n");
+
+        let error = strip_block(&text, Path::new("CLAUDE.md")).unwrap_err();
+
+        assert!(
+            error.to_string().contains("damaged brainmaker block"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn refuses_two_blocks() {
+        let text = format!("{BLOCK_START}\na\n{BLOCK_END}\nmine\n{BLOCK_START}\nb\n{BLOCK_END}\n");
+
+        let error = strip_block(&text, Path::new("CLAUDE.md")).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("2 start marker(s) and 2 end marker(s)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_damaged_block_leaves_the_briefing_as_it_is() {
+        // With the end line deleted by hand, the next run appended a second
+        // block, and the run after that paired the first start marker with the
+        // new end marker and deleted the text between them.
+        let base = temp_dir("briefing-damaged");
+        let content = base.join("content");
+        let claude = base.join("claude");
+        let original = format!("# Mine\n\nKeep this.\n\n{BLOCK_START}\nleft over\n\nAlso mine.\n");
+        write(&claude.join("CLAUDE.md"), &original);
+
+        let result = write_briefing(&content, &claude, Some("\"/opt/bm/bin/brainmaker\""));
+
+        assert!(result.is_err(), "a damaged block is an error");
+        assert_eq!(
+            fs::read_to_string(claude.join("CLAUDE.md")).unwrap(),
+            original
+        );
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]

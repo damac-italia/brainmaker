@@ -23,11 +23,17 @@ brainmaker [COMMAND] [OPTIONS]
 
 The parser accepts one command. A second command is an error, and so is any unrecognised argument.
 
+`link` and `unlink` replace `settings.json` and `CLAUDE.md` through a temporary file and a rename.
+They exit 1 and leave the file as it is when it exists but cannot be read as text, and when
+`CLAUDE.md` holds a marker pair that is not one start marker followed by one end marker. The error
+names the file and the count of each marker. `link` also exits 1 when the path of the program or of
+the root holds a control character, because the hook command cannot carry it.
+
 ### Options
 
 | Option | Argument | Applies to | Effect |
 |---|---|---|---|
-| `--force` | none | `sync`, `self-update` | With `sync`, download and extract even when the content is up to date. With `self-update`, reinstall the same version. |
+| `--force` | none | `sync`, `self-update` | With `sync`, download and extract even when the content is up to date, and install a release whose sequence is not higher than the installed one. With `self-update`, reinstall the same version. |
 | `--check` | none | `self-update` | Report the newer version and install nothing |
 | `--no-update-check` | none | `sync` | Skip the software version check |
 | `-y`, `--yes` | none | `uninstall` | Remove without asking first |
@@ -38,10 +44,20 @@ The parser accepts one command. A second command is an error, and so is any unre
 | `--claude-dir` | `<PATH>` | `link`, `unlink`, `uninstall` | Write to `PATH` instead of `~/.claude`. The LaunchAgent is then left alone, unless `--agent-dir` is also given. |
 | `--agent-dir` | `<PATH>` | `link`, `unlink`, `uninstall` | Write the LaunchAgent to `PATH` instead of `~/Library/LaunchAgents`, and do not load it |
 | `-q`, `--quiet` | none | all | Print errors only |
-| `-h`, `--help` | none | — | Print the help text and exit 0 |
-| `-V`, `--version` | none | — | Print `brainmaker <version>` and exit 0 |
+| `-h`, `--help` | none | any | Print the help text and exit 0 |
+| `-V`, `--version` | none | any | Print `brainmaker <version>` and exit 0 |
 
-`--config`, `--dir`, `--url`, `--claude-dir`, and `--agent-dir` fail when their value is absent.
+The parser enforces the "Applies to" column. An option given with another command exits 1 with
+`<flag> has no effect with <command>; run brainmaker --help`.
+
+`--config`, `--dir`, `--url`, `--claude-dir`, and `--agent-dir` take a value, and each one fails:
+
+- when the value is absent, with `<flag> needs a path` or `<flag> needs a URL`;
+- when the value starts with a hyphen, because that is the next option. For a path, the message
+  tells you to write it as `./<value>`;
+- when the option is given twice, with `<flag> is given twice; give it once`.
+
+A switch such as `--quiet` may be given twice.
 
 ### The LaunchAgent
 
@@ -78,6 +94,16 @@ prints `notice: cannot check the latest content version: ...` and
 `notice: the installed content <hash> stays in place.` to stderr, and exits 0. With nothing
 installed, or with `--force`, the failure exits 1.
 
+A `sync` that waits 30 seconds for the install lock of another run, and still finds it held, is
+treated the same way while content is installed: `brainmaker` prints
+`notice: another brainmaker run is installing content.` and
+`notice: the installed content <hash> stays in place.` to stderr, and exits 0. `--quiet` suppresses
+both lines. With nothing installed, or with `--force`, it exits 1. A `self-update` that cannot take
+the update lock within 30 seconds exits 1.
+
+A `sync` exits 1 when the server offers a release with another hash whose sequence is not higher
+than the installed one. The content stays as it was. `--force` installs that release.
+
 `uninstall` exits 0 and removes nothing when the answer to its question is not `y` or `yes`. It
 exits 1 when stdin is not a terminal and `--yes` is absent. A removal that fails part-way exits 1
 with part of the install already gone; run the command again to finish.
@@ -92,7 +118,7 @@ and `--url` with `<flag> has no effect with uninstall, which loads no settings`,
 | Step | Removes | When |
 |---|---|---|
 | 1 | The LaunchAgent, the skill links, the `SessionStart` hook, and the `CLAUDE.md` block that `link` wrote, as `unlink` removes them | the root is recognised or does not exist |
-| 2 | `content/`, `.staging/`, `.trash/`, `.download.zip`, and `agent.log` | the root is recognised |
+| 2 | `content/`, `.staging/`, `.trash/`, `.download.zip`, `.lock`, `.update.lock`, and `agent.log` | the root is recognised |
 | 3 | `bin/brainmaker`, and every `bin/.brainmaker*` file that `link` or `self-update` left | the root is recognised |
 | 4 | `state.json.tmp`, `state.json`, `confidential/config.tmp`, and `confidential/config.enc` | the root is recognised |
 | 5 | `bin/`, `confidential/`, and then the root | each one is empty |
@@ -124,6 +150,7 @@ the run prints a notice and the path to delete after the command exits.
 | `token url` | The token endpoint in use, or `<none>` |
 | `auth` | `absent`, or `client-credentials grant, scope sync, client id N characters, secret N characters`. Never a credential itself. |
 | `key` | `release` or `development`, naming which build key this binary carries |
+| `binding` | What ties the sealed store to this machine: `machine identifier`, `home directory path (weak)`, or `none (weak)`. A `(weak)` value means a copy of `config.enc` opens on another machine. |
 | `signing` | Both key counts, as `N trusted software key(s), N trusted content key(s)`. `0` software keys means it installs no update; `0` content keys means it installs no content. |
 | `installed` | The hash in `state.json`, or `<none>` |
 | `present` | `yes` when `content/` is a directory |
@@ -207,7 +234,7 @@ grant_type=client_credentials&scope=sync
 |---|---|
 | `access_token` | Required. 1 to 8192 bytes of printable ASCII. A control character fails the run, because the value goes into a header. |
 | `token_type` | Optional. `Bearer` in any case. Any other value fails the run. |
-| `expires_in` | Optional, in seconds. It defaults to 600. The client stops using the token 30 seconds before it expires. |
+| `expires_in` | Optional, in seconds. It defaults to 600. The client uses at most 3600 of it, and stops using the token 30 seconds before that time ends. |
 
 The response body is read up to 64 KiB. One run gets one token and reuses it, so a server that
 issues a 10-minute token serves one token request per run.
@@ -230,7 +257,7 @@ Returns the signed description of the current content.
 ```json
 {
   "hash": "a1b2c3d4",
-  "payload": "{\"hash\":\"a1b2c3d4\",\"sha256\":\"<64 hex>\",\"size_bytes\":1152430}",
+  "payload": "{\"hash\":\"a1b2c3d4\",\"sha256\":\"<64 hex>\",\"size_bytes\":1152430,\"sequence\":1760000000}",
   "signature": "<128 hex>"
 }
 ```
@@ -249,6 +276,7 @@ then reads these fields from the payload:
 | `hash` | Exactly 8 ASCII alphanumeric characters. |
 | `sha256` | 64 hexadecimal characters, the digest of the archive. |
 | `size_bytes` | Above 0 and at or below 512 MiB. |
+| `sequence` | Optional. A whole number, higher for a later release. `brainmaker-sign` writes the time of signing. The client refuses a release whose sequence is not higher than the installed one. |
 
 A response with no `payload` or no `signature` fails the run. The bare `hash` is kept beside them
 so a client older than the signing change keeps working, which is what lets a deployment publish
@@ -325,7 +353,8 @@ Returns one replacement binary. The client asks for the route with `{version}`, 
 asks for `software/brainmaker-0.2.0-darwin-arm64`, which is the name the release workflow produces.
 
 The client reads the body up to 128 MiB, checks its SHA-256 against the signed manifest, and runs it
-with `--version` before it swaps.
+with `--version` before it swaps. The output, with surrounding white space removed, must be exactly
+`brainmaker <version>`, where `<version>` is the manifest version.
 
 ### Error responses
 
@@ -336,13 +365,15 @@ with `--version` before it swaps.
 | other | `the server returned HTTP <code>` |
 | timeout | `the request timed out` |
 | DNS failure | `cannot resolve the host name` |
+| body past the limit | `the body of <url> is larger than the limit of <n> bytes` |
 
 Every status message ends with the message the server itself returned, after a colon. A server that
 answers `{"error": "..."}` contributes that string, so an empty deployment reads
 `the server returned HTTP 404 Not Found: no content release is published` rather than the status
 alone. A body that is not that JSON object is printed as it stands, which keeps a proxy's own page
 readable. Either way the text is collapsed onto one line and stops at 200 characters. The two
-transport rows carry no such message, because no response arrived.
+transport rows and the size row carry no such message. A download that fails for any reason after
+its file was created removes that file.
 
 ## Provisioning file format
 
@@ -408,24 +439,27 @@ cargo build --features sign --bin brainmaker-sign
 
 | Command | Effect |
 |---|---|
-| `keygen <KEY-FILE>` | Write a new PKCS#8 Ed25519 key with mode `0600`, and print its public key. Fails when the file exists. |
+| `keygen <KEY-FILE>` | Write a new PKCS#8 Ed25519 key, and print its public key. On Unix the file has mode `0600` from the moment it is created. Fails when anything exists at the path, a symbolic link included. |
 | `sign <KEY-FILE\|-> <MANIFEST-FILE> <ENVELOPE-FILE>` | Check the manifest, sign it, and write the envelope |
-| `sign-content <KEY-FILE\|-> <ARCHIVE> <HASH> <ENVELOPE-FILE>` | Digest the archive, sign `hash`, `sha256` and `size_bytes`, and write the envelope |
+| `sign-content <KEY-FILE\|-> <ARCHIVE> <HASH> <ENVELOPE-FILE> [SEQUENCE]` | Digest the archive, sign `hash`, `sha256`, `size_bytes` and `sequence`, and write the envelope. The sequence is the time of signing unless `SEQUENCE` names one. |
 | `verify <ENVELOPE-FILE> <PUBLIC-KEY>...` | Check an envelope against one or more public keys, the way `brainmaker` checks it |
 
 Pass `-` in place of the key file to read the key from `$BRAINMAKER_SIGNING_KEY` as hexadecimal.
 The release workflow uses that form, so the private key never reaches the runner's disk.
 
 `sign` refuses a manifest that `brainmaker` could not use: one that is not JSON, one whose
-`version` is empty or longer than 64 characters, one with no platform, or one whose `sha256` is not
-64 hexadecimal characters.
+`version` is not 1 to 64 characters of ASCII letters, digits, dots, hyphens, and plus signs, one
+with no platform, or one whose `sha256` is not 64 hexadecimal characters.
 
-`sign-content` refuses a hash that is not 8 alphanumeric ASCII characters, and an empty archive. It
-signs no URL, because the client derives the download address itself.
+`sign-content` refuses a hash that is not 8 alphanumeric ASCII characters, an empty archive, an
+archive of more than 512 MiB, and a `SEQUENCE` that is not a whole number. It signs no URL, because
+the client derives the download address itself.
 
 `verify` accepts either shape and names which it read. It tells them apart by field: a payload with
-`platforms` is a software manifest, and one with `sha256` is a content release. Neither list of keys
-is implied — pass the keys from `PUBLIC_KEYS` to check a manifest, and those from `CONTENT_KEYS` to
-check a content release, because `verify` passes when any key given accepts.
+`platforms` is a software manifest, and one with `sha256` is a content release. It then applies the
+checks of `sign` or `sign-content` to the payload, and it also refuses a content release that
+carries a `url` or a `sequence` that is not a whole number. Neither list of keys is implied: pass
+the keys from `PUBLIC_KEYS` to check a manifest, and those from `CONTENT_KEYS` to check a content
+release, because `verify` passes when any key given accepts.
 
 Every command exits 0 on success and 1 on failure.

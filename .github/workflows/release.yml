@@ -12,8 +12,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Every job reads the repository and nothing more. The manifest job alone
+# creates the release, so it alone may write.
 permissions:
-  contents: write
+  contents: read
 
 # This workflow learns no customer endpoint, and it publishes none. The manifest
 # carries a version and one SHA-256 per platform. Each client derives the
@@ -48,7 +50,12 @@ jobs:
             exe: .exe
 
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No later step pushes to the repository, so the token does not stay
+          # in the checkout.
+          persist-credentials: false
 
       # A build without the key would ship the published development key, and
       # every employee's sealed configuration would be readable with a stock
@@ -102,16 +109,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      # The same toolchain step that the test workflow uses, so that a release
+      # is built by the compiler that tested it, and not by whatever the
+      # runner image holds.
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
       - name: Add the Rust target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Build
+      - name: Build the dependencies
         # ring compiles C, so cc-rs must find a compiler that targets musl.
         # For x86_64-unknown-linux-musl, cc-rs tries "x86_64-linux-musl-gcc"
         # and then falls back to "musl-gcc". For aarch64-unknown-linux-musl it
         # tries "aarch64-linux-musl-gcc" with no musl fallback, and then drops
         # to plain "gcc", which targets glibc. Name the compiler here so that
         # neither target relies on that guess.
+        #
+        # This step holds no secret. Every dependency, with its build script
+        # and its procedural macros, compiles here.
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build
+        # build.rs declares rerun-if-env-changed for the key, so this run
+        # rebuilds the brainmaker crate alone. No dependency compiles again,
+        # and no dependency build script runs again. The procedural macros that
+        # the brainmaker crate uses, such as serde_derive, still run in this
+        # step with the key in their environment, so the split keeps the key
+        # from dependency build scripts, not from all dependency code.
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
@@ -146,7 +177,7 @@ jobs:
           echo "$reported"
           test "$reported" = "brainmaker $VERSION"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: brainmaker-${{ matrix.key }}
           path: dist/brainmaker-*
@@ -157,10 +188,17 @@ jobs:
     name: manifest
     needs: build
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No later step pushes to the repository, so the token does not stay
+          # in the checkout.
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: staging
           pattern: brainmaker-*
@@ -193,9 +231,25 @@ jobs:
           ./scripts/make-manifest.sh dist "$VERSION"
           cat dist/manifest.json
 
+      # The same toolchain step that the test workflow uses, so that a release
+      # is built by the compiler that tested it, and not by whatever the
+      # runner image holds.
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      # Built with no secret in the environment. A dependency build script or
+      # a procedural macro runs during this step, and it must find no key.
+      - name: Build the signing tool
+        run: cargo build --release --locked --features sign --bin brainmaker-sign
+
       # brainmaker refuses an unsigned manifest, so a release without this
-      # secret would publish a manifest that every client rejects.
+      # secret would publish a manifest that every client rejects. A run
+      # started by hand builds and checksums, and signs nothing, because no
+      # tag vouches for the version it would sign.
       - name: Check that the signing key is set
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           BRAINMAKER_SIGNING_KEY: ${{ secrets.BRAINMAKER_SIGNING_KEY }}
         run: |
@@ -209,18 +263,19 @@ jobs:
 
       # The private key reaches the tool through the environment and never
       # touches the runner's disk. The tool refuses to sign a manifest that
-      # brainmaker could not use.
+      # brainmaker could not use. An earlier step, which held no secret, built
+      # the tool, so no build script runs here.
       - name: Sign the manifest
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           BRAINMAKER_SIGNING_KEY: ${{ secrets.BRAINMAKER_SIGNING_KEY }}
-        run: |
-          cargo build --release --locked --features sign --bin brainmaker-sign
-          ./target/release/brainmaker-sign sign - dist/manifest.json dist/manifest.signed.json
+        run: ./target/release/brainmaker-sign sign - dist/manifest.json dist/manifest.signed.json
 
       # The signed manifest must verify against the keys that this revision
       # compiles into the binaries. A key mismatch here would otherwise stop
       # every self-update in the field.
       - name: Check that the signed manifest verifies
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           # Read the PUBLIC_KEYS block alone. A bare grep over the file would
           # also collect CONTENT_KEYS, and verify passes when ANY key given
@@ -245,11 +300,12 @@ jobs:
           cp target/release/brainmaker-sign \
              "tools-dist/brainmaker-sign-$VERSION-linux-x86_64"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: brainmaker-release
           path: dist/
           if-no-files-found: error
+          retention-days: 7
 
       # GitHub writes the notes from the pull requests merged since the
       # previous tag: a "What's Changed" list, any new contributors, and a

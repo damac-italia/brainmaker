@@ -271,4 +271,35 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_a_symbolic_link_entry() {
+        let dir = temp_dir("extract-symlink");
+        let archive = dir.join("content.zip");
+
+        let file = File::create(&archive).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+        writer.start_file("real.txt", options).unwrap();
+        writer.write_all(b"real").unwrap();
+        // A link that points out of the destination, once it exists there.
+        writer
+            .add_symlink("link", "../outside.txt", options)
+            .unwrap();
+        writer.finish().unwrap();
+
+        let dest = dir.join("out");
+        let stats = extract(&archive, &dest).unwrap();
+
+        assert_eq!(stats.files, 1);
+        assert_eq!(stats.skipped, 1);
+        assert!(dest.join("real.txt").is_file());
+        assert!(
+            fs::symlink_metadata(dest.join("link")).is_err(),
+            "the link was extracted"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

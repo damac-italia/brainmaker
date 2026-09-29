@@ -58,6 +58,13 @@ const DEFAULT_LIFETIME: Duration = Duration::from_secs(600);
 /// arrive with a token that the server has already rejected.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(30);
 
+/// Longest lifetime we accept from the server.
+///
+/// The value reaches us from the network and is added to a clock reading. One
+/// hour is six times what the server issues, and it keeps that sum far from an
+/// overflow.
+const MAX_LIFETIME: Duration = Duration::from_secs(3600);
+
 /// Longest token we accept. A token longer than this is a server fault.
 const MAX_TOKEN_LEN: usize = 8192;
 
@@ -110,11 +117,17 @@ impl TokenCache {
     }
 
     /// Replaces the cached token.
+    ///
+    /// A lifetime that the clock cannot hold stores nothing, so the next
+    /// request asks for a new token.
     fn put(&self, token: &str, lifetime: Duration) {
+        let Some(usable_until) = Instant::now().checked_add(lifetime) else {
+            return;
+        };
         if let Ok(mut guard) = self.inner.lock() {
             *guard = Some(Cached {
                 token: token.to_string(),
-                usable_until: Instant::now() + lifetime,
+                usable_until,
             });
         }
     }
@@ -139,10 +152,24 @@ pub fn bearer(config: &Config) -> Result<Option<String>> {
     Ok(Some(token))
 }
 
+/// Returns the time for which this client uses a token.
+///
+/// `expires_in` is the server's own value, in seconds. The result is never
+/// longer than [`MAX_LIFETIME`], and it is [`EXPIRY_MARGIN`] shorter than the
+/// bounded value.
+fn usable_lifetime(expires_in: Option<u64>) -> Duration {
+    expires_in
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_LIFETIME)
+        .min(MAX_LIFETIME)
+        .saturating_sub(EXPIRY_MARGIN)
+}
+
 /// Exchanges the client credentials for a token.
 ///
-/// Returns the token and the time for which this client will use it, which is
-/// [`EXPIRY_MARGIN`] shorter than the server's own lifetime.
+/// Returns the token and the time for which this client will use it. That time
+/// comes from [`usable_lifetime`]: the server's value, cut to at most
+/// [`MAX_LIFETIME`], less [`EXPIRY_MARGIN`].
 fn request_token(credentials: &Credentials, url: &str) -> Result<(String, Duration)> {
     let agent = remote::build_agent(remote::TEXT_TIMEOUT);
 
@@ -179,11 +206,7 @@ fn request_token(credentials: &Credentials, url: &str) -> Result<(String, Durati
     let token = parsed.access_token;
     check_token(&token)?;
 
-    let lifetime = parsed
-        .expires_in
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_LIFETIME)
-        .saturating_sub(EXPIRY_MARGIN);
+    let lifetime = usable_lifetime(parsed.expires_in);
 
     Ok((token, lifetime))
 }
@@ -284,6 +307,7 @@ pub fn base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{Route, Server, temp_dir};
 
     #[test]
     fn encodes_the_base64_test_vectors() {
@@ -343,6 +367,28 @@ mod tests {
     }
 
     #[test]
+    fn bounds_the_lifetime_that_the_server_names() {
+        assert_eq!(
+            usable_lifetime(Some(u64::MAX)),
+            MAX_LIFETIME - EXPIRY_MARGIN
+        );
+        assert_eq!(
+            usable_lifetime(Some(600)),
+            Duration::from_secs(600) - EXPIRY_MARGIN
+        );
+        assert_eq!(usable_lifetime(None), DEFAULT_LIFETIME - EXPIRY_MARGIN);
+        // A lifetime shorter than the margin is zero, not negative.
+        assert_eq!(usable_lifetime(Some(5)), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_lifetime_the_clock_cannot_hold_caches_nothing() {
+        let cache = TokenCache::default();
+        cache.put("token", Duration::MAX);
+        assert!(cache.get().is_none());
+    }
+
+    #[test]
     fn no_endpoint_is_compiled_into_this_module() {
         // The distributed binary must disclose no customer endpoint.
         let source = include_str!("auth.rs");
@@ -360,5 +406,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A server whose token route answers with `status` and `body`.
+    fn serving_token(status: u16, body: &str) -> Server {
+        Server::start(vec![Route {
+            status,
+            ..Route::post("/oauth2/token", body)
+        }])
+    }
+
+    #[test]
+    fn exchanges_the_credentials_for_a_token() {
+        let server = serving_token(
+            200,
+            r#"{"access_token":"abc","expires_in":600,"token_type":"Bearer"}"#,
+        );
+        let dir = temp_dir("auth-exchange");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let token = bearer(&config).unwrap();
+
+        assert_eq!(token, Some("abc".to_string()));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        let (method, path, authorization) = &requests[0];
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/oauth2/token");
+        assert!(authorization.starts_with("Basic "), "got {authorization}");
+        // The base64 of "the-client-id:the-client-secret", which the system
+        // base64 tool computed, so that the wire format does not rest on this
+        // module's own encoder.
+        assert_eq!(
+            authorization,
+            "Basic dGhlLWNsaWVudC1pZDp0aGUtY2xpZW50LXNlY3JldA=="
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn asks_for_one_token_per_run() {
+        let server = serving_token(200, r#"{"access_token":"abc","expires_in":600}"#);
+        let dir = temp_dir("auth-cache");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        assert_eq!(bearer(&config).unwrap(), Some("abc".to_string()));
+        assert_eq!(bearer(&config).unwrap(), Some("abc".to_string()));
+
+        assert_eq!(server.requests().len(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_token_type_that_is_not_bearer() {
+        let server = serving_token(
+            200,
+            r#"{"access_token":"abc","expires_in":600,"token_type":"mac"}"#,
+        );
+        let dir = temp_dir("auth-token-type");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let error = bearer(&config).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("token type"), "got {text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_token_that_holds_a_line_break() {
+        // The JSON escapes decode to a carriage return and a line feed, which
+        // would let the server write a header of its own.
+        let server = serving_token(200, r#"{"access_token":"a\r\nX-Injected: 1"}"#);
+        let dir = temp_dir("auth-line-break");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let error = bearer(&config).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("cannot send"), "got {text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn names_the_reason_that_the_token_endpoint_gives() {
+        let server = serving_token(
+            401,
+            r#"{"error":"invalid_client","error_description":"unknown client"}"#,
+        );
+        let dir = temp_dir("auth-rejected");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let error = bearer(&config).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("invalid_client"), "got {text}");
+        assert!(text.contains("unknown client"), "got {text}");
+        assert!(!text.contains("the-client-secret"), "got {text}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sends_no_header_when_no_credential_is_configured() {
+        let server = Server::start(vec![Route::get("/x", "hello")]);
+        let dir = temp_dir("auth-none");
+        let config = Config::for_test(&dir, &server.base());
+
+        assert_eq!(bearer(&config).unwrap(), None);
+        remote::fetch_text(&config, &format!("{}/x", server.base()), 1024).unwrap();
+
+        // One request, the one for the route, with no Authorization header.
+        assert_eq!(
+            server.requests(),
+            vec![("GET".to_string(), "/x".to_string(), String::new())]
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

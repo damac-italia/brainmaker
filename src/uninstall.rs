@@ -9,7 +9,8 @@
 //!    would name a program that is gone, and would then fail on every run.
 //! 2. What brainmaker writes under the root: the content, the program copy
 //!    that the hook runs, the state file, the sealed settings, the agent's
-//!    log, and any temporary file that a stopped run left behind.
+//!    log, the two lock files, and any temporary file that a stopped run left
+//!    behind.
 //! 3. The root itself, once nothing else is left in it.
 //!
 //! # What it leaves
@@ -190,6 +191,8 @@ fn remove_root(
         layout.staging_dir(),
         layout.trash_dir(),
         layout.download_file(),
+        layout.lock_file(),
+        layout.update_lock_file(),
         schedule::log_path(root),
     ];
     paths.extend(program_files(bin, &installed)?);
@@ -561,6 +564,10 @@ mod tests {
         write(&layout.staging_dir().join("CLAUDE.md"), b"half\n");
         write(&layout.trash_dir().join("CLAUDE.md"), b"old\n");
         write(&layout.download_file(), b"zip\n");
+        // The lock files that sync and self-update leave between runs, under
+        // the names that docs/API.md gives.
+        write(&root.join(".lock"), b"");
+        write(&root.join(".update.lock"), b"");
         write(&state::temporary_path(&layout.state_file()), b"{}\n");
         write(&secretstore::temporary_path(&layout.store_path()), b"x\n");
         // What link and self-update stage beside the program copy.
@@ -576,6 +583,8 @@ mod tests {
         let report = uninstall(&layout, &base.join("claude"), None, &quiet).unwrap();
 
         assert!(report.root_removed, "left {:?}", report.left);
+        assert!(!root.join(".lock").exists());
+        assert!(!root.join(".update.lock").exists());
         assert!(!root.exists());
         fs::remove_dir_all(&base).ok();
     }

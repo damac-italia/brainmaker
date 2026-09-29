@@ -224,6 +224,25 @@ fn check_credential_value(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fails for a provisioning file whose values this client could not use.
+///
+/// `provision::read` already checked the base URLs and the credential set.
+/// This adds the two checks that live in this module: the character rules on
+/// the credentials, and the rules on the five routes. It runs before the
+/// store is written, so a file that fails leaves the previous store, and the
+/// file itself, in place.
+fn check_importable(settings: &Settings) -> Result<()> {
+    if let (Some(endpoint), Some(id), Some(secret)) = (
+        settings.jwt_endpoint(),
+        settings.client_id(),
+        settings.client_secret(),
+    ) {
+        Credentials::new(endpoint.to_string(), id.to_string(), secret.to_string())?;
+    }
+    Routes::load(|key| settings.get(key).map(str::to_string))?;
+    Ok(())
+}
+
 /// Where brainmaker keeps its files: the root, and every path under it.
 ///
 /// `Config` answers each of its paths through this. `uninstall` builds a
@@ -240,7 +259,7 @@ impl Layout {
     pub fn resolve(dir: Option<&Path>) -> Result<Self> {
         let root = match dir {
             Some(path) => absolute(path)?,
-            None => dirs::home_dir()
+            None => std::env::home_dir()
                 .context("cannot locate the home directory")?
                 .join(".brainmaker"),
         };
@@ -282,6 +301,19 @@ impl Layout {
     /// File that receives the downloaded archive.
     pub fn download_file(&self) -> PathBuf {
         self.root.join(".download.zip")
+    }
+
+    /// File that one run locks while it installs content.
+    pub fn lock_file(&self) -> PathBuf {
+        self.root.join(".lock")
+    }
+
+    /// File that one run locks while it replaces the program.
+    ///
+    /// A second file, so that a long content download does not hold back a
+    /// software update, and the reverse.
+    pub fn update_lock_file(&self) -> PathBuf {
+        self.root.join(".update.lock")
     }
 }
 
@@ -330,12 +362,24 @@ impl Config {
 
         if let Some(path) = provision::find(options.config.as_deref(), store.is_file())? {
             settings = provision::read(&path)?;
+            check_importable(&settings)
+                .with_context(|| format!("{} is not a usable provisioning file", path.display()))?;
             let sealed = secretstore::seal(settings.to_text().as_bytes())?;
             secretstore::write_owner_only(&store, &sealed)?;
             log(&format!(
                 "Imported the configuration from {}",
                 path.display()
             ));
+            let binding = secretstore::binding();
+            if binding.is_weak() {
+                log(&format!(
+                    "warning: this system gives no machine identifier, so the sealed settings \
+                     are bound to: {}. A copy of {} opens on another machine that has the \
+                     same binary.",
+                    binding.name(),
+                    store.display()
+                ));
+            }
 
             let mut removed = false;
             if !options.keep_config {
@@ -495,6 +539,16 @@ impl Config {
         self.layout.download_file()
     }
 
+    /// File that one run locks while it installs content.
+    pub fn lock_file(&self) -> PathBuf {
+        self.layout.lock_file()
+    }
+
+    /// File that one run locks while it replaces the program.
+    pub fn update_lock_file(&self) -> PathBuf {
+        self.layout.update_lock_file()
+    }
+
     /// URL that returns the latest content hash as JSON.
     pub fn latest_url(&self) -> String {
         join(&self.base_url, &self.routes.content_latest)
@@ -602,6 +656,41 @@ pub fn validate_hash(hash: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// This block follows every production item on purpose. The test
+// `no_endpoint_is_compiled_into_this_module` reads only the text that comes
+// before the first item that is built for tests alone, so a block placed
+// earlier would take the rest of the file out of that check.
+#[cfg(test)]
+impl Config {
+    /// A configuration for a test: the root, a base URL, and nothing else.
+    pub fn for_test(root: &Path, base_url: &str) -> Self {
+        Self {
+            layout: Layout {
+                root: root.to_path_buf(),
+            },
+            base_url: base_url.to_string(),
+            routes: Routes::default(),
+            credentials: None,
+            tokens: Arc::new(TokenCache::default()),
+            source: Source::Stored,
+        }
+    }
+
+    /// The same, with client credentials for a token endpoint.
+    pub fn for_test_with_credentials(root: &Path, base_url: &str, jwt_endpoint: &str) -> Self {
+        let mut config = Self::for_test(root, base_url);
+        config.credentials = Some(
+            Credentials::new(
+                jwt_endpoint.to_string(),
+                "the-client-id".to_string(),
+                "the-client-secret".to_string(),
+            )
+            .expect("the test credentials are usable"),
+        );
+        config
+    }
 }
 
 #[cfg(test)]
@@ -859,6 +948,138 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// The client secret in the test files. No error text may show it.
+    const TEST_SECRET: &str = "s3cr3t-value-7f3a";
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "brainmaker-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The settings of a provisioning file that holds a base URL, the three
+    /// credential keys, and one route.
+    fn file_settings(client_id: &str, latest_path: &str) -> Settings {
+        provision::parse(&format!(
+            "BRAINMAKER_API_BASE=https://api.example.test/v1\n\
+             SWETSI_JWT_ENDPOINT=https://api.example.test/swetsi/v1/\n\
+             SWETSI_CLIENT_ID={client_id}\n\
+             SWETSI_CLIENT_SECRET={TEST_SECRET}\n\
+             BRAINMAKER_CONTENT_LATEST_PATH={latest_path}\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn accepts_a_file_whose_routes_and_credentials_are_usable() {
+        let settings = file_settings("the-client-id", "state/current");
+        let result = check_importable(&settings);
+        assert!(result.is_ok(), "got {result:?}");
+    }
+
+    #[test]
+    fn refuses_a_file_whose_route_is_a_whole_url() {
+        let settings = file_settings("the-client-id", "https://other.example.test/x");
+        assert!(check_importable(&settings).is_err());
+    }
+
+    #[test]
+    fn refuses_a_file_whose_route_climbs_out_of_the_base() {
+        let settings = file_settings("the-client-id", "../x");
+        assert!(check_importable(&settings).is_err());
+    }
+
+    #[test]
+    fn refuses_a_file_whose_client_id_holds_a_colon() {
+        let settings = file_settings("a:b", "state/current");
+        let error = check_importable(&settings).unwrap_err();
+        let shown = format!("{error:#}");
+        // The error must name the identifier key and must not show the secret.
+        // The failure messages leave out the error text, so that a failing run
+        // does not print the secret either.
+        assert!(
+            shown.contains(CLIENT_ID_ENV),
+            "the error does not name {CLIENT_ID_ENV}"
+        );
+        assert!(
+            !shown.contains(TEST_SECRET),
+            "the error text shows the client secret"
+        );
+    }
+
+    #[test]
+    fn a_file_that_fails_the_check_leaves_the_store_and_itself_in_place() {
+        let dir = temp_dir("import-bad-route");
+        let file = dir.join("bad.env");
+        std::fs::write(
+            &file,
+            "BRAINMAKER_API_BASE=https://api.example.test/v1\n\
+             BRAINMAKER_CONTENT_LATEST_PATH=../x\n",
+        )
+        .unwrap();
+
+        let options = Options {
+            root: Some(dir.join("root")),
+            base_url: None,
+            config: Some(file.clone()),
+            keep_config: false,
+        };
+        let result = Config::load(&options, &|_: &str| {});
+
+        assert!(result.is_err(), "the route leaves the base URL");
+        assert!(file.exists(), "the failed import removed the file");
+        assert!(
+            !dir.join("root/confidential/config.enc").exists(),
+            "the failed import wrote the store"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_bad_file_leaves_a_working_store_as_it_was() {
+        let dir = temp_dir("import-keeps-store");
+        let store = dir.join("root/confidential/config.enc");
+
+        // A usable file makes the store.
+        let good = dir.join("good.env");
+        std::fs::write(&good, "BRAINMAKER_API_BASE=https://api.example.test/v1\n").unwrap();
+        let mut options = Options {
+            root: Some(dir.join("root")),
+            base_url: None,
+            config: Some(good),
+            keep_config: false,
+        };
+        let loaded = Config::load(&options, &|_: &str| {});
+        assert!(loaded.is_ok(), "got {loaded:?}");
+        let before = std::fs::read(&store).unwrap();
+
+        // A file with a route that leaves the base URL must not replace it.
+        let bad = dir.join("bad.env");
+        std::fs::write(
+            &bad,
+            "BRAINMAKER_API_BASE=https://api.example.test/v1\n\
+             BRAINMAKER_CONTENT_LATEST_PATH=../x\n",
+        )
+        .unwrap();
+        options.config = Some(bad.clone());
+        let result = Config::load(&options, &|_: &str| {});
+
+        assert!(result.is_err(), "the route leaves the base URL");
+        assert!(bad.exists(), "the failed import removed the file");
+        assert!(
+            std::fs::read(&store).unwrap() == before,
+            "the failed import changed the store"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

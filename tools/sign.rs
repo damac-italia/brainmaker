@@ -34,10 +34,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
+use ring::digest::{SHA256, digest};
 use ring::rand::SystemRandom;
 use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// Environment variable that carries the PKCS#8 key as hexadecimal.
 ///
@@ -45,13 +45,22 @@ use sha2::{Digest, Sha256};
 /// never touches the runner's disk.
 const KEY_ENV: &str = "BRAINMAKER_SIGNING_KEY";
 
+/// Length of a content hash. The client holds the same value as HASH_LEN
+/// in src/config.rs, and a test below fails when the two differ.
+const HASH_LEN: usize = 8;
+
+/// Largest archive that the client installs. The client holds the same
+/// value as MAX_ARCHIVE_BYTES in src/config.rs, and a test below fails
+/// when the two differ.
+const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+
 const HELP: &str = "\
 brainmaker-sign — generate a signing key, and sign what brainmaker installs
 
 USAGE:
     brainmaker-sign keygen <KEY-FILE>
     brainmaker-sign sign <KEY-FILE|-> <MANIFEST-FILE> <ENVELOPE-FILE>
-    brainmaker-sign sign-content <KEY-FILE|-> <ARCHIVE> <HASH> <ENVELOPE-FILE>
+    brainmaker-sign sign-content <KEY-FILE|-> <ARCHIVE> <HASH> <ENVELOPE-FILE> [SEQUENCE]
     brainmaker-sign verify <ENVELOPE-FILE> <PUBLIC-KEY>...
 
 COMMANDS:
@@ -59,7 +68,10 @@ COMMANDS:
     sign          Wrap a software manifest and its signature into the envelope
                   that brainmaker downloads
     sign-content  Digest a content archive and sign the result, giving the
-                  envelope that {base}/content/latest returns
+                  envelope that {base}/content/latest returns. The payload
+                  carries a sequence, which is the time of signing unless
+                  SEQUENCE names one. A client installs only a release with
+                  a higher sequence than the one it holds.
     verify        Check an envelope against one or more public keys, the way
                   brainmaker checks it. Run this before you publish.
 
@@ -100,8 +112,15 @@ fn run(args: &[&str]) -> Result<()> {
         ["keygen", key_file] => keygen(Path::new(key_file)),
         ["sign", key, manifest, envelope] => sign(key, Path::new(manifest), Path::new(envelope)),
         ["sign-content", key, archive, hash, envelope] => {
-            sign_content(key, Path::new(archive), hash, Path::new(envelope))
+            sign_content(key, Path::new(archive), hash, Path::new(envelope), None)
         }
+        ["sign-content", key, archive, hash, envelope, sequence] => sign_content(
+            key,
+            Path::new(archive),
+            hash,
+            Path::new(envelope),
+            Some(sequence),
+        ),
         ["verify", envelope, keys @ ..] if !keys.is_empty() => verify(Path::new(envelope), keys),
         _ => bail!("unknown arguments; run brainmaker-sign --help"),
     }
@@ -109,22 +128,28 @@ fn run(args: &[&str]) -> Result<()> {
 
 /// Writes a new key, and prints the public half.
 fn keygen(key_file: &Path) -> Result<()> {
-    if key_file.exists() {
-        bail!(
-            "{} already exists. Signing with a new key needs a key rotation, \
-             so move the old file aside on purpose.",
-            key_file.display()
-        );
-    }
+    use std::io::Write;
 
     let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
         .map_err(|_| anyhow::anyhow!("cannot generate a key"))?;
     let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
         .map_err(|error| anyhow::anyhow!("cannot read the generated key: {error}"))?;
 
-    std::fs::write(key_file, hex(pkcs8.as_ref()))
+    let mut file = match create_owner_only(key_file) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "{} already exists. Signing with a new key needs a key rotation, \
+                 so move the old file aside on purpose.",
+                key_file.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot create {}", key_file.display()));
+        }
+    };
+    file.write_all(hex(pkcs8.as_ref()).as_bytes())
         .with_context(|| format!("cannot write {}", key_file.display()))?;
-    restrict(key_file)?;
 
     println!("Wrote the private key to {}.", key_file.display());
     println!();
@@ -136,6 +161,30 @@ fn keygen(key_file: &Path) -> Result<()> {
         key_file.display()
     );
     Ok(())
+}
+
+/// Creates `path` for writing, readable by its owner alone.
+///
+/// The file gets its mode when it is created, so no moment exists at which
+/// another account can read the key. `create_new` fails when anything is
+/// already at the path, a symbolic link included, so a key is never
+/// written through a link to another place.
+#[cfg(unix)]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Signs a manifest and writes the envelope.
@@ -174,23 +223,48 @@ fn sign(key: &str, manifest_file: &Path, envelope_file: &Path) -> Result<()> {
 
 /// Digests `archive` and signs a content release that describes it.
 ///
-/// The signed payload carries the hash, the digest, and the size, and no URL.
-/// The client derives the download address from its own base URL, so a signed
-/// release cannot move the download to another host — the rule the software
-/// manifest already follows.
-fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> Result<()> {
+/// The signed payload carries the hash, the digest, the size, and a sequence,
+/// and no URL. The client derives the download address from its own base URL,
+/// so a signed release cannot move the download to another host — the rule the
+/// software manifest already follows.
+///
+/// The sequence orders the releases, and a client installs a release only when
+/// its sequence is higher than the one it holds. `sequence` names one. With
+/// `None`, the sequence is the time of signing in seconds since the Unix epoch,
+/// so a release signed later always carries a higher value.
+fn sign_content(
+    key: &str,
+    archive: &Path,
+    hash: &str,
+    envelope_file: &Path,
+    sequence: Option<&str>,
+) -> Result<()> {
     let pair = load_key(key)?;
 
     check_hash(hash)?;
+    let sequence: u64 = match sequence {
+        Some(text) => text
+            .parse()
+            .map_err(|_| anyhow::anyhow!("the sequence {text:?} is not a whole number"))?,
+        None => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| anyhow::anyhow!("the clock reads a time before 1970"))?
+            .as_secs(),
+    };
     let bytes =
         std::fs::read(archive).with_context(|| format!("cannot read {}", archive.display()))?;
     if bytes.is_empty() {
         bail!("{} is empty", archive.display());
     }
+    if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+        bail!(
+            "{} is {} bytes, past the limit of {MAX_ARCHIVE_BYTES} that every client applies",
+            archive.display(),
+            bytes.len()
+        );
+    }
 
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let sha256 = hex(&hasher.finalize());
+    let sha256 = hex(digest(&SHA256, &bytes).as_ref());
 
     // The signature covers these exact bytes, and the client checks them
     // before it parses them. The field order therefore only has to stay put
@@ -199,6 +273,7 @@ fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> 
         "hash": hash,
         "sha256": sha256,
         "size_bytes": bytes.len(),
+        "sequence": sequence,
     }))
     .context("cannot write the content release")?;
 
@@ -212,7 +287,7 @@ fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> 
         .with_context(|| format!("cannot write {}", envelope_file.display()))?;
 
     println!(
-        "Signed {} ({} bytes, sha256 {sha256}) into {}.",
+        "Signed {} ({} bytes, sha256 {sha256}, sequence {sequence}) into {}.",
         archive.display(),
         bytes.len(),
         envelope_file.display()
@@ -228,7 +303,7 @@ fn sign_content(key: &str, archive: &Path, hash: &str, envelope_file: &Path) -> 
 /// Eight alphanumeric ASCII characters, which is what synapsis derives from
 /// the first 8 characters of the archive digest.
 fn check_hash(hash: &str) -> Result<()> {
-    if hash.len() != 8 || !hash.chars().all(|c| c.is_ascii_alphanumeric()) {
+    if hash.len() != HASH_LEN || !hash.chars().all(|c| c.is_ascii_alphanumeric()) {
         bail!("the hash {hash:?} is not 8 alphanumeric ASCII characters");
     }
     Ok(())
@@ -299,7 +374,6 @@ fn load_key(key: &str) -> Result<Ed25519KeyPair> {
         .map_err(|error| anyhow::anyhow!("the signing key is not a PKCS#8 Ed25519 key: {error}"))
 }
 
-/// Fails when the manifest is not the shape brainmaker reads.
 /// Names the shape of a signed payload, or fails when it is neither shape.
 ///
 /// One envelope carries a software manifest, and another carries a content
@@ -350,6 +424,22 @@ fn check_content(text: &str) -> Result<()> {
     if size == 0 {
         bail!("the content release claims a size of 0 bytes");
     }
+    if size > MAX_ARCHIVE_BYTES {
+        bail!(
+            "the content release claims {size} bytes, past the limit of \
+             {MAX_ARCHIVE_BYTES} that every client applies"
+        );
+    }
+
+    // The sequence is optional, because a client accepts a release from a
+    // signer that wrote none. When it is there, it must be a whole number,
+    // because a client refuses a payload with a sequence that it cannot read.
+    if value
+        .get("sequence")
+        .is_some_and(|sequence| sequence.as_u64().is_none())
+    {
+        bail!("the content release carries a \"sequence\" that is not a whole number");
+    }
 
     // The client derives the download address from its own base URL, so a URL
     // here would be a URL the client ignores and an operator trusts.
@@ -359,6 +449,7 @@ fn check_content(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fails when the manifest is not the shape brainmaker reads.
 fn check_manifest(text: &str) -> Result<()> {
     let value: serde_json::Value =
         serde_json::from_str(text).context("the manifest is not valid JSON")?;
@@ -367,8 +458,11 @@ fn check_manifest(text: &str) -> Result<()> {
         .get("version")
         .and_then(serde_json::Value::as_str)
         .context("the manifest has no \"version\" string")?;
-    if version.is_empty() || version.len() > 64 {
-        bail!("the manifest version {version:?} is empty or longer than 64 characters");
+    if !usable_version(version) {
+        bail!(
+            "the manifest version {version:?} is not 1 to 64 characters of ASCII letters, \
+             digits, dots, hyphens, and plus signs, so every client would refuse it"
+        );
     }
 
     let platforms = value
@@ -392,6 +486,18 @@ fn check_manifest(text: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// True for a version string that the client accepts.
+///
+/// The same rule as `version::validate` in src/version.rs. A test below
+/// fails when the two disagree.
+fn usable_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= 64
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -425,14 +531,375 @@ fn decode_hex(text: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(unix)]
-fn restrict(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("cannot restrict {}", path.display()))
-}
+// The client's own rules, compiled into the tests alone, so that the tests
+// below can compare the signer against them.
+#[cfg(test)]
+#[path = "../src/version.rs"]
+mod client_version;
 
-#[cfg(not(unix))]
-fn restrict(_path: &Path) -> Result<()> {
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "brainmaker-sign-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// A software manifest with one platform, at `version`.
+    fn manifest(version: &str) -> String {
+        serde_json::json!({
+            "version": version,
+            "platforms": { "darwin-arm64": { "sha256": DIGEST } },
+        })
+        .to_string()
+    }
+
+    /// A content release that claims `size` bytes.
+    fn release(size: u64) -> String {
+        serde_json::json!({
+            "hash": "abcd1234",
+            "sha256": DIGEST,
+            "size_bytes": size,
+        })
+        .to_string()
+    }
+
+    /// A content release whose "sequence" is `sequence`, whatever its type.
+    fn release_with_sequence(sequence: serde_json::Value) -> String {
+        serde_json::json!({
+            "hash": "abcd1234",
+            "sha256": DIGEST,
+            "size_bytes": 1024,
+            "sequence": sequence,
+        })
+        .to_string()
+    }
+
+    /// The sequence in the payload of the envelope in `path`.
+    ///
+    /// Fails when the payload is not a content release that `check_content`
+    /// accepts.
+    fn signed_sequence(path: &Path) -> u64 {
+        let text = std::fs::read_to_string(path).unwrap();
+        let envelope: Envelope = serde_json::from_str(&text).unwrap();
+        check_content(&envelope.payload).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&envelope.payload).unwrap();
+        payload["sequence"]
+            .as_u64()
+            .expect("the payload carries a sequence")
+    }
+
+    #[test]
+    fn the_version_rule_is_the_client_rule() {
+        let nines_64 = "9".repeat(64);
+        let nines_65 = "9".repeat(65);
+        let samples = [
+            "0.2.0",
+            "1.0.0-rc.1+build9",
+            "",
+            "0.2.0; rm -rf /",
+            "0.2.0\n",
+            "v1",
+            "1 0",
+            "1.0.0/../x",
+            nines_64.as_str(),
+            nines_65.as_str(),
+            "1.0.0é",
+        ];
+        for sample in samples {
+            assert_eq!(
+                usable_version(sample),
+                client_version::validate(sample),
+                "the signer and the client disagree about {sample:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_limits_are_the_client_limits() {
+        let config = include_str!("../src/config.rs");
+        assert!(
+            config.contains("pub const HASH_LEN: usize = 8;"),
+            "src/config.rs changed HASH_LEN, so change HASH_LEN in the signer"
+        );
+        assert!(
+            config.contains("pub const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;"),
+            "src/config.rs changed MAX_ARCHIVE_BYTES, so change MAX_ARCHIVE_BYTES in the signer"
+        );
+        assert_eq!(HASH_LEN, 8);
+        assert_eq!(MAX_ARCHIVE_BYTES, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn refuses_a_manifest_version_that_the_client_refuses() {
+        let error = check_manifest(&manifest("1.0.0 beta")).unwrap_err();
+        assert!(
+            error.to_string().contains("every client would refuse it"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn accepts_a_usable_manifest() {
+        check_manifest(&manifest("0.2.0")).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_manifest_with_no_platform() {
+        let text = serde_json::json!({ "version": "0.2.0", "platforms": {} }).to_string();
+        let error = check_manifest(&text).unwrap_err();
+        assert!(error.to_string().contains("names no platform"), "{error:#}");
+    }
+
+    #[test]
+    fn refuses_a_platform_with_a_malformed_digest() {
+        let samples = [
+            String::from("abc"),
+            "g".repeat(64),
+            "a".repeat(63),
+            "a".repeat(65),
+        ];
+        for sum in &samples {
+            let text = serde_json::json!({
+                "version": "0.2.0",
+                "platforms": { "darwin-arm64": { "sha256": sum } },
+            })
+            .to_string();
+            assert!(
+                check_manifest(&text).is_err(),
+                "accepted the digest {sum:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_content_release_past_the_client_limit() {
+        check_content(&release(MAX_ARCHIVE_BYTES)).unwrap();
+
+        let error = check_content(&release(MAX_ARCHIVE_BYTES + 1)).unwrap_err();
+        assert!(
+            error.to_string().contains("every client applies"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_content_release_that_carries_a_url() {
+        let text = serde_json::json!({
+            "hash": "abcd1234",
+            "sha256": DIGEST,
+            "size_bytes": 1024,
+            "url": "https://example.invalid/content.zip",
+        })
+        .to_string();
+        let error = check_content(&text).unwrap_err();
+        assert!(error.to_string().contains("\"url\""), "{error:#}");
+    }
+
+    #[test]
+    fn a_content_release_may_carry_a_sequence() {
+        check_content(&release_with_sequence(serde_json::json!(5))).unwrap();
+        check_content(&release_with_sequence(serde_json::json!(u64::MAX))).unwrap();
+
+        // A release from a signer older than the sequence carries none.
+        check_content(&release(1024)).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_sequence_that_is_not_a_number() {
+        let samples = [
+            serde_json::json!("5"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(null),
+            serde_json::json!(true),
+        ];
+        for sample in samples {
+            let error = check_content(&release_with_sequence(sample.clone())).unwrap_err();
+            assert!(
+                error.to_string().contains("\"sequence\""),
+                "the sequence {sample} gave: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn sign_content_writes_the_sequence_it_is_given_and_otherwise_the_time() {
+        let base = temp_dir("sequence");
+        let key_path = base.join("test.key");
+        let archive_path = base.join("content.zip");
+        let envelope_path = base.join("latest.json");
+        let (key, archive, envelope) = (
+            key_path.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+            envelope_path.to_str().unwrap(),
+        );
+        keygen(&key_path).unwrap();
+        std::fs::write(&archive_path, b"archive bytes").unwrap();
+
+        // A named sequence goes into the payload as it stands.
+        run(&[
+            "sign-content",
+            key,
+            archive,
+            "abcd1234",
+            envelope,
+            "1760000000",
+        ])
+        .unwrap();
+        assert_eq!(signed_sequence(&envelope_path), 1_760_000_000);
+
+        // With none named, the sequence is the time of signing.
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        let before = now();
+        run(&["sign-content", key, archive, "abcd1234", envelope]).unwrap();
+        let after = now();
+        let written = signed_sequence(&envelope_path);
+        assert!(
+            before <= written && written <= after,
+            "the sequence {written} lies outside the signing time, {before} to {after}"
+        );
+
+        // The envelope is one that `verify` accepts against the signing key.
+        let public = hex(load_key(key).unwrap().public_key().as_ref());
+        verify(&envelope_path, &[public.as_str()]).unwrap();
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn sign_content_refuses_a_sequence_that_is_not_a_whole_number() {
+        let base = temp_dir("bad-sequence");
+        let key_path = base.join("test.key");
+        let archive_path = base.join("content.zip");
+        let envelope_path = base.join("latest.json");
+        let (key, archive, envelope) = (
+            key_path.to_str().unwrap(),
+            archive_path.to_str().unwrap(),
+            envelope_path.to_str().unwrap(),
+        );
+        keygen(&key_path).unwrap();
+        std::fs::write(&archive_path, b"archive bytes").unwrap();
+
+        // The last one is one more than the largest whole number a u64 holds.
+        let samples = ["", "abc", "-1", "1.5", "1e3", " 5", "18446744073709551616"];
+        for text in samples {
+            let error =
+                run(&["sign-content", key, archive, "abcd1234", envelope, text]).unwrap_err();
+            assert!(
+                error.to_string().contains("is not a whole number"),
+                "the sequence {text:?} gave: {error:#}"
+            );
+            assert!(
+                !envelope_path.exists(),
+                "an envelope was written for the sequence {text:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn names_the_kind_of_a_payload() {
+        assert_eq!(
+            check_payload(&manifest("0.2.0")).unwrap(),
+            "a software manifest"
+        );
+        assert_eq!(check_payload(&release(1024)).unwrap(), "a content release");
+        assert!(check_payload("{\"a\":1}").is_err());
+    }
+
+    #[test]
+    fn decodes_hexadecimal() {
+        assert_eq!(decode_hex("00ff10AB").unwrap(), [0x00, 0xff, 0x10, 0xab]);
+        assert!(decode_hex("0").is_err());
+        assert!(decode_hex("0g").is_err());
+    }
+
+    #[test]
+    fn a_key_signs_and_the_envelope_verifies() {
+        let base = temp_dir("sign");
+        let key_path = base.join("test.key");
+        let manifest_path = base.join("manifest.json");
+        let envelope_path = base.join("manifest.signed.json");
+        let key = key_path.to_str().unwrap();
+
+        keygen(&key_path).unwrap();
+        std::fs::write(&manifest_path, manifest("0.2.0")).unwrap();
+        sign(key, &manifest_path, &envelope_path).unwrap();
+
+        let pair = load_key(key).unwrap();
+        let public_hex = hex(pair.public_key().as_ref());
+        verify(&envelope_path, &[public_hex.as_str()]).unwrap();
+
+        // The public key of a key that never signed the envelope must fail.
+        let other_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let other = Ed25519KeyPair::from_pkcs8(other_pkcs8.as_ref()).unwrap();
+        let other_hex = hex(other.public_key().as_ref());
+        assert!(verify(&envelope_path, &[other_hex.as_str()]).is_err());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keygen_creates_a_file_that_only_its_owner_reads() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = temp_dir("mode");
+        let key_path = base.join("test.key");
+
+        keygen(&key_path).unwrap();
+
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the key file has mode {mode:o}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn keygen_refuses_a_path_that_is_taken() {
+        let base = temp_dir("taken");
+        let key_path = base.join("test.key");
+        std::fs::write(&key_path, "an earlier key").unwrap();
+
+        let error = keygen(&key_path).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            "an earlier key"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keygen_refuses_a_symbolic_link() {
+        let base = temp_dir("link");
+        let elsewhere = base.join("elsewhere");
+        let key_path = base.join("test.key");
+        std::os::unix::fs::symlink(&elsewhere, &key_path).unwrap();
+
+        assert!(keygen(&key_path).is_err());
+        assert!(
+            !elsewhere.exists(),
+            "keygen wrote the key through the symbolic link"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
