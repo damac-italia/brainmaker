@@ -1,6 +1,9 @@
 <h1 align="center">brainmaker</h1>
 <p align="center">Keeps <code>~/.brainmaker/content</code> in step with the content API.</p>
 <p align="center">
+  <img alt="Rust 1.89" src="https://img.shields.io/badge/Rust-1.89-000000?style=for-the-badge&logo=rust&logoColor=white">
+</p>
+<p align="center">
   <img alt="license: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg">
 </p>
 
@@ -15,6 +18,7 @@ The binary carries no endpoint and no credential. Both arrive in a provisioning 
 ## Quick start
 
 `brainmaker` needs a provisioning file before it can reach a server. Your administrator issues it.
+The build needs Rust 1.89 or later, which `Cargo.toml` declares as `rust-version`.
 
 ```bash
 cargo install --path .
@@ -49,17 +53,20 @@ gone. Later runs read the sealed copy and need no file.
 | Rollback | Restores the previous `content/` when the second rename fails |
 | Zip hardening | Rejects escaping paths and symbolic links; caps one entry at 256 MiB |
 | Sealed settings | Stores the endpoints and the client secret AES-256-GCM encrypted, bound to the machine |
-| Short-lived tokens | Exchanges the client credentials for a token that the server expires after 10 minutes |
+| Short-lived tokens | Exchanges the client credentials for a token that the server expires after 10 minutes, and uses a token for one hour at most, whatever lifetime the server names |
 | No compiled endpoint | A unit test fails the build if a URL with a host enters `src/config.rs` |
 | TLS-only base URL | Refuses a plain-HTTP base URL, except one whose host is this machine |
 | Signed updates | Refuses a software manifest without an Ed25519 signature from a compiled-in key |
 | Signed content | Refuses a content release that no key in `CONTENT_KEYS` signed, and checks the archive digest before it extracts |
+| Replay refusal | Refuses a content release whose signed sequence is not higher than the installed one, unless `sync --force` is given |
+| One run at a time | A file lock keeps two installs of the content, or two replacements of the binary, out of one root |
 | Two key lists | Content and software verify against separate lists, so a content signer cannot sign a manifest |
 | Offline tolerance | Keeps the installed content and exits 0 when the server cannot be reached, so a session still starts |
-| Claude bridge | `link` puts the shared skills and the session briefing into `~/.claude`, for every project |
+| Claude bridge | `link` puts the shared skills and the session briefing into `~/.claude`, for every project, and replaces `settings.json` and `CLAUDE.md` through a rename |
 | Hourly refresh | On macOS, `link` installs a LaunchAgent that runs `self-update`, then `sync`, every hour |
 | Clean removal | `uninstall` removes the bridge and everything brainmaker wrote under the root, and nothing else |
-| Self-update | Verifies the SHA-256 and the `--version` output before it swaps the binary, including the copy the hook runs |
+| Self-update | Verifies the SHA-256 and the exact `--version` line before it swaps the binary, including the copy the hook runs |
+| Strict options | Refuses an option that has no effect with the command, a value option given twice, and a value that starts with a hyphen |
 | Static Linux builds | `x86_64` and `arm64` link against musl, so there is no glibc version floor |
 
 ## Usage
@@ -78,10 +85,10 @@ brainmaker sync
 brainmaker status
 ```
 
-`status` prints the root, the store path, the settings source, the API base, the token URL, the
-credential lengths, the key class, the number of trusted software keys, the number of trusted
-content keys, the installed hash, the latest hash, the platform key, and the published version. It
-changes nothing.
+`status` prints the root, the content directory, the store path, the settings source, the API base,
+the token URL, the credential lengths, the key class, the machine binding of the store, the number
+of trusted software keys and of trusted content keys, the installed hash, the latest hash, the
+platform key, and the published version. It changes nothing.
 
 ### Replace the binary
 
@@ -97,6 +104,14 @@ brainmaker self-update
 `sync` applies the same rule to the content, against `CONTENT_KEYS`. A release that no listed key
 signed stops before the archive is extracted, and the archive's SHA-256 and size are checked
 against the signed values first.
+
+A content release also carries a sequence, and `sync` refuses a release with another hash whose
+sequence is not higher than the installed one. The run then exits 1 and the content stays as it
+was. To roll one machine back to such a release on purpose, run:
+
+```bash
+brainmaker sync --force
+```
 
 ### Let Claude read the content in every session
 
@@ -117,7 +132,15 @@ file capped so one growing file cannot crowd out the rest. It is registered by `
 meant to be run by hand.
 
 `brainmaker unlink` removes all of them. Both commands are idempotent, and neither touches a file it
-did not write: a skill name that already exists as a real directory is reported and skipped.
+did not write: a skill name that already exists as a real directory is reported and skipped, and
+`unlink` removes only the hook entries that end with `# brainmaker-link`, so a command of yours in
+the same group stays.
+
+`link` and `unlink` replace `settings.json` and `CLAUDE.md` through a temporary file and a rename,
+so a run that stops part-way leaves the old file whole. A symbolic link stays a link, and an
+existing file keeps its mode. A file that cannot be read as text stops the run and stays as it is.
+A `CLAUDE.md` that holds a damaged marker pair also stops the run, and the error tells you to
+remove the `brainmaker-link` lines by hand.
 
 `link` installs only the `SessionStart` hook. The content's other hooks are written for the vault
 as a project, and at user scope they would run on every tool call in every project.
@@ -152,7 +175,9 @@ as a project, and at user scope they would run on every tool call in every proje
 The command names the binary by its full path, because nothing puts `brainmaker` on `PATH`, and
 `link` first copies the running binary to `~/.brainmaker/bin/brainmaker` so the path outlives the
 archive it was unzipped from. `--dir` names the root, so a link made with `--dir` keeps using it.
-A relative `--dir` is made absolute before anything is written.
+A relative `--dir` is made absolute before anything is written. Each path is one double-quoted
+shell word, with a backslash before `$`, the backtick, `"`, and `\`. A path that holds a control
+character, such as a line break, stops `link`.
 
 `--quiet` keeps a successful run silent. A failed run still prints to stderr and exits 1. A server
 that cannot be reached is not a failure while content is installed: the installed content stays,
@@ -188,8 +213,8 @@ brainmaker uninstall
 
 1. What `link` wrote, the LaunchAgent included, exactly as `unlink` removes it.
 2. What brainmaker wrote under `~/.brainmaker`: the content, the program copy that the hook runs,
-   the state file, the sealed settings, the agent log, and any temporary file that a stopped run
-   left.
+   the state file, the sealed settings, the agent log, the two lock files, and any temporary file
+   that a stopped run left.
 3. `~/.brainmaker` itself, when nothing else is left in it.
 
 It removes nothing that brainmaker did not write. Your own skills, hooks, and `CLAUDE.md` text
@@ -314,7 +339,7 @@ disk. Every API request then carries `Authorization: Bearer <token>`.
 
 | Option | Effect |
 |---|---|
-| `--force` | With `sync`, download and extract even when the content is up to date. With `self-update`, reinstall the same version. |
+| `--force` | With `sync`, download and extract even when the content is up to date, and install a release whose sequence is not higher. With `self-update`, reinstall the same version. |
 | `--check` | With `self-update`, report the newer version and install nothing |
 | `--no-update-check` | With `sync`, skip the software version check |
 | `-y`, `--yes` | With `uninstall`, remove without asking first |
@@ -334,12 +359,16 @@ obeys the same TLS rule as the provisioning file, so a local test server needs a
 `--keep-config` leaves the provisioning file in place and prints a warning on every run, because
 that file still holds the client secret.
 
+An option that has no effect with the command fails the run and names the option and the command,
+for example `sync --check`. A value option given twice fails, and so does a value that starts with
+a hyphen, such as `uninstall --dir --yes`. Write a path that starts with a hyphen as `./-name`.
+
 ## Documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — modules, boundaries, data model, decisions
-- [Flow](docs/FLOW.md) — the sync, provisioning, and self-update paths
-- [API](docs/API.md) — the CLI surface and the five HTTP routes the server must serve
-- [Security](docs/SECURITY.md) — trust model, secret handling, input validation
+- [Architecture](docs/ARCHITECTURE.md): modules, boundaries, data model, decisions
+- [Flow](docs/FLOW.md): the sync, provisioning, and self-update paths
+- [API](docs/API.md): the CLI surface and the five HTTP routes the server must serve
+- [Security](docs/SECURITY.md): trust model, secret handling, input validation
 
 ## Build and release
 
@@ -353,6 +382,9 @@ builds on its own native runner, so nothing is cross-compiled.
 | `linux-x86_64` | `ubuntu-22.04` | `x86_64-unknown-linux-musl` | static |
 | `linux-arm64` | `ubuntu-22.04-arm` | `aarch64-unknown-linux-musl` | static |
 | `windows-x86_64` | `windows-2022` | `x86_64-pc-windows-msvc` | dynamic, system libraries |
+
+The build job and the manifest job set up the stable toolchain with the same pinned action that the
+`test` workflow uses, so a release is built by the compiler that tested it.
 
 The workflow signs each macOS build with an ad-hoc signature (`codesign -s -`). Without it, a
 binary that arrives over the network does not start on Apple Silicon. Every build job then runs its
@@ -389,7 +421,7 @@ cargo run --features sign --bin brainmaker-sign -- keygen content-signing.key
 
 The two lists exist so that one capability is not the other. The software key signs what replaces
 the running executable, and it stays off every server. The content key signs what lands in
-`content/`, so whoever publishes content holds it — a deploy host, in practice. With one shared
+`content/`, so whoever publishes content holds it: a deploy host, in practice. With one shared
 list, that host could sign a software manifest and replace every binary in the fleet. A unit test
 fails the build if a key ever appears in both lists.
 
@@ -400,6 +432,9 @@ cargo run --features sign --bin brainmaker-sign -- \
   sign-content content-signing.key content.zip <hash> latest.json
 ```
 
+`sign-content` writes the time of signing as the sequence. An optional fifth argument names another
+whole number. Every client refuses a release whose sequence is not higher than the one it holds.
+
 `brainmaker-sign verify` accepts either shape and names which one it read, so the same command
 checks a manifest and a content release. The release also publishes
 `brainmaker-sign-<version>-linux-x86_64`, so a deploy host can sign without a Rust toolchain.
@@ -409,12 +444,12 @@ checks a manifest and a content release. The release also publishes
 | Kind | Name | Purpose |
 |---|---|---|
 | Secret | `BRAINMAKER_CONFIG_KEY` | Seals each employee's stored settings. The workflow fails without it. |
-| Secret | `BRAINMAKER_SIGNING_KEY` | Signs the software manifest. The manifest job fails without it. |
+| Secret | `BRAINMAKER_SIGNING_KEY` | Signs the software manifest. A run for a `v*` tag fails without it. A run started by hand does not read it. |
 
 The build job also fails when `PUBLIC_KEYS` in `src/signature.rs` is empty, because such a binary
 could never install an update, and when `CONTENT_KEYS` is empty, because such a binary could never
-install content. The manifest job verifies the signed manifest against `PUBLIC_KEYS` alone, so a
-manifest signed with the content key cannot pass that check.
+install content. On a `v*` tag, the manifest job verifies the signed manifest against `PUBLIC_KEYS`
+alone, so a manifest signed with the content key cannot pass that check.
 
 The workflow takes no URL as input, and it publishes none. The manifest carries a version and one
 SHA-256 per platform. Each client derives the download address from the base URL and the routes in
@@ -477,8 +512,11 @@ cargo run --features sign --bin brainmaker-sign -- sign signing.key dist/manifes
 ```
 
 ```bash
-cargo run --features sign --bin brainmaker-sign -- verify dist/manifest.signed.json $(grep -Eo '"[0-9a-fA-F]{64}"' src/signature.rs | tr -d '"')
+cargo run --features sign --bin brainmaker-sign -- verify dist/manifest.signed.json $(sed -n '/^pub const PUBLIC_KEYS/,/^];/p' src/signature.rs | grep -Eo '"[0-9a-fA-F]{64}"' | tr -d '"')
 ```
+
+The command reads the `PUBLIC_KEYS` block alone, as the release workflow does. A grep over the whole
+file would also pass the `CONTENT_KEYS` key, and `verify` passes when any key given accepts.
 
 ### Building linux-arm64 without an arm64 runner
 
@@ -553,9 +591,9 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
 General Public License for more details.
 
-Every one of the 58 crates in `Cargo.lock` carries a permissive license that GPL-3 accepts: MIT,
-Apache-2.0, ISC, BSD-3-Clause, 0BSD, Zlib, Unlicense, Unicode-3.0, CDLA-Permissive-2.0, or MPL-2.0
-without an Exhibit B notice. List them with:
+`Cargo.lock` names 58 crates besides `brainmaker` itself. Every one of them carries a permissive
+license that GPL-3 accepts: MIT, Apache-2.0, `Apache-2.0 WITH LLVM-exception`, ISC, BSD-3-Clause,
+0BSD, Zlib, Unlicense, Unicode-3.0, or CDLA-Permissive-2.0. List them with:
 
 ```bash
 cargo tree --format '{p} {l}'

@@ -49,8 +49,10 @@ time, and an identifier of the machine. That combination covers these cases:
 - A reader who holds the file but not the binary learns nothing.
 - A `grep` over the home directory finds no URL and no credential.
 
-The identifier is the platform UUID on macOS, `/etc/machine-id` on Linux (or
-`/var/lib/dbus/machine-id` when the first file is missing), and `MachineGuid` on Windows. When the
+The identifier is the platform UUID on macOS, read through `/usr/sbin/ioreg`, `/etc/machine-id` on
+Linux (or `/var/lib/dbus/machine-id` when the first file is missing), and `MachineGuid` on Windows,
+read through `reg.exe` under `%SystemRoot%\System32`. Both tools are called by their full path, so
+a program of the same name earlier on `PATH` never answers. When the
 system gives none, which is usual in a container, the key uses the home directory path instead, and
 the first bullet point does not hold: the copy opens on any machine with the same binary and the
 same account name. When the home directory is unknown too, the key uses a constant, and the copy
@@ -63,7 +65,7 @@ compiled-in secret, and they run on the bound machine. Anyone who receives the d
 recover the endpoints and the client credentials. Treat all four as known to every employee who
 receives the distribution. Issue one client identifier per person where that is possible, and revoke
 that client on the server when someone leaves. Revoking the client stops the next token request; a
-token already issued stays valid for the rest of its 10 minutes.
+token already issued stays valid for the rest of its lifetime, which the server sets to 10 minutes.
 
 ## Trust boundaries
 
@@ -73,9 +75,10 @@ token already issued stays valid for the rest of its 10 minutes.
 | Content API to disk | The hash string | Exactly 8 ASCII alphanumeric characters, checked before it enters a URL or a path |
 | Content API to disk | The zip archive | Path containment, symbolic-link rejection, permission stripping, size caps |
 | Software API to the binary | The manifest | Ed25519 signature over the served bytes, checked before the parse; then version character set and length, platform key lookup, checksum format. The manifest names no URL, so it cannot direct a download. |
-| Software API to the binary | The replacement binary | SHA-256 match, then a `--version` run before the swap |
-| Provisioning file to the store | `KEY=VALUE` text | Size cap, key character set, TLS rule on both URLs, all-or-none credential check, character rule on both credential values, route rule on all five routes |
+| Software API to the binary | The replacement binary | SHA-256 match, then a `--version` run whose output must be exactly `brainmaker <version>`, before the swap |
+| Provisioning file to the store | `KEY=VALUE` text | Size cap, key character set, TLS rule on both URLs, all-or-none credential check, character rule on both credential values, route rule on all five routes. All run before the store is written, so a file that fails leaves the previous store and the file in place. |
 | Token endpoint to a header | The access token | Length cap, printable-ASCII rule, and a `token_type` that must read `Bearer` when the response carries one |
+| Token endpoint to the clock | `expires_in` | Cut to one hour before it is added to a clock reading; a sum that the clock cannot hold caches nothing |
 | Store to the process | `config.enc` | AES-256-GCM authenticates the header and the ciphertext before any byte is used |
 
 ## Authentication and authorization
@@ -91,7 +94,9 @@ The server expires the token after 10 minutes. That bounds what a token taken fr
 worth: the client secret stays valuable, and it stays sealed. The token lives in memory for one run
 and never reaches the disk, so nothing on the disk holds a usable bearer token between runs.
 `brainmaker` stops using a token 30 seconds before it expires, so a request that starts near the
-boundary does not arrive with an expired token.
+boundary does not arrive with an expired token. The client uses a token for one hour at most,
+whatever `expires_in` says, and it adds that time to the clock with a checked sum, so a large value
+from the server cannot stop the process.
 
 Because a credential travels on every request, `url::check_base_url` requires `https://`. It accepts
 `http://` only when the host is `localhost` or a loopback address, where the request never reaches
@@ -139,9 +144,9 @@ with a space or any other character that cannot go into a URL.
 | `SWETSI_CLIENT_SECRET` | `~/.brainmaker/confidential/config.enc` | AES-256-GCM, mode `0600` in a `0700` directory |
 | `SWETSI_CLIENT_ID` | the same file | the same |
 | `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT` | the same file | the same |
-| The access token | process memory only | Never written to disk. It expires 10 minutes after the server issues it. |
-| `BRAINMAKER_CONFIG_KEY` | a repository secret, read at build time | Never in the repository. `build.rs` declares `cargo:rerun-if-env-changed`, so a cached build cannot ship a stale key. |
-| `BRAINMAKER_SIGNING_KEY` | a repository secret, read at release time | Never in the repository, and never on a machine that serves the API. The signing step reads it from the environment, so it never reaches the runner's disk. |
+| The access token | process memory only | Never written to disk. The server expires it 10 minutes after it issues it, and the client uses it for one hour at most. |
+| `BRAINMAKER_CONFIG_KEY` | a repository secret, read at build time | Never in the repository. `build.rs` declares `cargo:rerun-if-env-changed`, so a cached build cannot ship a stale key. The dependencies build first with no secret set. |
+| `BRAINMAKER_SIGNING_KEY` | a repository secret, read at release time | Never in the repository, and never on a machine that serves the API. Only a run for a `v*` tag reads it. The signing step reads it from the environment, so it never reaches the runner's disk. |
 
 The manifest signing key's public half is not a secret. It lives in `PUBLIC_KEYS` in
 [`src/signature.rs`](../src/signature.rs) and is committed. `brainmaker status` prints how many keys
@@ -150,6 +155,24 @@ a binary trusts on its `signing` line.
 To rotate the signing key, put the new public key first in `PUBLIC_KEYS`, keep the old one, and
 release. Remove the old key only once every client carries a binary that holds the new one. A
 manifest verifies when any listed key accepts it.
+
+`brainmaker-sign keygen` creates the key file and sets its mode in one call, so on Unix the file
+is `0600` from the moment it exists. It refuses a path where anything already exists, a symbolic
+link included, so it never writes a key through a link to another place.
+
+### Release workflow
+
+The release workflow applies these controls:
+
+| Control | Effect |
+|---|---|
+| Token scope | The workflow token can read the repository and nothing more. The manifest job alone may write, because it creates the release. |
+| Pinned actions | Every action in every workflow is pinned by commit SHA. Dependabot raises the updates. |
+| Checkout credentials | `persist-credentials: false` on both checkouts, so the token does not stay on the runner's disk |
+| Split build | The dependencies build with no secret set. A second build then compiles the `brainmaker` crate alone with `BRAINMAKER_CONFIG_KEY` set, so no dependency build script sees the key. |
+| Signing tool | `brainmaker-sign` builds in a step with no secret set. The signing step then runs the finished binary. |
+| Tag gate | Only a run for a `v*` tag checks the signing key, signs the manifest, verifies it against `PUBLIC_KEYS` alone, and creates the release. A run started by hand signs nothing. |
+| Toolchain | The build and manifest jobs set up the toolchain with the pinned action that the `test` workflow uses. |
 
 The store is written through a temporary file and a rename, so a crash never leaves a partial file.
 The temporary file gets mode `0600` before the rename.
@@ -224,10 +247,14 @@ continues with the entries that pass.
 2. The install directory must be writable, checked with a probe file before any download.
 3. The download must match the `sha256` in the manifest, which must itself be 64 hexadecimal
    characters.
-4. The staged binary must run and must report the manifest's version. This catches a build for the
-   wrong architecture and a manifest that points at the wrong file.
+4. The staged binary must run, and its `--version` output must be exactly `brainmaker <version>`
+   for the manifest's version. A substring match would accept `0.1.10` for `0.1.1`. This catches a
+   build for the wrong architecture and a manifest that points at the wrong file.
 5. Only then does the swap run, through two renames. A failure on the second rename restores the
    previous binary.
+
+A second lock, on `.update.lock` under the root, keeps two updates apart, and the run that holds it
+removes the staged files that a killed update left beside the program.
 
 A verified binary then replaces `<root>/bin/brainmaker` as well, when that copy exists and is a
 different file from the one that ran. The `SessionStart` hook names that copy, so an update that
@@ -309,6 +336,11 @@ the API host. And `link` installs the `SessionStart` hook alone: the content's `
 `PostToolUse`, `PreCompact` and `Stop` hooks stay project-scoped, because at user scope they would
 run on every tool call in every project on the machine.
 
+The hook command and the LaunchAgent script run through a shell, so `link` writes the program path
+and the root as double-quoted words, with a backslash before `$`, the backtick, `"`, and `\`. A
+path that holds a control character stops `link`. The hook and the `CLAUDE.md` block are written
+through a temporary file and a rename, and a file that cannot be read as text is left alone.
+
 ### Size caps
 
 | Input | Cap |
@@ -329,14 +361,17 @@ truncated. The caps are constants in [`src/config.rs`](../src/config.rs).
 |---|---|---|
 | `anyhow` | 1.0.104 | Error context |
 | `ring` | 0.17 | AES-256-GCM, HKDF-SHA256, SHA-256, and Ed25519 verification |
-| `serde`, `serde_json` | 1.0.229, 1.0.151 | Manifest and state parsing |
+| `serde`, `serde_json` | 1.0.229, 1.0.151 | Manifest, state, and `settings.json` parsing; `serde_json` with `preserve_order` |
 | `ureq` | 3.3.0 | HTTP client |
 | `zip` | 8.6.0 | Archive extraction, `deflate-flate2-zlib-rs` only, which reads and does not build a second compressor, default features off |
 
 The requirement column is the one in `Cargo.toml`. The release workflow runs
 `cargo build --release --locked`, so a release builds the versions in the committed `Cargo.lock`,
 which a Dependabot bump can raise inside a requirement without changing it. Adding a dependency
-therefore requires a lock-file commit and a review.
+therefore requires a lock-file commit and a review. `Cargo.toml` declares `rust-version = "1.89"`.
+
+The `dependency-review` workflow blocks a pull request that adds a dependency with a high-severity
+advisory. Dependabot raises weekly updates for Cargo and for GitHub Actions.
 
 ## Reporting a vulnerability
 

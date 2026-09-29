@@ -13,12 +13,12 @@ under the `sign` feature and never ships.
 | Module | Role | Depends on |
 |---|---|---|
 | [`src/main.rs`](../src/main.rs) | Entry point, command dispatch, all `stdout` output | every module |
-| [`src/cli.rs`](../src/cli.rs) | Argument parsing and the help text | none |
-| [`src/config.rs`](../src/config.rs) | Settings load, the root and every path under it (`Layout`), route and URL building, credential checks, size limits, hash validation | `auth`, `provision`, `secretstore`, `url` |
-| [`src/auth.rs`](../src/auth.rs) | The OAuth2 client-credentials exchange, and the access token cache | `config`, `remote`, `ureq` |
+| [`src/cli.rs`](../src/cli.rs) | Argument parsing, the check that each option applies to the command, and the help text | none |
+| [`src/config.rs`](../src/config.rs) | Settings load, the import check, the root and every path under it (`Layout`), route and URL building, credential checks, size limits, hash validation | `auth`, `provision`, `secretstore`, `url` |
+| [`src/auth.rs`](../src/auth.rs) | The OAuth2 client-credentials exchange, the bound on the token lifetime, and the access token cache | `config`, `remote`, `ureq` |
 | [`src/url.rs`](../src/url.rs) | URL origin parsing, and the rule that a base URL must use TLS | none |
 | [`src/provision.rs`](../src/provision.rs) | Provisioning file discovery, parsing, validation | `url` |
-| [`src/secretstore.rs`](../src/secretstore.rs) | Seal and open the stored settings, restrict file modes | `ring` |
+| [`src/secretstore.rs`](../src/secretstore.rs) | Seal and open the stored settings, report what binds them to the machine, restrict file modes | `ring` |
 | [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, and the signed content release | `auth`, `config`, `digest`, `signature`, `ureq` |
 | [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `digest`, `lock`, `remote`, `state` |
 | [`src/archive.rs`](../src/archive.rs) | Zip extraction and its safety checks | `config`, `zip` |
@@ -27,7 +27,7 @@ under the `sign` feature and never ships.
 | [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `link`, `lock`, `remote`, `signature`, `version` |
 | [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `ring` |
 | [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `ring` |
-| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the session context, and the binary copy under the root | `config`, `schedule`, `serde_json` |
+| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the session context, the shell quoting of the hook command, and the binary copy under the root | `config`, `schedule`, `serde_json` |
 | [`src/schedule.rs`](../src/schedule.rs) | Write, load, unload, and remove the hourly macOS LaunchAgent | none |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
 | [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root | `config`, `link`, `schedule`, `secretstore`, `state` |
@@ -99,6 +99,8 @@ the injected `log` closure.
 ├── confidential/       0700
 │   └── config.enc      0600, the sealed endpoints, routes, and credentials
 ├── content/            the extracted content
+├── .lock               the install lock that sync holds
+├── .update.lock        the update lock that self-update holds
 └── state.json          {"hash": "...", "updated_at_unix": ..., "sequence": ...}
 ```
 
@@ -112,8 +114,11 @@ replaced on every update, so keep your own files elsewhere. `sync` holds an excl
 `.lock` while it installs, and `self-update` holds one on `.update.lock` while it replaces the
 program. Both files stay in the root between runs, and `uninstall` removes them.
 
-`self-update` writes `.brainmaker-update-<pid>` and `.brainmaker-old` beside the binary, and
-removes both before it exits. On Windows both carry the `.exe` suffix.
+`self-update` writes `.brainmaker-probe-<pid>`, `.brainmaker-update-<pid>`, and `.brainmaker-old`
+beside the binary, and removes them before it exits. On Windows the last two carry the `.exe`
+suffix. A run that is killed cannot remove its files, so the next `self-update` removes every
+`.brainmaker-probe-*` and `.brainmaker-update-*` file in that directory once it holds the update
+lock. It leaves every other file there as it is.
 
 ### `state.json`
 
@@ -201,6 +206,10 @@ for an access token at `POST {jwt_endpoint}/oauth2/token`, and the server expire
 10 minutes. A static token, which earlier versions carried, stayed valid until an operator revoked
 it by hand.
 
+The client takes the lifetime from `expires_in`, and cuts it to one hour. That value arrives from
+the network and is added to a clock reading, and the release profile sets `panic = "abort"`, so an
+unbounded sum could stop the process. A sum that the clock still cannot hold caches nothing.
+
 The token lives in `TokenCache`, which one `Config` owns, so one run fetches one token and reuses it
 for up to three requests. The cache never reaches the disk, so nothing on disk holds a usable bearer
 token between runs. The client stops using a token 30 seconds before it expires, so a request that
@@ -271,6 +280,26 @@ This matters more than it would for inert data. The content ships a `.claude` di
 hooks `link` registers, so an archive that reached a machine unchecked would be code that runs at
 every session start.
 
+### A content release must be newer than the one installed
+
+A signature proves who made a release, and not when. Without an order, a server could serve any
+release that was ever signed, and every client would install it. The signed payload therefore
+carries a `sequence`, which `brainmaker-sign` sets to the time of signing unless the operator names
+one, and `state.json` records the sequence of the installed release.
+
+`sync::check_order` passes when no sequence is installed or when the offered one is higher. It
+fails for an equal, a lower, or a missing sequence. It applies only when the offered hash differs
+from the installed one, so a missing `content/` is restored whatever the sequence. It runs twice:
+once before the install lock, and again on the state read after the lock, so a run that waited
+cannot replace a release that another run installed during the wait with an older one. A
+reinstall of the installed hash records the higher of the two sequences.
+
+`--force` skips the rule, for a deliberate rollback on one machine, and records the older sequence.
+
+The tradeoffs: a `state.json` written before this rule holds no sequence, so that machine accepts
+any signed release until it installs one that carries a sequence. To roll every client back, sign
+the older archive again: the new signature carries a new, higher sequence.
+
 ### An unreachable server is a notice, not a failure, while content is installed
 
 `sync` runs from the `SessionStart` hook at the start of every Claude session, and a laptop is
@@ -307,6 +336,12 @@ is surprising if you do not know the rule.
 Nothing puts `brainmaker` on `PATH`, and the install instructions tell the reader to delete the
 unpacked archive. So `link` copies the running binary to `<root>/bin/brainmaker` and writes that
 full path, quoted, into the hook, along with `--dir <root>`.
+
+The hook and the LaunchAgent both hand that command to a shell, so `link::command_prefix` writes
+each path as one double-quoted word, with a backslash before `$`, the backtick, `"`, and `\`. Every
+other character stays as it is, so a decomposed accent reaches the shell as its bytes. A path that
+holds a control character is refused, because no quoting carries a line break through both a shell
+and a property list.
 
 That creates a second copy, and a `self-update` that reached only the file the user happened to
 run would leave every session on the old version. So `selfupdate::apply` replaces the installed
@@ -347,6 +382,31 @@ it at the next login. An SSH session, which has no GUI domain, is the usual caus
 The tradeoff: a promoted build reaches every linked Mac within an hour, with no person to stop
 it. The five `self-update` controls are the only gate, so the signing key decides what every Mac
 runs. Only macOS has launchd; Windows and Linux keep the hook as their only trigger.
+
+### Claude files are replaced whole, or not at all
+
+`link` and `unlink` edit two files that belong to the user: `~/.claude/settings.json` and
+`~/.claude/CLAUDE.md`. A partial write there would lose the user's own hooks or text. So each file
+is written to a temporary file beside it and renamed over it, and the mode of an existing file is
+kept. When the path is a symbolic link, the file it names is replaced and the link stays.
+
+A file that exists but cannot be read as text stops the run, because treating it as empty would
+replace text that was never read. `CLAUDE.md` must hold no marker, or one start marker followed by
+one end marker. Any other shape stops the run, because a guess at which markers belong together
+would delete the user's text. In `settings.json`, `unlink` removes single hook entries whose
+command ends with `# brainmaker-link`, and removes a group only when that removal emptied it.
+`serde_json` is built with `preserve_order`, so the file keeps the key order the user wrote.
+
+The tradeoff: a damaged marker pair needs a manual fix before `link` or `unlink` runs again.
+
+### The parser refuses an option that has no effect
+
+`cli::check_options` holds one row per option, with the commands it applies to. An option given
+with another command fails the run, for example `sync --check`. A value option given twice fails,
+and so does a value that starts with a hyphen, so `uninstall --dir --yes` no longer takes `--yes`
+as the root. An option that was accepted and ignored let the user believe it took effect.
+
+The tradeoff: a script that passed a harmless extra option now fails, and must drop it.
 
 ### A relative `--dir` becomes absolute before anything is written
 
@@ -394,6 +454,11 @@ and you remove it by hand.
 The file key is HKDF-SHA256 over a secret compiled in at build time, salted with a machine
 identifier. A copy of `config.enc` therefore does not open on another machine.
 
+When the system gives no identifier, `secretstore::machine_identity` falls back to the home
+directory path, and then to a constant, and returns a `Binding` that names which one it used.
+`status` prints it on its `binding` line, and an import on a weak binding logs a warning. The three
+identity strings are part of the key, so a change to one makes every stored file unreadable.
+
 The tradeoff: rotating `BRAINMAKER_CONFIG_KEY` makes every existing store unreadable, and every
 employee has to import a fresh file. See [SECURITY.md](SECURITY.md) for what this does and does not
 protect against.
@@ -435,6 +500,9 @@ the swap leaves the old content in `.trash/` and no `content/`. When `sync` star
 `content/`. If another run holds the lock, that run may be inside its own swap, so `sync` leaves
 `.trash/` alone.
 
+The lock is `File::try_lock` from the standard library, which is stable since Rust 1.89, so
+`Cargo.toml` declares `rust-version = "1.89"`.
+
 The tradeoff: a run that finds the lock held for 30 seconds installs nothing, so the update arrives
 with the next run. The lock is advisory. It orders `brainmaker` runs only, and `uninstall` takes no
 lock.
@@ -464,3 +532,13 @@ The tradeoff: a release build is slower to produce, and a panic gives no unwind 
 Both Linux targets are `*-unknown-linux-musl` and link statically, so one binary runs on any
 distribution of that architecture and has no glibc version floor. `ring` compiles C, so the
 workflow names `musl-gcc` explicitly for both targets rather than relying on the `cc-rs` guess.
+
+### The dependency set stays small
+
+`ring` computes SHA-256 as well as the AEAD, HKDF, and Ed25519 operations, so no separate hash
+crate is needed. The home directory comes from `std::env::home_dir`. `zip` builds with the
+`deflate-flate2-zlib-rs` feature alone, which reads deflate and does not build the zopfli
+compressor. HTTP Basic needs one base64 encoding, which `auth::base64` carries in about 20 lines.
+
+The tradeoff: a few small functions live in this crate rather than in a dependency, and their
+tests live here too.
