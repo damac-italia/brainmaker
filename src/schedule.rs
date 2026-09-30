@@ -11,6 +11,9 @@
 //! agent runs `self-update` and then `sync` once an hour, at minute 0, whether
 //! or not a session is open.
 //!
+//! The admin's agent runs `self-update` alone. `link` connects no Claude on
+//! the admin's Mac, so nothing there reads the content; see [`crate::link`].
+//!
 //! # What it writes
 //!
 //! `link` writes `~/Library/LaunchAgents/<LABEL>.plist` and loads it with
@@ -85,6 +88,15 @@ impl Agents {
     }
 }
 
+/// What the agent runs each hour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runs {
+    /// `self-update`, then `sync`: a Mac whose Claude reads the content.
+    UpdateAndSync,
+    /// `self-update` alone: the admin's Mac, where no Claude reads the content.
+    UpdateOnly,
+}
+
 /// The log that the agent writes under `root`.
 pub fn log_path(root: &Path) -> PathBuf {
     root.join(LOG_NAME)
@@ -97,9 +109,15 @@ pub fn log_path(root: &Path) -> PathBuf {
 /// unchanged list is neither rewritten nor reloaded. A `launchctl` failure is a
 /// notice, not an error: the list is in place, and launchd loads it at the next
 /// login.
-pub fn install(agents: &Agents, prefix: &str, root: &Path, log: &dyn Fn(&str)) -> Result<bool> {
+pub fn install(
+    agents: &Agents,
+    prefix: &str,
+    root: &Path,
+    runs: Runs,
+    log: &dyn Fn(&str),
+) -> Result<bool> {
     let path = agents.plist();
-    let text = render(prefix, &log_path(root));
+    let text = render(prefix, &log_path(root), runs);
     if fs::read_to_string(&path).is_ok_and(|existing| existing == text) {
         return Ok(false);
     }
@@ -143,11 +161,15 @@ pub fn remove(agents: &Agents) -> Result<bool> {
 /// The two commands run through `/bin/sh`, so `sync` runs when `self-update`
 /// fails: an update that cannot reach the server must not hold the content
 /// back. `sync` skips its own software check, which `self-update` just made.
-/// `RunAtLoad` makes a run at every login, and launchd makes up one missed run
-/// when the Mac wakes from sleep.
-fn render(prefix: &str, log: &Path) -> String {
-    let script =
-        format!("date; {prefix} self-update --quiet; {prefix} sync --quiet --no-update-check");
+/// [`Runs::UpdateOnly`] leaves `sync` out. `RunAtLoad` makes a run at every
+/// login, and launchd makes up one missed run when the Mac wakes from sleep.
+fn render(prefix: &str, log: &Path, runs: Runs) -> String {
+    let script = match runs {
+        Runs::UpdateAndSync => {
+            format!("date; {prefix} self-update --quiet; {prefix} sync --quiet --no-update-check")
+        }
+        Runs::UpdateOnly => format!("date; {prefix} self-update --quiet"),
+    };
     let log = escape(&log.display().to_string());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -434,14 +456,37 @@ mod tests {
         let agents = Agents::unloaded(&base.join("LaunchAgents"));
         let root = base.join("root");
 
-        assert!(install(&agents, "\"/opt/bm/bin/brainmaker\"", &root, &quiet).unwrap());
+        assert!(
+            install(
+                &agents,
+                "\"/opt/bm/bin/brainmaker\"",
+                &root,
+                Runs::UpdateAndSync,
+                &quiet
+            )
+            .unwrap()
+        );
         assert!(agents.plist().is_file());
         assert!(
-            !install(&agents, "\"/opt/bm/bin/brainmaker\"", &root, &quiet).unwrap(),
+            !install(
+                &agents,
+                "\"/opt/bm/bin/brainmaker\"",
+                &root,
+                Runs::UpdateAndSync,
+                &quiet
+            )
+            .unwrap(),
             "second run is a no-op"
         );
         assert!(
-            install(&agents, "\"/other/brainmaker\"", &root, &quiet).unwrap(),
+            install(
+                &agents,
+                "\"/other/brainmaker\"",
+                &root,
+                Runs::UpdateAndSync,
+                &quiet
+            )
+            .unwrap(),
             "a new program path rewrites the list"
         );
 
@@ -456,6 +501,7 @@ mod tests {
         let text = render(
             "\"/opt/bm/bin/brainmaker\" --dir \"/opt/bm\"",
             Path::new("/opt/bm/agent.log"),
+            Runs::UpdateAndSync,
         );
         // `;` and not `&&`, so a failed self-update still lets sync run.
         assert!(
@@ -471,6 +517,23 @@ mod tests {
         assert!(text.contains("<string>/opt/bm/agent.log</string>"));
     }
 
+    #[test]
+    fn the_admin_agent_updates_and_never_syncs() {
+        let text = render(
+            "\"/opt/bm/bin/brainmaker\" --dir \"/opt/bm\"",
+            Path::new("/opt/bm/agent.log"),
+            Runs::UpdateOnly,
+        );
+        assert!(
+            text.contains(
+                "<string>date; \"/opt/bm/bin/brainmaker\" --dir \"/opt/bm\" self-update --quiet</string>"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains(" sync "), "{text}");
+        assert!(text.contains(&format!("<string>{LABEL}</string>")));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn plutil_accepts_the_property_list() {
@@ -480,6 +543,7 @@ mod tests {
             &agents,
             "\"/Me & You/bin/brainmaker\" --dir \"/Me & You\"",
             Path::new("/Me & You"),
+            Runs::UpdateAndSync,
             &quiet,
         )
         .unwrap();
@@ -499,7 +563,11 @@ mod tests {
 
     #[test]
     fn escapes_a_path_that_holds_an_ampersand() {
-        let text = render("\"/Me & You/brainmaker\"", Path::new("/Me & You/agent.log"));
+        let text = render(
+            "\"/Me & You/brainmaker\"",
+            Path::new("/Me & You/agent.log"),
+            Runs::UpdateAndSync,
+        );
         assert!(text.contains("/Me &amp; You/agent.log"), "{text}");
         assert!(!text.contains("Me & You"), "{text}");
     }

@@ -13,7 +13,7 @@ exist, and how to report a vulnerability.
 | The administrator who issues the provisioning file | The endpoints and the client credentials |
 | The employee who runs the binary | Nothing beyond their own account; they already hold the binary |
 | The server | Which operator a credential belongs to, and so the name on each note. The client never names it. |
-| The admin's copy | Collecting the notes. It runs in a root of its own, such as `~/.brainmaker-admin`, is never linked, and its issuer client holds `sync` and `outbox:read`, never `publish`. The admin commands grant nothing by themselves: the server decides what the token may read. |
+| The admin's copy | Collecting the notes. It is an install like every other, in `~/.brainmaker`, and its issuer client holds `sync` and `outbox:read`, never `publish`. `link` connects nothing to Claude for a credential that reads the outbox and cannot send notes. The admin commands grant nothing by themselves: the server decides what the token may read. |
 
 The two paths have different anchors.
 
@@ -96,13 +96,19 @@ at `POST {SWETSI_JWT_ENDPOINT}/oauth2/token`, with HTTP Basic and the `client_cr
 names one scope in each request, so a client that the server grants more than one scope still
 requests only the scope that the next request needs: `sync` for every read, and `outbox:write` to
 send a note, asked for only when a note is ready, and `outbox:read` for the admin commands. It keeps
-one token per scope for the run, so a sync token never carries the right to write, and a laptop
-never asks for the right to read the notes. It then sends `Authorization: Bearer <token>` on every
-request under the base URL. With no credential configured it sends no header. It performs no
-authorization of its own: the server decides what the token may read and write.
+one token per scope for the run, so a sync token never carries the right to write. It then sends
+`Authorization: Bearer <token>` on every request under the base URL. With no credential configured
+it sends no header. It performs no authorization of its own: the server decides what the token may
+read and write.
 
 An issuer that does not grant `outbox:write` answers `invalid_scope`. The push then stops with a
 notice, the notes stay, and the sync is not affected.
+
+`link` asks for `outbox:read` and, when the issuer grants it, for `outbox:write`, once, to learn the
+role. It uses neither token for a request. A credential that reads the outbox and cannot send notes
+is the admin's, and `link` connects nothing to Claude for it: see
+[Content is code, once it is linked](#content-is-code-once-it-is-linked). The role check is a
+convenience for the install and grants nothing: the server still checks every token.
 
 The server expires the token after 10 minutes. That bounds what a token taken from a laptop is
 worth: the client secret stays valuable, and it stays sealed. The token lives in memory for one run
@@ -358,6 +364,18 @@ The hook command and the LaunchAgent script run through a shell, so `link` write
 and the root as double-quoted words, with a backslash before `$`, the backtick, `"`, and `\`. A
 path that holds a control character stops `link`. The hook and the `CLAUDE.md` block are written
 through a temporary file and a rename, and a file that cannot be read as text is left alone.
+
+The admin's Claude must not read the content as its own instructions: the briefing is written for
+operators, and the admin's credential can read every note. So `link` asks the issuer for the role
+before it writes anything. For a credential that reads the outbox and cannot send notes, it links no
+skill and writes no hook and no block, removes any that an earlier run wrote, and schedules
+`self-update` alone. A role check that gets no clear answer stops `link` with nothing changed.
+
+A client that holds both `outbox:write` and `outbox:read` gets the bridge, because its person is also
+an operator. Its Claude then reads the content as instructions with a credential that could read
+every note, so a bad line in the content reaches further than on a laptop. Give both scopes only to
+a person who needs both. `pull-outbox` also marks each note as collected, so a second admin who runs
+it takes notes away from the admin's harvest.
 
 ### The notes
 

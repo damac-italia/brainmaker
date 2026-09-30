@@ -81,7 +81,9 @@ carries a key under its old name, such as `SWETSI_API_BASE`.
 
 `remote.rs` and `outbox.rs` call [`auth::bearer`](../src/auth.rs) before each request, with the
 scope that the request needs: `sync` for every read, and `outbox:write` for a note. The first call
-for a scope fetches, and every later call for it in the same run reads the cache.
+for a scope fetches, and every later call for it in the same run reads the cache. `link` calls
+`auth::grants`, which calls `bearer` and turns `invalid_scope` into `false`, to learn the role; see
+[Link and the hourly agent](#link-and-the-hourly-agent).
 
 ```mermaid
 sequenceDiagram
@@ -107,23 +109,23 @@ sequenceDiagram
 
 Steps:
 
-1. [`auth.rs:193`](../src/auth.rs) returns `Ok(None)` when no credential is configured. The request
+1. [`auth.rs:198`](../src/auth.rs) returns `Ok(None)` when no credential is configured. The request
    then carries no `Authorization` header.
-2. [`auth.rs:197`](../src/auth.rs) returns the cached token for the scope while it stays usable.
-3. [`auth.rs:240`](../src/auth.rs) posts `grant_type=client_credentials&scope=<scope>` with HTTP
-   Basic, and [`auth.rs:249`](../src/auth.rs) reads the response body up to 64 KiB. An answer of 400
+2. [`auth.rs:202`](../src/auth.rs) returns the cached token for the scope while it stays usable.
+3. [`auth.rs:258`](../src/auth.rs) posts `grant_type=client_credentials&scope=<scope>` with HTTP
+   Basic, and [`auth.rs:267`](../src/auth.rs) reads the response body up to 64 KiB. An answer of 400
    or 401 whose `error` is `invalid_scope` becomes `InvalidScope` at
-   [`auth.rs:303`](../src/auth.rs), which a caller can tell apart from every other failure.
-4. [`auth.rs:260`](../src/auth.rs) refuses a `token_type` other than `Bearer`, in any case. A
+   [`auth.rs:321`](../src/auth.rs), which a caller can tell apart from every other failure.
+4. [`auth.rs:278`](../src/auth.rs) refuses a `token_type` other than `Bearer`, in any case. A
    response with no `token_type` passes.
-5. [`auth.rs:279`](../src/auth.rs) refuses a token that is empty, longer than 8192 bytes, or holds
+5. [`auth.rs:297`](../src/auth.rs) refuses a token that is empty, longer than 8192 bytes, or holds
    a character outside printable ASCII.
-6. [`auth.rs:220`](../src/auth.rs) computes how long the client uses the token: `expires_in`, or
+6. [`auth.rs:238`](../src/auth.rs) computes how long the client uses the token: `expires_in`, or
    600 seconds when the response has none, cut to at most one hour, less 30 seconds.
-7. [`auth.rs:203`](../src/auth.rs) caches the token for that scope and that time. A lifetime that
+7. [`auth.rs:208`](../src/auth.rs) caches the token for that scope and that time. A lifetime that
    the clock cannot hold caches nothing, so the next request asks for a new token. The cache never
    reaches the disk.
-8. [`auth.rs:211`](../src/auth.rs) answers whether this run received a token for a scope. The
+8. [`auth.rs:216`](../src/auth.rs) answers whether this run received a token for a scope. The
    outbox steps of `sync` ask it for `sync`, because that token proves that the issuer answered.
 
 A failed token request fails the command that asked for it. During `sync`, that happens before any
@@ -393,13 +395,21 @@ Steps:
 sequenceDiagram
     participant main
     participant link
+    participant auth
     participant schedule
     participant launchd
     main->>schedule: Agents::resolve(--agent-dir, --claude-dir given)
     main->>link: link(config, claude, agents, log)
-    link->>link: link skills, copy the program, quote the command prefix
-    link->>link: write the hook and the block, each through a rename
-    link->>schedule: install(agents, prefix, root, log)
+    link->>auth: grants(outbox:read), then grants(outbox:write) when read is granted
+    alt reads the outbox and cannot send notes: the admin
+        link->>link: copy the program, quote the command prefix
+        link->>link: remove any skill link, hook entry, and block
+        link->>schedule: install(agents, prefix, root, UpdateOnly, log)
+    else every other credential, or none
+        link->>link: link skills, copy the program, quote the command prefix
+        link->>link: write the hook and the block, each through a rename
+        link->>schedule: install(agents, prefix, root, UpdateAndSync, log)
+    end
     alt the property list is unchanged
         schedule-->>link: false
     else
@@ -407,38 +417,51 @@ sequenceDiagram
         schedule->>launchd: bootout, then bootstrap, when it loads
         schedule-->>link: true
     end
-    launchd->>launchd: each hour and at login, self-update then sync
+    launchd->>launchd: each hour and at login, self-update, then sync on an operator's Mac
 ```
 
 Steps:
 
 1. [`main.rs:121`](../src/main.rs) resolves the agent location through
-   [`schedule.rs:60`](../src/schedule.rs). `--agent-dir` names a directory that is never loaded.
-   Without it, [`schedule.rs:64`](../src/schedule.rs) returns no agent on a system other than
+   [`schedule.rs:63`](../src/schedule.rs). `--agent-dir` names a directory that is never loaded.
+   Without it, [`schedule.rs:67`](../src/schedule.rs) returns no agent on a system other than
    macOS, or when `--claude-dir` was given.
-2. [`link.rs:139`](../src/link.rs) fails when the content directory does not exist yet, and
-   [`link.rs:147`](../src/link.rs) creates `outbox/` with mode `0700`.
-3. [`link.rs:148`](../src/link.rs) links the skills, and
-   [`link.rs:149`](../src/link.rs) copies the program under the root.
-4. [`link.rs:150`](../src/link.rs) builds the command prefix. [`link.rs:512`](../src/link.rs)
+2. [`link.rs:158`](../src/link.rs) asks for the role before it writes anything.
+   [`link.rs:193`](../src/link.rs) asks [`auth.rs:225`](../src/auth.rs) for `outbox:read` and, only
+   when the issuer grants it, for `outbox:write`. `invalid_scope` counts as not granted, and a run
+   with no credential grants neither. Any other failure stops the run with nothing written.
+3. For a credential that reads the outbox and cannot send notes,
+   [`link.rs:159`](../src/link.rs) copies the program, and [`link.rs:209`](../src/link.rs) runs the
+   admin's install. [`link.rs:219`](../src/link.rs) removes the skill links into the content,
+   [`link.rs:220`](../src/link.rs) the hook entries, and [`link.rs:221`](../src/link.rs) the block.
+   [`link.rs:227`](../src/link.rs) installs the agent that runs `self-update` alone, and
+   [`link.rs:236`](../src/link.rs) prints the `admin pull-outbox` command. The run needs no content
+   directory and makes no outbox. Steps 4 to 8 do not run.
+4. Every other credential goes on here. [`link.rs:165`](../src/link.rs) fails when the content
+   directory does not exist yet, and [`link.rs:173`](../src/link.rs) creates `outbox/` with mode
+   `0700`.
+5. [`link.rs:174`](../src/link.rs) links the skills, and
+   [`link.rs:175`](../src/link.rs) copies the program under the root.
+6. [`link.rs:176`](../src/link.rs) builds the command prefix. [`link.rs:593`](../src/link.rs)
    writes each path as one double-quoted shell word, puts a backslash before `$`, the backtick,
    `"`, and `\`, and refuses a path that holds a control character.
-5. [`link.rs:151`](../src/link.rs) writes the hook into `settings.json`, and
-   [`link.rs:152`](../src/link.rs) writes the block into `CLAUDE.md`. A file that exists but cannot
+7. [`link.rs:177`](../src/link.rs) writes the hook into `settings.json`, and
+   [`link.rs:178`](../src/link.rs) writes the block into `CLAUDE.md`. A file that exists but cannot
    be read as text fails the run and stays as it is. A `CLAUDE.md` whose markers are not one start
-   followed by one end fails the run too. [`link.rs:599`](../src/link.rs) writes each file through
+   followed by one end fails the run too. [`link.rs:680`](../src/link.rs) writes each file through
    a temporary file and a rename, keeps the mode of an existing file, and keeps a symbolic link as
    a link.
-6. [`link.rs:154`](../src/link.rs) installs the agent with the same command prefix the hook runs.
-7. [`schedule.rs:103`](../src/schedule.rs) returns with nothing changed when the property list
+8. [`link.rs:181`](../src/link.rs) installs the agent with the same command prefix the hook runs.
+9. [`schedule.rs:121`](../src/schedule.rs) returns with nothing changed when the property list
    already holds the same text.
-8. [`schedule.rs:109`](../src/schedule.rs) writes the property list.
-   [`schedule.rs:114`](../src/schedule.rs) unloads an earlier copy, and
-   [`schedule.rs:115`](../src/schedule.rs) loads the new one. A load failure prints a `notice:`
-   line, and `link` still exits 0.
-9. launchd then runs `/bin/sh -c` with the script that
-   [`schedule.rs:148`](../src/schedule.rs) renders: `self-update --quiet`, then
-   `sync --quiet --no-update-check`, joined by `;`, with the output in `<root>/agent.log`.
+10. [`schedule.rs:127`](../src/schedule.rs) writes the property list.
+    [`schedule.rs:132`](../src/schedule.rs) unloads an earlier copy, and
+    [`schedule.rs:133`](../src/schedule.rs) loads the new one. A load failure prints a `notice:`
+    line, and `link` still exits 0.
+11. launchd then runs `/bin/sh -c` with the script that
+    [`schedule.rs:166`](../src/schedule.rs) renders: `self-update --quiet`, then
+    `sync --quiet --no-update-check`, joined by `;`, with the output in `<root>/agent.log`. The
+    admin's agent runs `self-update --quiet` alone ([`schedule.rs:171`](../src/schedule.rs)).
 
 `unlink` runs the same resolve step, then `link::remove_bridge`, which unloads and removes the
 agent before it removes the skill links, the hook entries, and the block. It removes each hook
@@ -499,8 +522,9 @@ it while a `sync` or a `self-update` runs.
 
 ## Admin commands
 
-The admin runs these on a copy in a root of its own. Each one loads the settings as every other
-command does, then asks for a token with the scope `outbox:read`.
+The admin runs these on an install like everyone else's, which `link` left unconnected to Claude;
+see [Link and the hourly agent](#link-and-the-hourly-agent). Each one loads the settings as every
+other command does, then asks for a token with the scope `outbox:read`.
 
 ```mermaid
 sequenceDiagram
@@ -525,29 +549,29 @@ sequenceDiagram
 Steps of `admin pull-outbox`:
 
 1. [`main.rs:157`](../src/main.rs) runs the command with the directory that the parser took.
-2. [`admin.rs:241`](../src/admin.rs) refuses a directory that does not exist, before any request,
+2. [`admin.rs:242`](../src/admin.rs) refuses a directory that does not exist, before any request,
    so a wrong working directory writes nothing.
-3. [`admin.rs:248`](../src/admin.rs) takes `.admin.lock` without waiting, and then removes the temporary
+3. [`admin.rs:249`](../src/admin.rs) takes `.admin.lock` without waiting, and then removes the temporary
    files that a stopped run left in the directory.
-4. [`admin.rs:262`](../src/admin.rs) reads one page of 100 notes. `InvalidScope` becomes
-   `this credential cannot read the outbox` at [`admin.rs:179`](../src/admin.rs).
-5. [`admin.rs:339`](../src/admin.rs) checks the operator, the client ID, the name, `received_at`,
+4. [`admin.rs:263`](../src/admin.rs) reads one page of 100 notes. `InvalidScope` becomes
+   `this credential cannot read the outbox` at [`admin.rs:180`](../src/admin.rs).
+5. [`admin.rs:340`](../src/admin.rs) checks the operator, the client ID, the name, `received_at`,
    the kind, the domain, the flags, and the size again, and
-   [`admin.rs:362`](../src/admin.rs) compares the SHA-256 of the text with the one the server
+   [`admin.rs:363`](../src/admin.rs) compares the SHA-256 of the text with the one the server
    stored.
-6. [`admin.rs:369`](../src/admin.rs) takes the date from `received_at`, and
-   [`admin.rs:371`](../src/admin.rs) sets `author` and `review_flags` through
-   [`admin.rs:382`](../src/admin.rs).
-7. [`admin.rs:476`](../src/admin.rs) writes a flushed temporary file and hard-links it at
-   [`admin.rs:504`](../src/admin.rs). A name that holds the same bytes counts as written, and a
+6. [`admin.rs:370`](../src/admin.rs) takes the date from `received_at`, and
+   [`admin.rs:372`](../src/admin.rs) sets `author` and `review_flags` through
+   [`admin.rs:383`](../src/admin.rs).
+7. [`admin.rs:477`](../src/admin.rs) writes a flushed temporary file and hard-links it at
+   [`admin.rs:505`](../src/admin.rs). A name that holds the same bytes counts as written, and a
    name that holds other bytes gets a number.
-8. [`admin.rs:294`](../src/admin.rs) acknowledges the notes of the page that are on disk.
-   [`admin.rs:291`](../src/admin.rs) and [`admin.rs:295`](../src/admin.rs) stop the loop.
+8. [`admin.rs:295`](../src/admin.rs) acknowledges the notes of the page that are on disk.
+   [`admin.rs:292`](../src/admin.rs) and [`admin.rs:296`](../src/admin.rs) stop the loop.
 9. A note that could not be written stays unacknowledged, and the command exits 1.
 
-`admin status` reads the fleet view through [`admin.rs:581`](../src/admin.rs), which refuses any
-other shape at [`admin.rs:590`](../src/admin.rs), and builds the admin's shape at
-[`admin.rs:678`](../src/admin.rs). `admin syncs` resolves an operator to its clients through the
+`admin status` reads the fleet view through [`admin.rs:582`](../src/admin.rs), which refuses any
+other shape at [`admin.rs:591`](../src/admin.rs), and builds the admin's shape at
+[`admin.rs:679`](../src/admin.rs). `admin syncs` resolves an operator to its clients through the
 same view, reads each client's log, and merges the rows newest first at
-[`admin.rs:865`](../src/admin.rs), by the instant that each time names
-([`admin.rs:89`](../src/admin.rs)).
+[`admin.rs:866`](../src/admin.rs), by the instant that each time names
+([`admin.rs:90`](../src/admin.rs)).
