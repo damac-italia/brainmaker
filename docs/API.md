@@ -272,7 +272,8 @@ A run that sent at least one note writes `<root>/push.json` through a temporary 
 ### `admin pull-outbox <DIR>`
 
 1. `DIR` must be a directory. Otherwise the command writes nothing and exits 1.
-2. The command takes `<root>/.admin.lock` without waiting.
+2. The command takes `<root>/.admin.lock` without waiting, and removes every
+   `.brainmaker-pull-*` file in `DIR`: the temporary file of a run that was stopped.
 3. It reads one page of 100 notes from `GET {base}/{admin outbox route}?limit=100`.
 4. For each note it checks again the operator, the client ID, the note name, `received_at`, the kind,
    the domain, each flag, the size, and the SHA-256 of the text. A note that fails one stays on the

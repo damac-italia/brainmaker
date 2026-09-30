@@ -63,6 +63,10 @@ const MAX_CLIENT_ID_LEN: usize = 100;
 /// Longest operator name and longest flag.
 const MAX_NAME_LEN: usize = 32;
 
+/// Prefix of the temporary file that `pull-outbox` writes in the target
+/// directory before it links the note into place.
+const TEMP_PREFIX: &str = ".brainmaker-pull-";
+
 // ---------------------------------------------------------------- times ---
 
 /// Fails for a time that is not `YYYY-MM-DDTHH:MM:SS+HH:MM`, or `-HH:MM`.
@@ -247,6 +251,9 @@ pub fn pull_outbox(config: &Config, dir: &Path, log: &dyn Fn(&str)) -> Result<Pu
             lock_path.display()
         );
     };
+    // A run that was stopped cannot remove its temporary file. The lock means
+    // that no other run owns one now.
+    remove_leftovers(dir);
 
     let mut pulled = Pulled::default();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -291,6 +298,21 @@ pub fn pull_outbox(config: &Config, dir: &Path, log: &dyn Fn(&str)) -> Result<Pu
     }
     pulled.failed = failed.into_iter().collect();
     Ok(pulled)
+}
+
+/// Removes every regular file in `dir` whose name starts with
+/// [`TEMP_PREFIX`]. Nothing else writes that prefix.
+fn remove_leftovers(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let ours = entry.file_name().to_string_lossy().starts_with(TEMP_PREFIX);
+        let file = fs::symlink_metadata(entry.path()).is_ok_and(|meta| meta.is_file());
+        if ours && file {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 fn fetch_page(config: &Config) -> Result<Vec<WaitingNote>> {
@@ -454,7 +476,7 @@ fn belongs_to_key(rest: &[&str], bare: &dyn Fn(&str) -> String) -> bool {
 fn write_new(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let temp = dir.join(format!(
-        ".brainmaker-pull-{}-{}",
+        "{TEMP_PREFIX}{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
@@ -1145,6 +1167,20 @@ mod tests {
             .map(|r| serde_json::from_slice(&r.body).unwrap())
             .collect();
         assert_eq!(acks, vec![serde_json::json!({ "ids": ["n1"] })]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pull_outbox_removes_what_a_stopped_run_left() {
+        let server = admin_server(vec![page(&[])], r#"{"acked":0}"#);
+        let (dir, config, inbox) = admin_config(&server, "admin-leftover");
+        fs::write(inbox.join(".brainmaker-pull-42-0"), "half a note").unwrap();
+        fs::write(inbox.join(".other"), "not ours").unwrap();
+
+        pull_outbox(&config, &inbox, &quiet).unwrap();
+
+        assert!(!inbox.join(".brainmaker-pull-42-0").exists());
+        assert!(inbox.join(".other").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

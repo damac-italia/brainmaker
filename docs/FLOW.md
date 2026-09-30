@@ -525,28 +525,29 @@ sequenceDiagram
 Steps of `admin pull-outbox`:
 
 1. [`main.rs:157`](../src/main.rs) runs the command with the directory that the parser took.
-2. [`admin.rs:237`](../src/admin.rs) refuses a directory that does not exist, before any request,
+2. [`admin.rs:241`](../src/admin.rs) refuses a directory that does not exist, before any request,
    so a wrong working directory writes nothing.
-3. [`admin.rs:244`](../src/admin.rs) takes `.admin.lock` without waiting.
-4. [`admin.rs:255`](../src/admin.rs) reads one page of 100 notes. `InvalidScope` becomes
-   `this credential cannot read the outbox` at [`admin.rs:175`](../src/admin.rs).
-5. [`admin.rs:317`](../src/admin.rs) checks the operator, the client ID, the name, `received_at`,
+3. [`admin.rs:248`](../src/admin.rs) takes `.admin.lock` without waiting, and then removes the temporary
+   files that a stopped run left in the directory.
+4. [`admin.rs:262`](../src/admin.rs) reads one page of 100 notes. `InvalidScope` becomes
+   `this credential cannot read the outbox` at [`admin.rs:179`](../src/admin.rs).
+5. [`admin.rs:339`](../src/admin.rs) checks the operator, the client ID, the name, `received_at`,
    the kind, the domain, the flags, and the size again, and
-   [`admin.rs:340`](../src/admin.rs) compares the SHA-256 of the text with the one the server
+   [`admin.rs:362`](../src/admin.rs) compares the SHA-256 of the text with the one the server
    stored.
-6. [`admin.rs:347`](../src/admin.rs) takes the date from `received_at`, and
-   [`admin.rs:349`](../src/admin.rs) sets `author` and `review_flags` through
-   [`admin.rs:360`](../src/admin.rs).
-7. [`admin.rs:454`](../src/admin.rs) writes a flushed temporary file and hard-links it at
-   [`admin.rs:482`](../src/admin.rs). A name that holds the same bytes counts as written, and a
+6. [`admin.rs:369`](../src/admin.rs) takes the date from `received_at`, and
+   [`admin.rs:371`](../src/admin.rs) sets `author` and `review_flags` through
+   [`admin.rs:382`](../src/admin.rs).
+7. [`admin.rs:476`](../src/admin.rs) writes a flushed temporary file and hard-links it at
+   [`admin.rs:504`](../src/admin.rs). A name that holds the same bytes counts as written, and a
    name that holds other bytes gets a number.
-8. [`admin.rs:287`](../src/admin.rs) acknowledges the notes of the page that are on disk.
-   [`admin.rs:284`](../src/admin.rs) and [`admin.rs:288`](../src/admin.rs) stop the loop.
+8. [`admin.rs:294`](../src/admin.rs) acknowledges the notes of the page that are on disk.
+   [`admin.rs:291`](../src/admin.rs) and [`admin.rs:295`](../src/admin.rs) stop the loop.
 9. A note that could not be written stays unacknowledged, and the command exits 1.
 
-`admin status` reads the fleet view through [`admin.rs:559`](../src/admin.rs), which refuses any
-other shape at [`admin.rs:568`](../src/admin.rs), and builds the admin's shape at
-[`admin.rs:656`](../src/admin.rs). `admin syncs` resolves an operator to its clients through the
+`admin status` reads the fleet view through [`admin.rs:581`](../src/admin.rs), which refuses any
+other shape at [`admin.rs:590`](../src/admin.rs), and builds the admin's shape at
+[`admin.rs:678`](../src/admin.rs). `admin syncs` resolves an operator to its clients through the
 same view, reads each client's log, and merges the rows newest first at
-[`admin.rs:843`](../src/admin.rs), by the instant that each time names
-([`admin.rs:85`](../src/admin.rs)).
+[`admin.rs:865`](../src/admin.rs), by the instant that each time names
+([`admin.rs:89`](../src/admin.rs)).
