@@ -71,7 +71,7 @@ fn main() -> ExitCode {
             println!("brainmaker {}", selfupdate::CURRENT_VERSION);
             return ExitCode::SUCCESS;
         }
-        Action::Run(args) => args,
+        Action::Run(args) => *args,
     };
 
     match run(&args) {

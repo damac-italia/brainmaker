@@ -166,7 +166,9 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Run(Args),
+    /// Boxed, because `Args` passes the size limit of `clippy::large_enum_variant`
+    /// on Windows, where a path takes more bytes.
+    Run(Box<Args>),
     Help,
     AdminHelp,
     Version,
@@ -401,7 +403,7 @@ where
     check_admin_target(&args)?;
     check_options(&args)?;
 
-    Ok(Action::Run(args))
+    Ok(Action::Run(Box::new(args)))
 }
 
 /// Fails for an admin command whose value is missing, or given twice over.
@@ -500,7 +502,7 @@ mod tests {
 
     fn run(items: &[&str]) -> Args {
         match parse(items.iter().copied()).unwrap() {
-            Action::Run(args) => args,
+            Action::Run(args) => *args,
             other => panic!("expected Action::Run, got {other:?}"),
         }
     }
