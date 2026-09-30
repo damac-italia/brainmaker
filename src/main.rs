@@ -536,7 +536,6 @@ fn report(config: &Config, outcome: &sync::Outcome, quiet: bool) {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::io::Write as _;
     use std::time::{Duration, SystemTime};
 
     use super::*;
