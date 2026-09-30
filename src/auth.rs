@@ -26,16 +26,20 @@
 //! The route defaults to `oauth2/token`, and `SWETSI_TOKEN_PATH` overrides it.
 //! [`crate::config::Config::token_url`] builds the whole URL.
 //!
-//! brainmaker names the scope in the request rather than relying on a default,
-//! so a client that the server grants more than one scope still asks for the
-//! one scope that a sync needs.
+//! brainmaker names one scope in each request rather than relying on a
+//! default: `sync` to read content and software, and `outbox:write` to send a
+//! note. A sync token therefore never carries the right to write, and a client
+//! whose issuer grants no `outbox:write` still syncs. The issuer answers a
+//! scope it does not grant with `invalid_scope`, which [`InvalidScope`] carries.
 //!
 //! # The cache
 //!
-//! One run makes up to four requests, so the token is fetched once and reused.
-//! The cache lives in [`TokenCache`], which one [`crate::config::Config`] owns.
-//! It never reaches the disk: a run that ends throws the token away.
+//! One run makes several requests, so each token is fetched once and reused.
+//! The cache lives in [`TokenCache`], which one [`crate::config::Config`] owns,
+//! and it holds one token per scope. It never reaches the disk: a run that
+//! ends throws the tokens away.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -46,7 +50,11 @@ use crate::config::{Config, Credentials};
 use crate::remote;
 
 /// The scope that a sync needs. brainmaker asks for it explicitly.
-pub const SCOPE: &str = "sync";
+pub const SCOPE_SYNC: &str = "sync";
+
+/// The scope that sending a note needs. brainmaker asks for it only when a
+/// note waits in the outbox.
+pub const SCOPE_OUTBOX_WRITE: &str = "outbox:write";
 
 /// Lifetime we assume when the response omits `expires_in`. The server issues a
 /// token that lasts 10 minutes.
@@ -71,6 +79,32 @@ const MAX_TOKEN_LEN: usize = 8192;
 /// Largest token response we read.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
+/// The issuer answered that this client may not ask for `scope`.
+///
+/// A caller finds it with `downcast_ref` on the error that [`bearer`] returns,
+/// and treats it as a setting of the issuer rather than as a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidScope {
+    pub scope: String,
+}
+
+impl std::fmt::Display for InvalidScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the token endpoint does not grant this client the scope {}",
+            self.scope
+        )
+    }
+}
+
+impl std::error::Error for InvalidScope {}
+
+/// True when `error` says that the issuer does not grant a scope.
+pub fn is_invalid_scope(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<InvalidScope>().is_some()
+}
+
 /// Body of a successful `POST {jwt_endpoint}/oauth2/token`.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
@@ -86,70 +120,92 @@ struct Cached {
     usable_until: Instant,
 }
 
-/// The access token for one run.
+/// The access tokens for one run, one per scope.
 ///
-/// The cache holds a secret, so its [`std::fmt::Debug`] output names no value.
+/// The cache holds secrets, so its [`std::fmt::Debug`] output names no value.
 #[derive(Default)]
 pub struct TokenCache {
-    inner: Mutex<Option<Cached>>,
+    inner: Mutex<BTreeMap<String, Cached>>,
 }
 
 impl std::fmt::Debug for TokenCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = match self.inner.lock() {
-            Ok(guard) if guard.is_some() => "held",
-            Ok(_) => "empty",
-            Err(_) => "poisoned",
+            Ok(guard) if guard.is_empty() => "empty".to_string(),
+            Ok(guard) => format!(
+                "held for {}",
+                guard.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+            Err(_) => "poisoned".to_string(),
         };
         write!(f, "TokenCache({state})")
     }
 }
 
 impl TokenCache {
-    /// Returns the cached token while it stays usable.
-    fn get(&self) -> Option<String> {
+    /// Returns the cached token for `scope` while it stays usable.
+    fn get(&self, scope: &str) -> Option<String> {
         let guard = self.inner.lock().ok()?;
-        let cached = guard.as_ref()?;
+        let cached = guard.get(scope)?;
         if Instant::now() < cached.usable_until {
             return Some(cached.token.clone());
         }
         None
     }
 
-    /// Replaces the cached token.
+    /// Replaces the cached token for `scope`.
     ///
     /// A lifetime that the clock cannot hold stores nothing, so the next
     /// request asks for a new token.
-    fn put(&self, token: &str, lifetime: Duration) {
+    fn put(&self, scope: &str, token: &str, lifetime: Duration) {
         let Some(usable_until) = Instant::now().checked_add(lifetime) else {
             return;
         };
         if let Ok(mut guard) = self.inner.lock() {
-            *guard = Some(Cached {
-                token: token.to_string(),
-                usable_until,
-            });
+            guard.insert(
+                scope.to_string(),
+                Cached {
+                    token: token.to_string(),
+                    usable_until,
+                },
+            );
         }
+    }
+
+    /// True when this run received a token for `scope`, usable or not.
+    fn received(&self, scope: &str) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|guard| guard.contains_key(scope))
     }
 }
 
-/// Returns the bearer token for the next request.
+/// Returns the bearer token for `scope`, for the next request.
 ///
 /// Returns `Ok(None)` when no credential is configured, which leaves the
-/// request without an `Authorization` header.
-pub fn bearer(config: &Config) -> Result<Option<String>> {
+/// request without an `Authorization` header. An issuer that does not grant
+/// the scope gives an error that holds [`InvalidScope`].
+pub fn bearer(config: &Config, scope: &str) -> Result<Option<String>> {
     let (Some(credentials), Some(url)) = (config.credentials(), config.token_url()) else {
         return Ok(None);
     };
 
-    if let Some(token) = config.tokens().get() {
+    if let Some(token) = config.tokens().get(scope) {
         return Ok(Some(token));
     }
 
-    let (token, lifetime) = request_token(credentials, &url)
+    let (token, lifetime) = request_token(credentials, &url, scope)
         .with_context(|| format!("cannot get an access token from {url}"))?;
-    config.tokens().put(&token, lifetime);
+    config.tokens().put(scope, &token, lifetime);
     Ok(Some(token))
+}
+
+/// True when this run received a token for `scope` from the issuer.
+///
+/// A sync token proves that the issuer answered this run, so the steps after
+/// the content step ask this before they make a request of their own.
+pub fn received(config: &Config, scope: &str) -> bool {
+    config.tokens().received(scope)
 }
 
 /// Returns the time for which this client uses a token.
@@ -170,14 +226,14 @@ fn usable_lifetime(expires_in: Option<u64>) -> Duration {
 /// Returns the token and the time for which this client will use it. That time
 /// comes from [`usable_lifetime`]: the server's value, cut to at most
 /// [`MAX_LIFETIME`], less [`EXPIRY_MARGIN`].
-fn request_token(credentials: &Credentials, url: &str) -> Result<(String, Duration)> {
+fn request_token(credentials: &Credentials, url: &str, scope: &str) -> Result<(String, Duration)> {
     let agent = remote::build_agent(remote::TEXT_TIMEOUT);
 
     let mut response = agent
         .post(url)
         .header("Authorization", credentials.basic_header())
         .header("Accept", "application/json")
-        .send_form([("grant_type", "client_credentials"), ("scope", SCOPE)])
+        .send_form([("grant_type", "client_credentials"), ("scope", scope)])
         .map_err(describe)?;
 
     // Read the body before the status is judged: an OAuth2 failure carries its
@@ -191,7 +247,7 @@ fn request_token(credentials: &Credentials, url: &str) -> Result<(String, Durati
         .context("cannot read the token response body")?;
 
     if !status.is_success() {
-        return Err(reject(status.as_u16(), &body));
+        return Err(reject(status.as_u16(), &body, scope));
     }
 
     let parsed: TokenResponse = serde_json::from_str(&body)
@@ -237,12 +293,18 @@ fn check_token(token: &str) -> Result<()> {
 ///
 /// An OAuth2 endpoint answers a failure as `{"error": "invalid_client"}`, and
 /// it may add an `error_description`. That body says which half of the
-/// credential the server objected to, so it is appended to the guidance.
-fn reject(code: u16, body: &str) -> anyhow::Error {
+/// credential the server objected to, so it is appended to the guidance. An
+/// `invalid_scope` answer becomes [`InvalidScope`], which a caller can find.
+fn reject(code: u16, body: &str, scope: &str) -> anyhow::Error {
+    if (code == 400 || code == 401) && oauth_error(body).as_deref() == Some("invalid_scope") {
+        return anyhow::Error::new(InvalidScope {
+            scope: scope.to_string(),
+        });
+    }
     let headline = match code {
         400 | 401 => format!(
             "the token endpoint rejected the client credentials with HTTP {code}; \
-             check {} and {}, and check that the client may ask for the scope {SCOPE}",
+             check {} and {}, and check that the client may ask for the scope {scope}",
             crate::config::CLIENT_ID_ENV,
             crate::config::CLIENT_SECRET_ENV
         ),
@@ -258,6 +320,17 @@ fn reject(code: u16, body: &str) -> anyhow::Error {
         Some(message) => anyhow::anyhow!("{headline}: {message}"),
         None => anyhow::anyhow!("{headline}"),
     }
+}
+
+/// The `error` code of an OAuth2 error body, such as `invalid_scope`.
+fn oauth_error(body: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct OAuthError {
+        error: String,
+    }
+    serde_json::from_str::<OAuthError>(body)
+        .ok()
+        .map(|parsed| parsed.error)
 }
 
 /// Turns a ureq error from the token endpoint into a message that names the
@@ -344,26 +417,43 @@ mod tests {
     #[test]
     fn the_cache_returns_a_token_that_is_still_usable() {
         let cache = TokenCache::default();
-        assert_eq!(cache.get(), None);
+        assert_eq!(cache.get(SCOPE_SYNC), None);
 
-        cache.put("a-token", Duration::from_secs(60));
-        assert_eq!(cache.get().as_deref(), Some("a-token"));
+        cache.put(SCOPE_SYNC, "a-token", Duration::from_secs(60));
+        assert_eq!(cache.get(SCOPE_SYNC).as_deref(), Some("a-token"));
+    }
+
+    #[test]
+    fn the_cache_keeps_one_token_per_scope() {
+        let cache = TokenCache::default();
+        cache.put(SCOPE_SYNC, "sync-token", Duration::from_secs(60));
+        assert_eq!(cache.get(SCOPE_OUTBOX_WRITE), None);
+        assert!(!cache.received(SCOPE_OUTBOX_WRITE));
+
+        cache.put(SCOPE_OUTBOX_WRITE, "write-token", Duration::from_secs(60));
+        assert_eq!(cache.get(SCOPE_SYNC).as_deref(), Some("sync-token"));
+        assert_eq!(
+            cache.get(SCOPE_OUTBOX_WRITE).as_deref(),
+            Some("write-token")
+        );
     }
 
     #[test]
     fn the_cache_drops_a_token_that_expired() {
         let cache = TokenCache::default();
-        cache.put("a-token", Duration::from_secs(0));
-        assert_eq!(cache.get(), None);
+        cache.put(SCOPE_SYNC, "a-token", Duration::from_secs(0));
+        assert_eq!(cache.get(SCOPE_SYNC), None);
+        // The run still received it, so the issuer answered.
+        assert!(cache.received(SCOPE_SYNC));
     }
 
     #[test]
     fn the_cache_debug_output_never_shows_the_token() {
         let cache = TokenCache::default();
-        cache.put("super-secret-value", Duration::from_secs(60));
+        cache.put(SCOPE_SYNC, "super-secret-value", Duration::from_secs(60));
         let shown = format!("{cache:?}");
         assert!(!shown.contains("super-secret-value"), "got {shown}");
-        assert_eq!(shown, "TokenCache(held)");
+        assert_eq!(shown, "TokenCache(held for sync)");
     }
 
     #[test]
@@ -384,8 +474,8 @@ mod tests {
     #[test]
     fn a_lifetime_the_clock_cannot_hold_caches_nothing() {
         let cache = TokenCache::default();
-        cache.put("token", Duration::MAX);
-        assert!(cache.get().is_none());
+        cache.put(SCOPE_SYNC, "token", Duration::MAX);
+        assert!(cache.get(SCOPE_SYNC).is_none());
     }
 
     #[test]
@@ -425,7 +515,7 @@ mod tests {
         let dir = temp_dir("auth-exchange");
         let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
 
-        let token = bearer(&config).unwrap();
+        let token = bearer(&config, SCOPE_SYNC).unwrap();
 
         assert_eq!(token, Some("abc".to_string()));
         let requests = server.requests();
@@ -451,8 +541,14 @@ mod tests {
         let dir = temp_dir("auth-cache");
         let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
 
-        assert_eq!(bearer(&config).unwrap(), Some("abc".to_string()));
-        assert_eq!(bearer(&config).unwrap(), Some("abc".to_string()));
+        assert_eq!(
+            bearer(&config, SCOPE_SYNC).unwrap(),
+            Some("abc".to_string())
+        );
+        assert_eq!(
+            bearer(&config, SCOPE_SYNC).unwrap(),
+            Some("abc".to_string())
+        );
 
         assert_eq!(server.requests().len(), 1);
 
@@ -468,7 +564,7 @@ mod tests {
         let dir = temp_dir("auth-token-type");
         let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
 
-        let error = bearer(&config).unwrap_err();
+        let error = bearer(&config, SCOPE_SYNC).unwrap_err();
 
         let text = format!("{error:#}");
         assert!(text.contains("token type"), "got {text}");
@@ -484,7 +580,7 @@ mod tests {
         let dir = temp_dir("auth-line-break");
         let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
 
-        let error = bearer(&config).unwrap_err();
+        let error = bearer(&config, SCOPE_SYNC).unwrap_err();
 
         let text = format!("{error:#}");
         assert!(text.contains("cannot send"), "got {text}");
@@ -501,7 +597,7 @@ mod tests {
         let dir = temp_dir("auth-rejected");
         let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
 
-        let error = bearer(&config).unwrap_err();
+        let error = bearer(&config, SCOPE_SYNC).unwrap_err();
 
         let text = format!("{error:#}");
         assert!(text.contains("invalid_client"), "got {text}");
@@ -517,7 +613,7 @@ mod tests {
         let dir = temp_dir("auth-none");
         let config = Config::for_test(&dir, &server.base());
 
-        assert_eq!(bearer(&config).unwrap(), None);
+        assert_eq!(bearer(&config, SCOPE_SYNC).unwrap(), None);
         remote::fetch_text(&config, &format!("{}/x", server.base()), 1024).unwrap();
 
         // One request, the one for the route, with no Authorization header.

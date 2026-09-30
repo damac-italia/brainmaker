@@ -42,6 +42,12 @@ pub const DEFAULT_SOFTWARE_MANIFEST_PATH: &str = "software/brainmaker";
 /// Default route that returns one replacement binary.
 pub const DEFAULT_SOFTWARE_BINARY_PATH: &str = "software/brainmaker-{version}-{platform}{ext}";
 
+/// Default route that receives one note. The note name follows it.
+pub const DEFAULT_OUTBOX_PATH: &str = "outbox";
+
+/// Default route that names the operator of this client.
+pub const DEFAULT_WHOAMI_PATH: &str = "whoami";
+
 /// Length of a content hash, in characters.
 pub const HASH_LEN: usize = 8;
 
@@ -60,6 +66,9 @@ pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 /// Largest replacement binary we accept from the server.
 pub const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Largest note that push sends. The server refuses a larger one.
+pub const MAX_NOTE_BYTES: u64 = 64 * 1024;
 
 /// Where the settings for this run came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,11 +141,11 @@ impl Credentials {
     }
 }
 
-/// The five routes this client asks for, each relative to a base URL.
+/// The seven routes this client asks for, each relative to a base URL.
 ///
 /// No route name is required in the provisioning file. An absent key takes the
 /// generic default above, so a deployment that does not want its route names in
-/// a public repository sets all five and the repository learns nothing.
+/// a public repository sets all seven and the repository learns nothing.
 #[derive(Debug, Clone)]
 pub struct Routes {
     token: String,
@@ -144,6 +153,8 @@ pub struct Routes {
     content_archive: String,
     software_manifest: String,
     software_binary: String,
+    outbox: String,
+    whoami: String,
 }
 
 impl Default for Routes {
@@ -154,12 +165,14 @@ impl Default for Routes {
             content_archive: DEFAULT_CONTENT_ARCHIVE_PATH.to_string(),
             software_manifest: DEFAULT_SOFTWARE_MANIFEST_PATH.to_string(),
             software_binary: DEFAULT_SOFTWARE_BINARY_PATH.to_string(),
+            outbox: DEFAULT_OUTBOX_PATH.to_string(),
+            whoami: DEFAULT_WHOAMI_PATH.to_string(),
         }
     }
 }
 
 impl Routes {
-    /// Reads the five routes from one source, and checks each one.
+    /// Reads the seven routes from one source, and checks each one.
     ///
     /// `value` returns the configured route for a key, or `None` for the
     /// default.
@@ -174,6 +187,8 @@ impl Routes {
                 provision::KEY_CONTENT_ARCHIVE_PATH => routes.content_archive = checked,
                 provision::KEY_SOFTWARE_MANIFEST_PATH => routes.software_manifest = checked,
                 provision::KEY_SOFTWARE_BINARY_PATH => routes.software_binary = checked,
+                provision::KEY_OUTBOX_PATH => routes.outbox = checked,
+                provision::KEY_WHOAMI_PATH => routes.whoami = checked,
                 _ => {}
             }
         }
@@ -228,7 +243,7 @@ fn check_credential_value(key: &str, value: &str) -> Result<()> {
 ///
 /// `provision::read` already checked the base URLs and the credential set.
 /// This adds the two checks that live in this module: the character rules on
-/// the credentials, and the rules on the five routes. It runs before the
+/// the credentials, and the rules on the seven routes. It runs before the
 /// store is written, so a file that fails leaves the previous store, and the
 /// file itself, in place.
 fn check_importable(settings: &Settings) -> Result<()> {
@@ -314,6 +329,45 @@ impl Layout {
     /// software update, and the reverse.
     pub fn update_lock_file(&self) -> PathBuf {
         self.root.join(".update.lock")
+    }
+
+    /// Directory where the operator's Claude writes the notes that push sends.
+    pub fn outbox_dir(&self) -> PathBuf {
+        self.root.join("outbox")
+    }
+
+    /// Directory that holds each sent note, under the month the server
+    /// received it.
+    pub fn sent_dir(&self) -> PathBuf {
+        self.outbox_dir().join("sent")
+    }
+
+    /// Directory that holds each note that broke a rule, beside its reason.
+    pub fn rejected_dir(&self) -> PathBuf {
+        self.outbox_dir().join("rejected")
+    }
+
+    /// File that one run locks while it pushes notes.
+    ///
+    /// A third file, so that a push never waits for an install, and the
+    /// reverse.
+    pub fn outbox_lock_file(&self) -> PathBuf {
+        self.root.join(".outbox.lock")
+    }
+
+    /// File that records the last push that sent a note.
+    pub fn push_state_file(&self) -> PathBuf {
+        self.root.join("push.json")
+    }
+
+    /// File that holds the operator name that the server gives this client.
+    pub fn operator_file(&self) -> PathBuf {
+        self.root.join("operator")
+    }
+
+    /// File that one admin command locks while it collects notes.
+    pub fn admin_lock_file(&self) -> PathBuf {
+        self.root.join(".admin.lock")
     }
 }
 
@@ -549,6 +603,36 @@ impl Config {
         self.layout.update_lock_file()
     }
 
+    /// Directory where the operator's Claude writes the notes.
+    pub fn outbox_dir(&self) -> PathBuf {
+        self.layout.outbox_dir()
+    }
+
+    /// Directory that holds each sent note.
+    pub fn sent_dir(&self) -> PathBuf {
+        self.layout.sent_dir()
+    }
+
+    /// Directory that holds each note that broke a rule.
+    pub fn rejected_dir(&self) -> PathBuf {
+        self.layout.rejected_dir()
+    }
+
+    /// File that one run locks while it pushes notes.
+    pub fn outbox_lock_file(&self) -> PathBuf {
+        self.layout.outbox_lock_file()
+    }
+
+    /// File that records the last push that sent a note.
+    pub fn push_state_file(&self) -> PathBuf {
+        self.layout.push_state_file()
+    }
+
+    /// File that holds the operator name that the server gives this client.
+    pub fn operator_file(&self) -> PathBuf {
+        self.layout.operator_file()
+    }
+
     /// URL that returns the latest content hash as JSON.
     pub fn latest_url(&self) -> String {
         join(&self.base_url, &self.routes.content_latest)
@@ -582,6 +666,17 @@ impl Config {
         join(&self.base_url, &route)
     }
 
+    /// URL that receives the note `name`. Check the name first: it becomes a
+    /// path segment.
+    pub fn outbox_url(&self, name: &str) -> String {
+        join(&self.base_url, &format!("{}/{name}", self.routes.outbox))
+    }
+
+    /// URL that names the operator of this client.
+    pub fn whoami_url(&self) -> String {
+        join(&self.base_url, &self.routes.whoami)
+    }
+
     /// URL of the token endpoint, or `None` when no credential is configured.
     pub fn token_url(&self) -> Option<String> {
         self.credentials
@@ -609,9 +704,10 @@ impl Config {
     pub fn credentials_summary(&self) -> String {
         match self.credentials.as_ref() {
             Some(credentials) => format!(
-                "client-credentials grant, scope {}, client id {} characters, \
-                 secret {} characters",
-                auth::SCOPE,
+                "client-credentials grant, scope {}, and {} for the outbox, client id {} \
+                 characters, secret {} characters",
+                auth::SCOPE_SYNC,
+                auth::SCOPE_OUTBOX_WRITE,
                 credentials.client_id.chars().count(),
                 credentials.client_secret.chars().count()
             ),

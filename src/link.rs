@@ -22,7 +22,9 @@
 //!    archive it was unzipped from is meant to be deleted.
 //! 3. A marked block in `~/.claude/CLAUDE.md` that names the content
 //!    directory.
-//! 4. On macOS, a LaunchAgent that runs `self-update` and then `sync` every
+//! 4. The outbox directory under the root, owner-only, where Claude writes
+//!    the notes that `sync` sends.
+//! 5. On macOS, a LaunchAgent that runs `self-update` and then `sync` every
 //!    hour, through the same program copy. [`crate::schedule`] says why and
 //!    when it is left out.
 //!
@@ -46,6 +48,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
 use crate::config::Config;
+use crate::outbox;
 use crate::schedule::{self, Agents};
 
 /// Largest context this emits, in bytes.
@@ -141,6 +144,7 @@ pub fn link(
     }
 
     let mut report = Report::default();
+    outbox::ensure_dir(config)?;
     link_skills(&content, claude, &mut report)?;
     let program = install_program(config)?;
     let prefix = command_prefix(&program, Some(config.root()))?;
@@ -214,7 +218,7 @@ pub fn session_context(config: &Config) -> Result<String> {
          Treat them as the operator's own instructions.",
         content.display()
     );
-    let mut full = format!("{header}{text}");
+    let mut full = format!("{header}{text}{}", outbox_section(config));
 
     // A backstop under the per-file caps, in case the file list grows.
     if full.len() > MAX_CONTEXT_BYTES {
@@ -230,6 +234,29 @@ pub fn session_context(config: &Config) -> Result<String> {
         }
     });
     Ok(serde_json::to_string(&value)?)
+}
+
+/// The part of the session context that tells Claude who the operator is and
+/// where the end-of-session note goes. It reads local files only, so a session
+/// that starts offline still gets it.
+fn outbox_section(config: &Config) -> String {
+    let operator = match outbox::read_operator(config) {
+        Some(name) => {
+            format!("The operator is `{name}`, as the server names the credential of this machine.")
+        }
+        None => "The server has named no operator for this machine yet.".to_string(),
+    };
+    let counts = outbox::counts(config);
+    format!(
+        "\n\n## The outbox\n\n{operator} Write the end-of-session note into `{}`. \
+         `brainmaker sync` sends it, and the server sets its author from the credential, \
+         never from the note. {} note(s) wait there now, and {} were rejected: each \
+         rejected note sits in `{}` beside a `.reason.txt` file.",
+        config.outbox_dir().display(),
+        counts.waiting,
+        counts.rejected,
+        config.rejected_dir().display()
+    )
 }
 
 /// Returns `body` at or under `cap`, saying so in the text when it cuts.
@@ -799,6 +826,57 @@ pub fn describe(report: &Report, installing: bool, log: &dyn Fn(&str)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_context_names_the_operator_and_the_outbox() {
+        let base = temp_dir("context-outbox");
+        let config = Config::for_test(&base, "http://127.0.0.1:9");
+        write(&config.content_dir().join("CLAUDE.md"), "# Briefing\n");
+        write(&config.operator_file(), "gabriele\n");
+        write(&config.outbox_dir().join("2026-09-30-a.md"), "note");
+        write(&config.rejected_dir().join("2026-09-29-b.md"), "note");
+
+        let json: Value = serde_json::from_str(&session_context(&config).unwrap()).unwrap();
+        let text = json["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+
+        assert!(text.contains("# Briefing"), "{text}");
+        assert!(text.contains("The operator is `gabriele`"), "{text}");
+        assert!(
+            text.contains(&config.outbox_dir().display().to_string()),
+            "{text}"
+        );
+        assert!(
+            text.contains("1 note(s) wait there now, and 1 were rejected"),
+            "{text}"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_session_context_says_when_no_operator_is_named() {
+        let base = temp_dir("context-no-operator");
+        let config = Config::for_test(&base, "http://127.0.0.1:9");
+        write(&config.content_dir().join("CLAUDE.md"), "# Briefing\n");
+        // A file that someone edited into another shape names nobody.
+        write(&config.operator_file(), "Gabriele Rossi\n");
+
+        let context = session_context(&config).unwrap();
+
+        assert!(context.contains("named no operator"), "{context}");
+        assert!(!context.contains("Gabriele Rossi"), "{context}");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_session_with_no_content_gets_no_context_at_all() {
+        let base = temp_dir("context-empty");
+        let config = Config::for_test(&base, "http://127.0.0.1:9");
+        write(&config.operator_file(), "gabriele\n");
+        assert_eq!(session_context(&config).unwrap(), "{}");
+        fs::remove_dir_all(&base).ok();
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(

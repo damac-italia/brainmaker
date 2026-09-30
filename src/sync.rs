@@ -80,7 +80,7 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
     let content_present = content_dir.is_dir();
 
     log("Checking the latest content version.");
-    let release = match remote::latest_release(config) {
+    let release = match remote::latest_release(config, &crate::outbox::report_headers(config)) {
         Ok(release) => release,
         Err(error) => {
             return match installed {

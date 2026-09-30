@@ -15,6 +15,11 @@ exits.
 
 The binary carries no endpoint and no credential. Both arrive in a provisioning file.
 
+It also carries the notes of an operator's Claude to the server. At the end of a session, Claude
+writes one note into `~/.brainmaker/outbox/`, and the next `sync` sends it. The server sets the
+name on each note from the credential that sent it, and `sync` writes that name to
+`~/.brainmaker/operator` for Claude to read.
+
 ## Quick start
 
 `brainmaker` needs a provisioning file before it can reach a server. Your administrator issues it.
@@ -68,6 +73,9 @@ gone. Later runs read the sealed copy and need no file.
 | Self-update | Verifies the SHA-256 and the exact `--version` line before it swaps the binary, including the copy the hook runs |
 | Strict options | Refuses an option that has no effect with the command, a value option given twice, and a value that starts with a hyphen |
 | Static Linux builds | `x86_64` and `arm64` link against musl, so there is no glibc version floor |
+| Outbox | `sync` sends each note from `~/.brainmaker/outbox/` once it has not changed for a minute, with a token of its own scope, and moves it to `sent/` or `rejected/` |
+| Upload guard | Push sends regular files only, never through a symbolic link, with a checked name, at most 64 KiB, in UTF-8, with a checked frontmatter |
+| Operator name | `sync` asks the server which operator the credential belongs to, and writes the answer to `~/.brainmaker/operator` |
 
 ## Usage
 
@@ -88,7 +96,37 @@ brainmaker status
 `status` prints the root, the content directory, the store path, the settings source, the API base,
 the token URL, the credential lengths, the key class, the machine binding of the store, the number
 of trusted software keys and of trusted content keys, the installed hash, the latest hash, the
-platform key, and the published version. It changes nothing.
+platform key, and the published version. It then prints the operator name that the last `sync`
+wrote, the notes that wait and the notes that were rejected, and the age of the last push that sent
+a note. It changes nothing.
+
+### Send the notes
+
+At the end of a session, the operator's Claude writes one note into `~/.brainmaker/outbox/`, as
+`YYYY-MM-DD-<slug>.md`. `sync` sends every note that has not changed for 60 seconds, after the
+content step. To send them now:
+
+```bash
+brainmaker push
+```
+
+Each note takes one of three ways:
+
+| What happens | Where the note goes |
+|---|---|
+| The server stores it, or already holds the same bytes | `outbox/sent/<YYYY-MM>/`, the month in which the server received it |
+| It breaks a rule here, or the server refuses it with HTTP 400 or 413 | `outbox/rejected/`, beside `<name>.reason.txt` |
+| The issuer or the server does not take it, or cannot be reached | It stays in `outbox/`, and the run stops |
+
+A note must be a regular file, never a symbolic link, of at most 64 KiB, in UTF-8. Its frontmatter
+starts at the first line, names a `kind` of `fact`, `decision`, `anomaly`, or `question` and a
+`domain`, and repeats no key. The server applies the same rules. The name on the note comes from the
+server, from the credential that sent it, and never from the note: an `author` line is kept only as
+a claim.
+
+`push` asks the issuer for a token with the scope `outbox:write`, and only when a note is ready. A
+credential whose issuer client does not have that scope keeps syncing, and its notes stay. `sync`
+treats every push failure as a notice and exits 0; `push` exits 1 when a note stays.
 
 ### Replace the binary
 
@@ -125,11 +163,13 @@ that project is open. `link` bridges it to user scope, so it applies everywhere:
 - One symbolic link per shipped skill, under `~/.claude/skills`.
 - A `SessionStart` hook in `~/.claude/settings.json` that runs `sync`, then `session-context`.
 - A marked block in `~/.claude/CLAUDE.md` naming the content directory.
+- The outbox, `~/.brainmaker/outbox/`, with mode `0700`.
 - On macOS, the hourly LaunchAgent that [Keep it current between sessions](#keep-it-current-between-sessions) describes.
 
 `session-context` prints the JSON that hook returns: the shared briefing and the working notes, each
-file capped so one growing file cannot crowd out the rest. It is registered by `link` and is not
-meant to be run by hand.
+file capped so one growing file cannot crowd out the rest, then the operator name, the outbox path,
+and the count of notes that wait and that were rejected. It reads local files only. It is
+registered by `link` and is not meant to be run by hand.
 
 `brainmaker unlink` removes all of them. Both commands are idempotent, and neither touches a file it
 did not write: a skill name that already exists as a real directory is reported and skipped, and
@@ -213,9 +253,12 @@ brainmaker uninstall
 
 1. What `link` wrote, the LaunchAgent included, exactly as `unlink` removes it.
 2. What brainmaker wrote under `~/.brainmaker`: the content, the program copy that the hook runs,
-   the state file, the sealed settings, the agent log, the two lock files, and any temporary file
-   that a stopped run left.
+   the state file, the sealed settings, the agent log, the operator file, the push record, the
+   four lock files, and any temporary file that a stopped run left.
 3. `~/.brainmaker` itself, when nothing else is left in it.
+
+The outbox stays, with every note in it, and the run says how many notes were never sent. The root
+then stays too, because the outbox is in it.
 
 It removes nothing that brainmaker did not write. Your own skills, hooks, and `CLAUDE.md` text
 stay, and a file of yours under the root stays together with the root. When the root exists but
@@ -264,8 +307,8 @@ it fails with a message that asks for a new file.
 
 ### Route names
 
-Five more keys name the routes. Each one is optional, and an absent key takes the generic default
-below. Set all five to keep the route names of a deployment out of this public repository.
+Seven more keys name the routes. Each one is optional, and an absent key takes the generic default
+below. Set all seven to keep the route names of a deployment out of this public repository.
 
 | Key | Default | Joins |
 |---|---|---|
@@ -274,6 +317,8 @@ below. Set all five to keep the route names of a deployment out of this public r
 | `BRAINMAKER_CONTENT_ARCHIVE_PATH` | `content/{hash}.zip` | `BRAINMAKER_API_BASE` |
 | `BRAINMAKER_SOFTWARE_MANIFEST_PATH` | `software/brainmaker` | `BRAINMAKER_API_BASE` |
 | `BRAINMAKER_SOFTWARE_BINARY_PATH` | `software/brainmaker-{version}-{platform}{ext}` | `BRAINMAKER_API_BASE` |
+| `BRAINMAKER_OUTBOX_PATH` | `outbox`, then `/<note name>` | `BRAINMAKER_API_BASE` |
+| `BRAINMAKER_WHOAMI_PATH` | `whoami` | `BRAINMAKER_API_BASE` |
 
 `brainmaker` substitutes `{hash}`, `{version}`, `{platform}`, and `{ext}`. `{ext}` is `.exe` on
 Windows and empty everywhere else.
@@ -309,7 +354,7 @@ next run imports it, overwrites the sealed store, and removes the file.
 | `SWETSI_JWT_ENDPOINT` | the sealed value | Base of the OAuth2 routes. The TLS rule above applies to it. |
 | `SWETSI_CLIENT_ID` | the sealed value | Client identifier for the token request. |
 | `SWETSI_CLIENT_SECRET` | the sealed value | Client secret for the token request. |
-| The five `SWETSI_*_PATH` keys | the sealed value, else the default | One route each. The same rules as above apply. |
+| The seven `*_PATH` keys | the sealed value, else the default | One route each. The same rules as above apply. |
 | `BRAINMAKER_CONFIG` | unset | Path of the provisioning file to import. |
 | `BRAINMAKER_CONFIG_KEY` | a development key | Build-time only. Seals the stored settings. |
 
@@ -334,6 +379,10 @@ grant_type=client_credentials&scope=sync
 The token lasts 10 minutes. `brainmaker` asks for the scope `sync` explicitly, keeps the token in
 memory for the run, and stops using it 30 seconds before it expires. The token never reaches the
 disk. Every API request then carries `Authorization: Bearer <token>`.
+
+To send a note, `brainmaker` asks for a second token, with `scope=outbox:write`, and only when a note
+is ready. It keeps one token per scope for the run. A sync token therefore never carries the right
+to write, and an issuer that answers `invalid_scope` stops only the push.
 
 ### Options
 
@@ -367,7 +416,7 @@ a hyphen, such as `uninstall --dir --yes`. Write a path that starts with a hyphe
 
 - [Architecture](docs/ARCHITECTURE.md): modules, boundaries, data model, decisions
 - [Flow](docs/FLOW.md): the sync, provisioning, and self-update paths
-- [API](docs/API.md): the CLI surface and the five HTTP routes the server must serve
+- [API](docs/API.md): the CLI surface and the seven HTTP routes the server must serve
 - [Security](docs/SECURITY.md): trust model, secret handling, input validation
 
 ## Build and release

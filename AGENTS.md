@@ -67,6 +67,10 @@ write `/` as a separator.
 signer whose key a test makes the client trust, and a zip builder. A test that needs a server uses
 these helpers.
 
+The server records the headers and the body of each request. A route can send response headers,
+give its replies in order, and, for the token route, answer only the scope that the form names.
+Build a token route with `Route::token`, so that a test states which scope it expects.
+
 ## Documents
 
 `README.md` and `docs/*.md` are maintained with a tool named docsgen. `docs/.docsgen.json` records a

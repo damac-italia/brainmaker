@@ -1,6 +1,6 @@
 # API
 
-`brainmaker` exposes a command-line surface, and it consumes five HTTP routes. Both are described
+`brainmaker` exposes a command-line surface, and it consumes seven HTTP routes. Both are described
 here. The crate is a binary, not a library, so it exports nothing to other Rust code.
 
 ## Command-line surface
@@ -13,10 +13,11 @@ brainmaker [COMMAND] [OPTIONS]
 
 | Command | Effect | Writes |
 |---|---|---|
-| `sync` | Update the content when the server has a newer version. The default when no command is given. | `content/`, `state.json` |
-| `status` | Print the installed hash, the latest hash, and both software versions | nothing |
+| `sync` | Update the content when the server has a newer version. The default when no command is given. Then ask the server for the operator name, and send the notes in the outbox. | `content/`, `state.json`, `operator`, `outbox/`, `push.json` |
+| `status` | Print the installed hash, the latest hash, both software versions, the operator, and the notes in the outbox | nothing |
+| `push` | Send the notes in the outbox now | `outbox/`, `push.json` |
 | `self-update` | Replace this binary with the newest build for this platform | the binary |
-| `link` | Bridge the synced content into `~/.claude`. On macOS, also install and load the hourly LaunchAgent. | `~/.claude/skills`, `settings.json`, `CLAUDE.md`, `~/Library/LaunchAgents/it.damac.brainmaker.plist` |
+| `link` | Bridge the synced content into `~/.claude`, and create the outbox. On macOS, also install and load the hourly LaunchAgent. | `~/.claude/skills`, `settings.json`, `CLAUDE.md`, `~/Library/LaunchAgents/it.damac.brainmaker.plist`, `outbox/` |
 | `unlink` | Remove what `link` wrote, and nothing else | the same four |
 | `uninstall` | Remove what `link` wrote, then what brainmaker wrote under the root, then the root when it is empty. It asks first. | the same four, and the root |
 | `session-context` | Print the `SessionStart` JSON the linked hook returns | nothing |
@@ -104,6 +105,15 @@ the update lock within 30 seconds exits 1.
 A `sync` exits 1 when the server offers a release with another hash whose sequence is not higher
 than the installed one. The content stays as it was. `--force` installs that release.
 
+The outbox steps of `sync` never change its exit code. A failure of `whoami` or of the push prints
+one `notice:` line to stderr, which `--quiet` hides, and the content result decides the code. A
+failed content step does not stop the outbox steps: they run first, and the content error is then
+returned.
+
+`push` exits 1 when a note stays in the outbox because the issuer or the server did not take it, or
+could not be reached. It exits 0 when every ready note was sent or rejected, when no note waits,
+and when another run holds the push lock.
+
 `uninstall` exits 0 and removes nothing when the answer to its question is not `y` or `yes`. It
 exits 1 when stdin is not a terminal and `--yes` is absent. A removal that fails part-way exits 1
 with part of the install already gone; run the command again to finish.
@@ -118,7 +128,7 @@ and `--url` with `<flag> has no effect with uninstall, which loads no settings`,
 | Step | Removes | When |
 |---|---|---|
 | 1 | The LaunchAgent, the skill links, the `SessionStart` hook, and the `CLAUDE.md` block that `link` wrote, as `unlink` removes them | the root is recognised or does not exist |
-| 2 | `content/`, `.staging/`, `.trash/`, `.download.zip`, `.lock`, `.update.lock`, and `agent.log` | the root is recognised |
+| 2 | `content/`, `.staging/`, `.trash/`, `.download.zip`, `.lock`, `.update.lock`, `.outbox.lock`, `.admin.lock`, `agent.log`, `operator.tmp`, `operator`, `push.json.tmp`, and `push.json` | the root is recognised |
 | 3 | `bin/brainmaker`, and every `bin/.brainmaker*` file that `link` or `self-update` left | the root is recognised |
 | 4 | `state.json.tmp`, `state.json`, `confidential/config.tmp`, and `confidential/config.enc` | the root is recognised |
 | 5 | `bin/`, `confidential/`, and then the root | each one is empty |
@@ -129,6 +139,10 @@ recognised, the run changes nothing, step 1 included, and says so. The agent, th
 `CLAUDE.md` block are not checked against their root, so step 1 under a wrong `--dir` would cut off a real install
 elsewhere. Step 4 comes last because those two files are the marks: a run that stops part-way
 keeps them, and the next run still recognises the root.
+
+`outbox/` stays in every case, with every note in it, sent or not. The run prints how many notes
+were never sent: those that wait in `outbox/` and those in `outbox/rejected/`. The root then stays
+too, because it holds `outbox/`.
 
 A root that still holds other entries after step 5 stays, and the run names them. A symbolic link
 goes without the target that it names. That includes the root: when it is a link, step 5 removes
@@ -148,7 +162,7 @@ the run prints a notice and the path to delete after the command exits.
 | `settings` | `imported from <path>`, `read from the sealed store`, or `read from the environment` |
 | `api base` | The base URL in use |
 | `token url` | The token endpoint in use, or `<none>` |
-| `auth` | `absent`, or `client-credentials grant, scope sync, client id N characters, secret N characters`. Never a credential itself. |
+| `auth` | `absent`, or `client-credentials grant, scope sync, and outbox:write for the outbox, client id N characters, secret N characters`. Never a credential itself. |
 | `key` | `release` or `development`, naming which build key this binary carries |
 | `binding` | What ties the sealed store to this machine: `machine identifier`, `home directory path (weak)`, or `none (weak)`. A `(weak)` value means a copy of `config.enc` opens on another machine. |
 | `signing` | Both key counts, as `N trusted software key(s), N trusted content key(s)`. `0` software keys means it installs no update; `0` content keys means it installs no content. |
@@ -160,6 +174,11 @@ the run prints a notice and the path to delete after the command exits.
 | `platform` | This machine's manifest key, for example `darwin-arm64` |
 | `published` | The manifest version, or `<unknown>` |
 | `update` | `none`, `available; run <path of this binary> self-update`, or a reason |
+| `operator` | The name in `operator`, which the last `sync` wrote, or `<none>` |
+| `outbox` | `N waiting, N rejected`, counted from the files |
+| `pushed` | The age of the last push that sent a note, in its largest whole unit, such as `2 days ago`, or `<none>` |
+
+The last three rows read local files only.
 
 ### `session-context` output
 
@@ -185,19 +204,74 @@ in the text with the path to read for the rest.
 | `agent-memory/OPEN-THREADS.md` | 8 KiB |
 | `agent-memory/PREFERENCES.md` | 8 KiB |
 
+After the files, the context carries one more section, `The outbox`, from local files only: the
+operator name in `operator`, or a line that says the server named none; the path of the outbox, where
+Claude writes the end-of-session note; and the count of notes that wait and that were rejected.
+
 With no content, or with every file empty, the command prints `{}` and the session is unchanged.
 The command always prints, even under `--quiet`, because the hook reads its `stdout`.
 
+### The outbox
+
+The operator's Claude writes one note per session into `<root>/outbox/`. `sync` and `push` send the
+notes, oldest first, under the lock `<root>/.outbox.lock`. A run that finds the lock held sends
+nothing.
+
+| Check, in order | A file that fails it |
+|---|---|
+| The name does not start with `.`, ends with `.md`, and the entry is not a directory | Is ignored |
+| The entry is a regular file, and not a symbolic link | Moves to `rejected/` |
+| The file has not changed for 60 seconds | Waits for the next run |
+| The name matches `^[0-9]{4}-[0-9]{2}-[0-9]{2}-[a-z0-9][a-z0-9-]{0,99}\.md$` | Moves to `rejected/` |
+| The file is 1 byte to 64 KiB, valid UTF-8, with no NUL and no byte-order mark | Moves to `rejected/` |
+| The frontmatter passes the rules below | Moves to `rejected/` |
+
+The frontmatter starts with `---` and a line end, LF or CRLF, and ends at the next line that is
+exactly `---`. A key line is `key: value` at column 0; indented lines, list items, blank lines, and
+`#` comments carry nothing; any other line fails. A value is trimmed; a quoted value ends at its
+closing quote, and an unquoted value ends before ` #`. `kind` is required and is `fact`,
+`decision`, `anomaly`, or `question`. `domain` is required and matches `^[a-z0-9][a-z0-9-]{0,31}$`.
+No top-level key appears twice, `author` and `review_flags` included. The server applies the same
+rules.
+
+A file that moves to `rejected/` gets `<name>.reason.txt` beside it, with the rule it broke or the
+reason the server gave. A name that is taken there, or under `sent/`, gets `-2`, `-3`, and so on
+before `.md`.
+
+When no note is ready, the run makes no request. Otherwise it asks for an `outbox:write` token and
+sends each note to `POST {base}/{outbox route}/<name>`:
+
+| Answer | The note |
+|---|---|
+| `201`, `200` | Moves to `sent/<YYYY-MM>/`, where `YYYY-MM` is the first 7 characters of the `received_at` that the server returned. A value of another shape gives `sent/unknown/`. |
+| `400`, `413` | Moves to `rejected/`, with the server's reason |
+| `401`, `403`, `404`, `429`, `5xx`, another status, or no answer | Stays. The run prints a notice and stops. |
+| `invalid_scope` from the token endpoint | Every note stays. The run prints a notice and stops. |
+
+A run that sent at least one note writes `<root>/push.json` through a temporary file and a rename:
+
+```json
+{ "last_push_at_unix": 1790500000, "last_push_notes": 2 }
+```
+
+### The operator file
+
+When a `sync` run received a `sync` token, it asks `GET {base}/{whoami route}`. A name in the answer
+must match `^[a-z0-9][a-z0-9-]{0,31}$`, and `sync` writes it to `<root>/operator` as the name and one
+line feed. An answer of `"operator": null` deletes the file. Any failure, such as a `404` from a
+server older than this route, leaves the file as it is. The file is a convenience for Claude, never
+a security control.
+
 ## HTTP routes the server must serve
 
-Four routes sit under `BRAINMAKER_API_BASE`. One further route, the token endpoint, sits under
+Six routes sit under `BRAINMAKER_API_BASE`. One further route, the token endpoint, sits under
 `SWETSI_JWT_ENDPOINT`. The two hosts may differ. Serve them all over TLS: `brainmaker` refuses a
 plain-HTTP URL unless its host is this machine. `brainmaker` sends `Authorization: Bearer <token>`
 on every request under the base URL when a credential is configured, and sends the `User-Agent`
 `brainmaker/<version>`.
 
 Every route name below is the default. Each one has a key in the provisioning file, so a deployment
-can serve these five requests at any path it likes:
+can serve these seven requests at any path it likes:
 
 | Route | Key | Default |
 |---|---|---|
@@ -206,6 +280,8 @@ can serve these five requests at any path it likes:
 | Content archive | `BRAINMAKER_CONTENT_ARCHIVE_PATH` | `content/{hash}.zip` |
 | Software manifest | `BRAINMAKER_SOFTWARE_MANIFEST_PATH` | `software/brainmaker` |
 | Replacement binary | `BRAINMAKER_SOFTWARE_BINARY_PATH` | `software/brainmaker-{version}-{platform}{ext}` |
+| Note upload | `BRAINMAKER_OUTBOX_PATH` | `outbox`, then `/<note name>` |
+| Operator name | `BRAINMAKER_WHOAMI_PATH` | `whoami` |
 
 `brainmaker` substitutes `{hash}`, `{version}`, `{platform}`, and `{ext}`. `{ext}` is `.exe` on
 Windows and empty everywhere else. A route is a path under its base URL: a value holding `://`, a
@@ -224,7 +300,11 @@ Content-Type: application/x-www-form-urlencoded
 grant_type=client_credentials&scope=sync
 ```
 
-`brainmaker` names the scope in every request rather than relying on a server default.
+`brainmaker` names one scope in every request rather than relying on a server default: `sync` for
+every read, and `outbox:write` for the notes, asked for only when a note is ready. It keeps one
+token per scope for the run. An answer of `400` or `401` whose body is `{"error": "invalid_scope"}`
+means the issuer does not grant that scope to the client: the push stops with a notice, and the
+sync is not affected.
 
 ```json
 { "access_token": "…", "token_type": "Bearer", "expires_in": 600, "scope": "sync" }
@@ -236,8 +316,8 @@ grant_type=client_credentials&scope=sync
 | `token_type` | Optional. `Bearer` in any case. Any other value fails the run. |
 | `expires_in` | Optional, in seconds. It defaults to 600. The client uses at most 3600 of it, and stops using the token 30 seconds before that time ends. |
 
-The response body is read up to 64 KiB. One run gets one token and reuses it, so a server that
-issues a 10-minute token serves one token request per run.
+The response body is read up to 64 KiB. One run gets one token per scope and reuses it, so a server
+that issues a 10-minute token serves one token request per scope per run.
 
 | Status | Message the client prints |
 |---|---|
@@ -285,6 +365,15 @@ address from its own base URL, so a signed document cannot move the download to 
 
 The response body is read up to 1 MiB. Serve this route with `Cache-Control: no-store`; a cached
 response makes the client skip an update that is already published.
+
+The request carries three headers in which the client reports itself. The server may record them.
+Nothing that the client does depends on them.
+
+| Header | Value |
+|---|---|
+| `Brainmaker-Platform` | The platform key, such as `darwin-arm64` |
+| `Brainmaker-Content` | The installed hash, or `none` when `state.json` names none or `content/` is missing |
+| `Brainmaker-Outbox` | The count of notes that wait in the outbox |
 
 ### `GET {base}/{content archive route}`
 
@@ -356,6 +445,32 @@ The client reads the body up to 128 MiB, checks its SHA-256 against the signed m
 with `--version` before it swaps. The output, with surrounding white space removed, must be exactly
 `brainmaker <version>`, where `<version>` is the manifest version.
 
+### `GET {base}/{whoami route}`
+
+Returns the operator of the client that the token names, with the `sync` token.
+
+```json
+{ "client_id": "brainmaker-sync-gabriele", "operator": "gabriele", "display_name": "Gabriele" }
+```
+
+The client reads `operator` alone: a name, or `null` when the server names no operator. It reads the
+body up to 64 KiB. Serve this route with `Cache-Control: no-store`.
+
+### `POST {base}/{outbox route}/<name>`
+
+Receives one note, with an `outbox:write` token. `<name>` passed the name rule above. The body is
+the file as it is on disk, with `Content-Type: text/markdown; charset=utf-8`.
+
+| Status | The client |
+|---|---|
+| `201` | Moves the note to `sent/`. The body must carry `received_at`, ISO 8601, in the time zone of the server's report, such as `2026-09-29T18:12:40+02:00`. |
+| `200` | The same. The server already held these bytes. |
+| `400`, `413` | Moves the note to `rejected/`, with the reason from `{"error": "..."}` |
+| any other | Keeps the note, and stops the run |
+
+The client reads the answer body up to 64 KiB. It removes every control character from the reason
+before the reason reaches a file or the terminal.
+
 ### Error responses
 
 | Status | Message the client prints |
@@ -371,8 +486,8 @@ Every status message ends with the message the server itself returned, after a c
 answers `{"error": "..."}` contributes that string, so an empty deployment reads
 `the server returned HTTP 404 Not Found: no content release is published` rather than the status
 alone. A body that is not that JSON object is printed as it stands, which keeps a proxy's own page
-readable. Either way the text is collapsed onto one line and stops at 200 characters. The two
-transport rows and the size row carry no such message. A download that fails for any reason after
+readable. Either way the text is collapsed onto one line, loses every control character, and stops
+at 200 characters. The two transport rows and the size row carry no such message. A download that fails for any reason after
 its file was created removes that file.
 
 ## Provisioning file format
@@ -395,7 +510,7 @@ its file was created removes that file.
 | `SWETSI_JWT_ENDPOINT` | Base of the OAuth2 routes. The same URL rule applies. A trailing slash is accepted and stripped. |
 | `SWETSI_CLIENT_ID` | Client identifier. Printable ASCII, and no colon. |
 | `SWETSI_CLIENT_SECRET` | Client secret. Printable ASCII. |
-| The five `*_PATH` keys | Optional. Each is a route under its base URL. A value holding `://`, a `..` segment, or a space fails. A leading `/` is stripped. |
+| The seven `*_PATH` keys | Optional. Each is a route under its base URL. A value holding `://`, a `..` segment, or a space fails. A leading `/` is stripped. |
 | `SWETSI_TOKEN` | Refused. The key names the static token that earlier versions read. A file that carries it, and none of the three credential keys, fails. |
 | `SWETSI_API_BASE` | Refused. The key is now `BRAINMAKER_API_BASE`. A file that carries the old name and not the new one fails. |
 

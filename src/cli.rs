@@ -15,9 +15,12 @@ USAGE:
 COMMANDS:
     sync           Update the content when the server has a newer version
                    (default). It also reports a newer brainmaker, but it
-                   never installs one.
-    status         Print the installed hash, the latest hash, and both
-                   software versions. It changes nothing.
+                   never installs one. Then it asks the server for the
+                   operator name, and sends the notes in the outbox.
+    status         Print the installed hash, the latest hash, both software
+                   versions, the operator, and the notes in the outbox. It
+                   changes nothing.
+    push           Send the notes in the outbox now
     self-update    Replace this binary with the newest build for this platform
     link           Wire the synced content into ~/.claude, so its skills and
                    its session context load in every project, not only in the
@@ -70,20 +73,31 @@ ENVIRONMENT:
     SWETSI_CLIENT_SECRET  Client secret for the token request.
     BRAINMAKER_CONFIG     Path of the provisioning file to import.
 
-    Five more variables name the routes, and each one has a default:
+    Seven more variables name the routes, and each one has a default:
 
     SWETSI_TOKEN_PATH                  under SWETSI_JWT_ENDPOINT
     BRAINMAKER_CONTENT_LATEST_PATH     under BRAINMAKER_API_BASE
     BRAINMAKER_CONTENT_ARCHIVE_PATH    the same
     BRAINMAKER_SOFTWARE_MANIFEST_PATH  the same
     BRAINMAKER_SOFTWARE_BINARY_PATH    the same
+    BRAINMAKER_OUTBOX_PATH             the same
+    BRAINMAKER_WHOAMI_PATH             the same
 
     Each variable overrides the stored value. Supply all three credential
     variables, or none of them. None of them means no Authorization header.
 
+OUTBOX:
+    At the end of a session, Claude writes one note into
+    ~/.brainmaker/outbox/. sync sends each note that has not changed for a
+    minute, and moves it to outbox/sent/<YYYY-MM>/. A note that breaks a rule
+    moves to outbox/rejected/, beside a .reason.txt file. The name on a note
+    comes from the server, never from the note.
+
 EXIT CODES:
-    0    The content is up to date, or the update succeeded
-    1    The command failed
+    0    The content is up to date, or the update succeeded. A failure to
+         send a note is a notice, and sync still exits 0.
+    1    The command failed. push also exits 1 when a note stays in the
+         outbox because the server or the issuer did not take it.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +109,7 @@ pub enum Command {
     Unlink,
     Uninstall,
     SessionContext,
+    Push,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +267,10 @@ where
                 args.command = Command::SessionContext;
                 command_seen = true;
             }
+            "push" if !command_seen => {
+                args.command = Command::Push;
+                command_seen = true;
+            }
             other => bail!("unknown argument {other:?}; run brainmaker --help"),
         }
     }
@@ -271,7 +290,8 @@ fn check_options(args: &Args) -> Result<()> {
 
     // The commands that load settings. uninstall does not, so a settings flag
     // would do nothing there.
-    let all_but_uninstall: &[Command] = &[Sync, Status, SelfUpdate, Link, Unlink, SessionContext];
+    let all_but_uninstall: &[Command] =
+        &[Sync, Status, SelfUpdate, Link, Unlink, SessionContext, Push];
 
     let given: [(&str, bool, &[Command]); 9] = [
         ("--force", args.force, &[Sync, SelfUpdate]),
@@ -317,6 +337,7 @@ fn name_of(command: Command) -> &'static str {
         Command::Unlink => "unlink",
         Command::Uninstall => "uninstall",
         Command::SessionContext => "session-context",
+        Command::Push => "push",
     }
 }
 
@@ -385,6 +406,36 @@ mod tests {
 
         assert!(run(&["uninstall", "--yes"]).yes);
         assert!(run(&["-y", "uninstall"]).yes);
+    }
+
+    #[test]
+    fn parses_the_push_command_with_the_settings_flags() {
+        let args = run(&[
+            "push",
+            "--quiet",
+            "--dir",
+            "/tmp/root",
+            "--url",
+            "https://x/y",
+        ]);
+        assert_eq!(args.command, Command::Push);
+        assert!(args.quiet);
+        assert_eq!(args.dir, Some(PathBuf::from("/tmp/root")));
+    }
+
+    #[test]
+    fn refuses_a_flag_that_push_does_not_use() {
+        for flag in ["--force", "--check", "--no-update-check", "--yes"] {
+            let error = parse(["push", flag]).unwrap_err().to_string();
+            assert!(error.contains("has no effect with push"), "{flag}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_help_names_the_push_command_and_the_new_routes() {
+        assert!(HELP.contains("\n    push "), "the command list names push");
+        assert!(HELP.contains("BRAINMAKER_OUTBOX_PATH"));
+        assert!(HELP.contains("BRAINMAKER_WHOAMI_PATH"));
     }
 
     #[test]
