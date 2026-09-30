@@ -9,11 +9,16 @@
 //!    would name a program that is gone, and would then fail on every run.
 //! 2. What brainmaker writes under the root: the content, the program copy
 //!    that the hook runs, the state file, the sealed settings, the agent's
-//!    log, the two lock files, and any temporary file that a stopped run left
-//!    behind.
+//!    log, the operator file, the push record, the four lock files, and any
+//!    temporary file that a stopped run left behind.
 //! 3. The root itself, once nothing else is left in it.
 //!
 //! # What it leaves
+//!
+//! The outbox, with every note in it, sent or not: the notes are the
+//! operator's work, and a note that was never sent exists nowhere else. The
+//! run says how many were never sent. The root then stays too, because the
+//! outbox is in it.
 //!
 //! Everything it did not write. The root goes entry by entry, never as a
 //! whole, so a file of yours inside it survives, and so does the directory
@@ -46,6 +51,7 @@ use anyhow::{Context, Result};
 
 use crate::config::Layout;
 use crate::link;
+use crate::outbox;
 use crate::schedule::{self, Agents};
 use crate::secretstore;
 use crate::state;
@@ -85,10 +91,10 @@ This removes brainmaker from this machine:
   - under {claude}: the skill links, the SessionStart hook, and the
     CLAUDE.md block that link wrote
 {agent}  - under {root}: the content, the sealed settings, the state file, the
-    agent log, and the program copy that the hook runs
+    agent log, the operator file, and the program copy that the hook runs
 
-Nothing else in either directory changes. Changes that you made in the
-content are lost. The sealed settings hold the client credentials, so a new
+Nothing else in either directory changes. The outbox and the notes in it
+stay. Changes that you made in the content are lost. The sealed settings hold the client credentials, so a new
 install needs a brainmaker.env file from your administrator.
 
 Remove brainmaker? [y/N] ",
@@ -186,6 +192,8 @@ fn remove_root(
         .context("the sealed store has no parent directory")?
         .to_path_buf();
 
+    let operator = layout.operator_file();
+    let push_state = layout.push_state_file();
     let mut paths = vec![
         layout.content_dir(),
         layout.staging_dir(),
@@ -193,7 +201,13 @@ fn remove_root(
         layout.download_file(),
         layout.lock_file(),
         layout.update_lock_file(),
+        layout.outbox_lock_file(),
+        layout.admin_lock_file(),
         schedule::log_path(root),
+        outbox::temporary_path(&operator),
+        operator,
+        outbox::temporary_path(&push_state),
+        push_state,
     ];
     paths.extend(program_files(bin, &installed)?);
     paths.extend([
@@ -220,6 +234,18 @@ fn remove_root(
             }
             Err(error) => return Err(error),
         }
+    }
+
+    // The outbox stays, with every note in it.
+    let unsent = outbox::counts_in(&layout.outbox_dir(), &layout.rejected_dir());
+    if unsent.waiting + unsent.rejected > 0 {
+        log(&format!(
+            "Left {} note(s) that were never sent in {}: {} waiting, {} rejected.",
+            unsent.waiting + unsent.rejected,
+            layout.outbox_dir().display(),
+            unsent.waiting,
+            unsent.rejected
+        ));
     }
 
     remove_if_empty(bin)?;
@@ -554,6 +580,12 @@ mod tests {
         // the names that docs/API.md gives.
         write(&root.join(".lock"), b"");
         write(&root.join(".update.lock"), b"");
+        write(&root.join(".outbox.lock"), b"");
+        write(&root.join(".admin.lock"), b"");
+        write(&root.join("operator"), b"gabriele\n");
+        write(&root.join("operator.tmp"), b"gabriele\n");
+        write(&root.join("push.json"), b"{}\n");
+        write(&root.join("push.json.tmp"), b"{}\n");
         write(&state::temporary_path(&layout.state_file()), b"{}\n");
         write(&secretstore::temporary_path(&layout.store_path()), b"x\n");
         // What link and self-update stage beside the program copy.
@@ -572,6 +604,43 @@ mod tests {
         assert!(!root.join(".lock").exists());
         assert!(!root.join(".update.lock").exists());
         assert!(!root.exists());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn keeps_the_outbox_and_counts_the_notes_never_sent() {
+        let base = temp_dir("outbox");
+        let root = base.join("root");
+        let layout = installed(&root);
+        write(&layout.outbox_dir().join("2026-09-30-a.md"), b"waiting\n");
+        write(&layout.rejected_dir().join("2026-09-29-b.md"), b"refused\n");
+        write(
+            &layout.rejected_dir().join("2026-09-29-b.md.reason.txt"),
+            b"why\n",
+        );
+        let sent = layout.sent_dir().join("2026-09").join("2026-09-28-c.md");
+        write(&sent, b"sent\n");
+        write(&layout.operator_file(), b"gabriele\n");
+        write(&layout.push_state_file(), b"{}\n");
+
+        let lines = RefCell::new(Vec::new());
+        let log = |line: &str| lines.borrow_mut().push(line.to_string());
+        let report = uninstall(&layout, &base.join("claude"), None, &log).unwrap();
+
+        assert!(!report.root_removed);
+        assert_eq!(report.left, vec!["outbox".to_string()]);
+        assert!(layout.outbox_dir().join("2026-09-30-a.md").is_file());
+        assert!(layout.rejected_dir().join("2026-09-29-b.md").is_file());
+        assert!(sent.is_file());
+        assert!(!layout.operator_file().exists());
+        assert!(!layout.push_state_file().exists());
+        assert!(
+            lines.borrow().iter().any(|line| line
+                .starts_with("Left 2 note(s) that were never sent")
+                && line.ends_with("1 waiting, 1 rejected.")),
+            "{:?}",
+            lines.borrow()
+        );
         fs::remove_dir_all(&base).ok();
     }
 

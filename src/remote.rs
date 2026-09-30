@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! HTTP access to the content API and to the software API.
+//! HTTP access to the content API and to the software API, and the two
+//! requests of the outbox: one note sent, and the operator asked for.
+//!
+//! Text that the server sends can reach the terminal, a file under the root,
+//! or Claude's context. [`printable`] removes its control characters first.
 
 use std::fs::File;
 use std::io::{self, BufWriter};
@@ -23,6 +27,9 @@ const MAX_ERROR_BODY: u64 = 4 * 1024;
 
 /// Longest server message this client prints, in characters.
 const MAX_MESSAGE_CHARS: usize = 200;
+
+/// Largest answer to a note or to `whoami` that this client reads.
+const MAX_ANSWER_BYTES: u64 = 64 * 1024;
 
 /// Body that both APIs return on a failure.
 ///
@@ -76,9 +83,13 @@ pub struct ContentRelease {
 /// The check runs over the served bytes before anything parses them, so no
 /// JSON canonicalisation rule takes part in the security argument. A release
 /// that no compiled-in key accepts stops here, and nothing downloads.
-pub fn latest_release(config: &Config) -> Result<ContentRelease> {
+///
+/// `reported` holds the headers in which the client reports itself: its
+/// platform, its installed content, and the notes waiting. The server records
+/// them as reported, and nothing it serves depends on them.
+pub fn latest_release(config: &Config, reported: &[(&str, String)]) -> Result<ContentRelease> {
     let url = config.latest_url();
-    let body = fetch_text(config, &url, crate::config::MAX_MANIFEST_BYTES)?;
+    let body = fetch_text_with(config, &url, crate::config::MAX_MANIFEST_BYTES, reported)?;
 
     let latest: Latest = serde_json::from_str(&body)
         .with_context(|| format!("{url} did not return a JSON object"))?;
@@ -122,14 +133,27 @@ pub fn download_archive(config: &Config, hash: &str, dest: &Path) -> Result<u64>
     download(config, &url, dest, MAX_ARCHIVE_BYTES)
 }
 
-/// Reads a URL as text.
+/// Reads a URL as text, with a `sync` token.
 ///
 /// The response stops at `limit` bytes.
 pub fn fetch_text(config: &Config, url: &str, limit: u64) -> Result<String> {
+    fetch_text_with(config, url, limit, &[])
+}
+
+/// Reads a URL as text, with a `sync` token and the extra `headers`.
+fn fetch_text_with(
+    config: &Config,
+    url: &str,
+    limit: u64,
+    headers: &[(&str, String)],
+) -> Result<String> {
     let agent = build_agent(TEXT_TIMEOUT);
     let mut request = agent.get(url);
-    if let Some(token) = auth::bearer(config)? {
+    if let Some(token) = auth::bearer(config, auth::SCOPE_SYNC)? {
         request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    for (name, value) in headers {
+        request = request.header(*name, value);
     }
 
     let mut response = request
@@ -155,7 +179,7 @@ pub fn fetch_text(config: &Config, url: &str, limit: u64) -> Result<String> {
 pub fn download(config: &Config, url: &str, dest: &Path, limit: u64) -> Result<u64> {
     let agent = build_agent(DOWNLOAD_TIMEOUT);
     let mut request = agent.get(url);
-    if let Some(token) = auth::bearer(config)? {
+    if let Some(token) = auth::bearer(config, auth::SCOPE_SYNC)? {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
 
@@ -215,6 +239,76 @@ pub fn download(config: &Config, url: &str, dest: &Path, limit: u64) -> Result<u
     Ok(written)
 }
 
+/// What the server answered to one note: the status, and the body as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    pub status: u16,
+    pub body: String,
+}
+
+/// Sends one note, and returns the server's answer, whatever its status.
+///
+/// `token` is an `outbox:write` token, or `None` when no credential is
+/// configured. The caller checks `name` first: it becomes a path segment. A
+/// failure to reach the server is an error; every status is an answer.
+pub fn post_note(config: &Config, name: &str, note: &[u8], token: Option<&str>) -> Result<Answer> {
+    let url = config.outbox_url(name);
+    let agent = build_agent(TEXT_TIMEOUT);
+    let mut request = agent
+        .post(&url)
+        .header("Content-Type", "text/markdown; charset=utf-8")
+        .header("Accept", "application/json");
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let mut response = request
+        .send(note)
+        .map_err(describe)
+        .with_context(|| format!("cannot send the note to {url}"))?;
+    let status = response.status().as_u16();
+    // A body that cannot be read leaves the status, which decides what
+    // happens to the note.
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_ANSWER_BYTES)
+        .read_to_string()
+        .unwrap_or_default();
+    Ok(Answer { status, body })
+}
+
+/// Body of `GET {base}/whoami`. The server sends the client ID and the display
+/// name too, and this client reads neither.
+#[derive(Debug, Deserialize)]
+struct Whoami {
+    operator: Option<String>,
+}
+
+/// Asks the server which operator this client belongs to, with a `sync`
+/// token. `None` means that the server names none: nobody registered the
+/// client, or it is retired.
+pub fn whoami(config: &Config) -> Result<Option<String>> {
+    let url = config.whoami_url();
+    let body = fetch_text(config, &url, MAX_ANSWER_BYTES)?;
+    let parsed: Whoami = serde_json::from_str(&body)
+        .with_context(|| format!("{url} did not return the expected JSON object"))?;
+    Ok(parsed.operator)
+}
+
+/// Removes every control character from text that the server sent, and every
+/// character that changes the direction of the text around it.
+///
+/// That text can reach the terminal, a file, or Claude's context. A control
+/// character there could move the cursor, rewrite a line, or hide the rest.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+        .collect()
+}
+
 /// True when `error` is the HTTP client's report that the body passed the
 /// limit it was given.
 fn passed_the_limit(error: &io::Error) -> bool {
@@ -257,7 +351,7 @@ fn check_status(response: &mut ureq::http::Response<ureq::Body>) -> Result<()> {
             "the server rejected the request with HTTP {code}; check that {} is configured, and \
              that the client may read this route with the scope {}",
             crate::config::CLIENT_ID_ENV,
-            auth::SCOPE
+            auth::SCOPE_SYNC
         ),
         404 => "the server returned HTTP 404 Not Found".to_string(),
         _ => format!("the server returned HTTP {code}"),
@@ -284,8 +378,8 @@ fn server_message(response: &mut ureq::http::Response<ureq::Body>) -> Option<Str
 ///
 /// A body that parses as [`ErrorBody`] yields its fields. Anything else is
 /// returned as it stands, so a proxy's plain-text or HTML page still reaches
-/// the operator. The result holds no newline and stops at
-/// [`MAX_MESSAGE_CHARS`], because it is appended to a one-line error.
+/// the operator. The result holds no newline and no control character, and it
+/// stops at [`MAX_MESSAGE_CHARS`], because it is appended to a one-line error.
 pub fn message_from_body(body: &str) -> Option<String> {
     let text = match serde_json::from_str::<ErrorBody>(body) {
         Ok(parsed) => match parsed.error_description {
@@ -295,7 +389,9 @@ pub fn message_from_body(body: &str) -> Option<String> {
         Err(_) => body.to_string(),
     };
 
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The whitespace goes first, so a line break becomes a space rather than
+    // nothing, and then every other control character goes.
+    let collapsed = printable(&text.split_whitespace().collect::<Vec<_>>().join(" "));
     if collapsed.is_empty() {
         return None;
     }
@@ -397,6 +493,14 @@ mod tests {
     }
 
     #[test]
+    fn a_message_holds_no_control_character() {
+        let body = "{\"error\": \"bad \\u001b[2Jnote\\u202e txt\"}";
+        assert_eq!(message_from_body(body).unwrap(), "bad [2Jnote txt");
+        assert_eq!(printable("a\u{7}b\u{2066}c\u{85}d"), "abcd");
+        assert_eq!(printable("città — ok"), "città — ok");
+    }
+
+    #[test]
     fn stops_a_long_body_at_the_limit() {
         let body = "x".repeat(MAX_MESSAGE_CHARS * 2);
         let message = message_from_body(&body).unwrap();
@@ -424,7 +528,7 @@ mod tests {
         let server = serving_latest(signer.envelope(&payload));
         let dir = temp_dir("remote-signed");
 
-        let read = latest_release(&Config::for_test(&dir, &server.base())).unwrap();
+        let read = latest_release(&Config::for_test(&dir, &server.base()), &[]).unwrap();
 
         assert_eq!(read.hash, "25c60772");
         assert_eq!(read.sha256, "a".repeat(64));
@@ -442,7 +546,7 @@ mod tests {
         let server = serving_latest(stranger.envelope(&payload));
         let dir = temp_dir("remote-stranger");
 
-        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+        let error = latest_release(&Config::for_test(&dir, &server.base()), &[]).unwrap_err();
 
         let text = format!("{error:#}");
         assert!(
@@ -472,7 +576,7 @@ mod tests {
         let server = serving_latest(forged.to_string());
         let dir = temp_dir("remote-altered");
 
-        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+        let error = latest_release(&Config::for_test(&dir, &server.base()), &[]).unwrap_err();
 
         let text = format!("{error:#}");
         assert!(
@@ -488,7 +592,7 @@ mod tests {
         let server = serving_latest(r#"{"hash":"25c60772"}"#);
         let dir = temp_dir("remote-unsigned");
 
-        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+        let error = latest_release(&Config::for_test(&dir, &server.base()), &[]).unwrap_err();
 
         let text = format!("{error:#}");
         assert!(
@@ -507,7 +611,7 @@ mod tests {
         let server = serving_latest(signer.envelope(&payload));
         let dir = temp_dir("remote-too-large");
 
-        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+        let error = latest_release(&Config::for_test(&dir, &server.base()), &[]).unwrap_err();
 
         let text = format!("{error:#}");
         assert!(text.contains("past the limit"), "got {text}");
@@ -526,7 +630,7 @@ mod tests {
         }]);
         let dir = temp_dir("remote-404");
 
-        let error = latest_release(&Config::for_test(&dir, &server.base())).unwrap_err();
+        let error = latest_release(&Config::for_test(&dir, &server.base()), &[]).unwrap_err();
 
         let text = format!("{error:#}");
         assert!(text.contains("HTTP 404"), "got {text}");

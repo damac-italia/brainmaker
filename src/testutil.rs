@@ -6,6 +6,10 @@
 //! under test trusts, a small HTTP server on the loopback address, and a builder
 //! for zip archives. No test that uses it needs the network, a fixed port, or a
 //! fixed path.
+//!
+//! The server records each request with its headers and its body. A route can
+//! send response headers, give a different reply to each later request, and,
+//! for the token route, answer only the scope that the form asks for.
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -19,12 +23,15 @@ use std::time::Duration;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
-/// What the server records about each request: the method, the path, and the
-/// value of the `Authorization` header, or an empty string when it has none.
+/// The method, the path, and the value of the `Authorization` header, or an
+/// empty string when it has none. [`Server::requests`] returns this short form.
 type Recorded = Vec<(String, String, String)>;
 
 /// The longest request head that the server reads.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
+
+/// The longest request body that the server reads.
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// How long the server waits for a client to send its request head.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,6 +67,11 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// The SHA-256 of `bytes`, as 64 lower-case hexadecimal characters.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
 /// An Ed25519 key pair that a test signs with.
@@ -129,12 +141,54 @@ pub fn closed_port_base() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// One request as the server received it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Received {
+    pub method: String,
+    pub path: String,
+    /// Every header, in the order it arrived, with its name in lower case.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Received {
+    /// The value of the header `name`, which the caller writes in lower case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The value of `key` in a form body, decoded.
+    pub fn form(&self, key: &str) -> Option<String> {
+        form_value(&self.body, key)
+    }
+}
+
+/// One reply: the status, the body, and the headers besides
+/// `Content-Length` and `Connection`.
+#[derive(Debug, Clone)]
+pub struct Reply {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub headers: Vec<(String, String)>,
+}
+
 /// One answer that a [`Server`] gives: the request it matches, and the reply.
 pub struct Route {
     pub method: &'static str,
     pub path: String,
     pub status: u16,
     pub body: Vec<u8>,
+    /// Headers of the reply, besides `Content-Length` and `Connection`.
+    pub headers: Vec<(String, String)>,
+    /// The replies to the second request and to the ones after it, in order.
+    /// The last one repeats. Empty means the first reply repeats.
+    pub then: Vec<Reply>,
+    /// When set, the route matches only a form body that asks for this
+    /// scope, as a token request does.
+    pub scope: Option<String>,
 }
 
 impl Route {
@@ -145,6 +199,9 @@ impl Route {
             path: path.to_string(),
             status: 200,
             body: body.into(),
+            headers: Vec::new(),
+            then: Vec::new(),
+            scope: None,
         }
     }
 
@@ -153,6 +210,61 @@ impl Route {
         Self {
             method: "POST",
             ..Self::get(path, body)
+        }
+    }
+
+    /// The token route `POST /oauth2/token`, for a request that asks for
+    /// `scope`. It answers 200 with `body`.
+    pub fn token(scope: &str, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            scope: Some(scope.to_string()),
+            ..Self::post("/oauth2/token", body)
+        }
+    }
+
+    /// The same route with the status `status`.
+    pub fn status(self, status: u16) -> Self {
+        Self { status, ..self }
+    }
+
+    /// The same route, with one more header in its first reply.
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    /// The same route, with one more reply for a later request.
+    pub fn then(mut self, status: u16, body: impl Into<Vec<u8>>) -> Self {
+        self.then.push(Reply {
+            status,
+            body: body.into(),
+            headers: Vec::new(),
+        });
+        self
+    }
+
+    /// True when the route answers `request`.
+    fn matches(&self, request: &Received) -> bool {
+        self.method == request.method
+            && self.path == request.path
+            && self
+                .scope
+                .as_deref()
+                .is_none_or(|scope| request.form("scope").as_deref() == Some(scope))
+    }
+
+    /// The reply to the request that is number `served` for this route,
+    /// counting from 0.
+    fn reply(&self, served: usize) -> Reply {
+        match served.checked_sub(1) {
+            Some(index) if !self.then.is_empty() => {
+                self.then[index.min(self.then.len() - 1)].clone()
+            }
+            _ => Reply {
+                status: self.status,
+                body: self.body.clone(),
+                headers: self.headers.clone(),
+            },
         }
     }
 }
@@ -164,7 +276,7 @@ impl Route {
 /// server records every request. Dropping the value stops the thread.
 pub struct Server {
     port: u16,
-    requests: Arc<Mutex<Recorded>>,
+    requests: Arc<Mutex<Vec<Received>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -176,7 +288,7 @@ impl Server {
     pub fn start(routes: Vec<Route>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port is free");
         let port = listener.local_addr().unwrap().port();
-        let requests = Arc::new(Mutex::new(Recorded::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread = {
@@ -198,8 +310,20 @@ impl Server {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// Every request that the server has answered so far, oldest first.
+    /// Every request that the server has answered so far, oldest first, as
+    /// the method, the path, and the `Authorization` header.
     pub fn requests(&self) -> Recorded {
+        self.received()
+            .into_iter()
+            .map(|request| {
+                let authorization = request.header("authorization").unwrap_or("").to_string();
+                (request.method, request.path, authorization)
+            })
+            .collect()
+    }
+
+    /// Every request that the server has answered so far, oldest first, whole.
+    pub fn received(&self) -> Vec<Received> {
         self.requests.lock().unwrap().clone()
     }
 }
@@ -217,59 +341,65 @@ impl Drop for Server {
 }
 
 /// Accepts connections and answers each one, until `stop` is set.
-fn serve(listener: TcpListener, routes: &[Route], requests: &Mutex<Recorded>, stop: &AtomicBool) {
+fn serve(
+    listener: TcpListener,
+    routes: &[Route],
+    requests: &Mutex<Vec<Received>>,
+    stop: &AtomicBool,
+) {
+    // How many requests each route has answered, for its list of replies.
+    let mut served = vec![0usize; routes.len()];
     loop {
         let accepted = listener.accept();
         if stop.load(Ordering::SeqCst) {
             break;
         }
         if let Ok((stream, _)) = accepted {
-            answer(stream, routes, requests);
+            answer(stream, routes, &mut served, requests);
         }
     }
 }
 
 /// Reads one request from `stream`, records it, and writes the reply.
-fn answer(mut stream: TcpStream, routes: &[Route], requests: &Mutex<Recorded>) {
+fn answer(
+    mut stream: TcpStream,
+    routes: &[Route],
+    served: &mut [usize],
+    requests: &Mutex<Vec<Received>>,
+) {
     // A client that connects and says nothing must not hold the server.
     let _ = stream.set_read_timeout(Some(HEAD_TIMEOUT));
 
-    let Some(head) = read_head(&mut stream) else {
+    let Some(request) = read_request(&mut stream) else {
         return;
     };
+    requests.lock().unwrap().push(request.clone());
 
-    // The request needs its head only. A body, such as the form of a token
-    // request, is never read as part of the request.
-    let mut lines = head.split("\r\n");
-    let mut request_line = lines.next().unwrap_or("").split_whitespace();
-    let method = request_line.next().unwrap_or("").to_string();
-    let path = request_line.next().unwrap_or("").to_string();
-    let authorization = lines
-        .take_while(|line| !line.is_empty())
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
-        .map(|(_, value)| value.trim().to_string())
-        .unwrap_or_default();
-
-    requests
-        .lock()
-        .unwrap()
-        .push((method.clone(), path.clone(), authorization));
-
-    let (status, body) = match routes
-        .iter()
-        .find(|route| route.method == method && route.path == path)
-    {
-        Some(route) => (route.status, route.body.clone()),
-        None => (404, br#"{"error": "no such route"}"#.to_vec()),
+    let reply = match routes.iter().position(|route| route.matches(&request)) {
+        Some(index) => {
+            let reply = routes[index].reply(served[index]);
+            served[index] += 1;
+            reply
+        }
+        None => Reply {
+            status: 404,
+            body: br#"{"error": "no such route"}"#.to_vec(),
+            headers: Vec::new(),
+        },
     };
+    let status = reply.status;
     let reason = if status == 200 { "OK" } else { "Error" };
-    let mut reply = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    reply.extend_from_slice(&body);
+    let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
+    for (name, value) in &reply.headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        reply.body.len()
+    ));
+    let mut reply_bytes = head.into_bytes();
+    reply_bytes.extend_from_slice(&reply.body);
+    let reply = reply_bytes;
 
     let _ = stream.write_all(&reply);
     let _ = stream.flush();
@@ -284,24 +414,92 @@ fn answer(mut stream: TcpStream, routes: &[Route], requests: &Mutex<Recorded>) {
     while matches!(stream.read(&mut sink), Ok(read) if read > 0) {}
 }
 
-/// Reads from `stream` until the blank line that ends a request head.
+/// Reads one request from `stream`: the head, then as many body bytes as
+/// `Content-Length` names.
 ///
-/// Returns the bytes read, which can run past the blank line into a body.
 /// Returns `None` when the client closes, or stops sending, before the head
 /// ends.
-fn read_head(stream: &mut TcpStream) -> Option<String> {
-    let mut head = Vec::new();
+fn read_request(stream: &mut TcpStream) -> Option<Received> {
+    let mut bytes = Vec::new();
     let mut chunk = [0u8; 1024];
-    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-        if head.len() > MAX_HEAD_BYTES {
+    let end = loop {
+        if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end;
+        }
+        if bytes.len() > MAX_HEAD_BYTES {
             return None;
         }
         match stream.read(&mut chunk) {
             Ok(0) | Err(_) => return None,
-            Ok(read) => head.extend_from_slice(&chunk[..read]),
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+        }
+    };
+
+    let head = String::from_utf8_lossy(&bytes[..end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next().unwrap_or("").split_whitespace();
+    let method = request_line.next().unwrap_or("").to_string();
+    let path = request_line.next().unwrap_or("").to_string();
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+
+    let length = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_BODY_BYTES);
+    let mut body = bytes[end + 4..].to_vec();
+    while body.len() < length {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
         }
     }
-    Some(String::from_utf8_lossy(&head).into_owned())
+    body.truncate(length);
+
+    Some(Received {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+/// The value of `key` in a form body, with `+` and `%XX` decoded.
+fn form_value(body: &[u8], key: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    text.split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| decode(name) == key)
+        .map(|(_, value)| decode(value))
+}
+
+/// Decodes one form field.
+fn decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => out.push(b' '),
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        index += 2;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            other => out.push(other),
+        }
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -325,6 +523,95 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_server_records_headers_and_the_body_and_sends_headers() {
+        let server = Server::start(vec![
+            Route::post("/notes/a", r#"{"ok":true}"#)
+                .status(201)
+                .header("Retry-After", "7"),
+        ]);
+
+        let agent = crate::remote::build_agent(crate::remote::TEXT_TIMEOUT);
+        let response = agent
+            .post(&format!("{}/notes/a", server.base()))
+            .header("X-Test", "one")
+            .send(&b"the body"[..])
+            .unwrap();
+
+        assert_eq!(response.status().as_u16(), 201);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("7")
+        );
+        let received = server.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].header("x-test"), Some("one"));
+        assert_eq!(received[0].body, b"the body");
+    }
+
+    #[test]
+    fn a_route_gives_its_replies_in_order_and_repeats_the_last() {
+        let server = Server::start(vec![
+            Route::get("/x", "first")
+                .then(429, "second")
+                .then(500, "third"),
+        ]);
+        let dir = temp_dir("testutil-sequence");
+        let config = Config::for_test(&dir, &server.base());
+        let url = format!("{}/x", server.base());
+
+        assert_eq!(
+            crate::remote::fetch_text(&config, &url, 1024).unwrap(),
+            "first"
+        );
+        for expected in ["HTTP 429", "HTTP 500", "HTTP 500"] {
+            let error = crate::remote::fetch_text(&config, &url, 1024).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "got {error:#}");
+        }
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_token_route_answers_only_the_scope_it_names() {
+        let server = Server::start(vec![
+            Route::token("sync", r#"{"access_token":"s"}"#),
+            Route::token("outbox:write", r#"{"error":"invalid_scope"}"#).status(400),
+        ]);
+        let agent = crate::remote::build_agent(crate::remote::TEXT_TIMEOUT);
+        let url = format!("{}/oauth2/token", server.base());
+        let ask = |scope: &str| {
+            agent
+                .post(&url)
+                .send_form([("grant_type", "client_credentials"), ("scope", scope)])
+                .unwrap()
+                .status()
+                .as_u16()
+        };
+
+        assert_eq!(ask("sync"), 200);
+        assert_eq!(ask("outbox:write"), 400);
+        assert_eq!(ask("publish"), 404);
+        assert_eq!(
+            server.received()[1].form("scope").as_deref(),
+            Some("outbox:write")
+        );
+    }
+
+    #[test]
+    fn a_form_field_decodes_its_escapes() {
+        assert_eq!(
+            form_value(b"a=1&scope=outbox%3Awrite+now", "scope").as_deref(),
+            Some("outbox:write now")
+        );
+        assert_eq!(form_value(b"a=1", "scope"), None);
+        assert_eq!(decode("100%"), "100%");
+        assert_eq!(decode("%zz"), "%zz");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 # Architecture
 
 `brainmaker` is one Rust binary. It has no background process, no plugin
-system, and no local database. One invocation loads settings, gets one access token, makes at most
-three further HTTP requests, writes the filesystem, and exits. `uninstall` is the exception: it loads
-no settings and opens no socket.
+system, and no local database. One invocation loads settings, gets one access token for each scope
+that it needs, makes a bounded number of further HTTP requests, writes the filesystem, and exits.
+A `sync` makes at most three requests for the content and the software, one for the operator name,
+and one for each note that is ready in the outbox. `uninstall` is the exception: it loads no
+settings and opens no socket.
 
 A second binary, `brainmaker-sign`, lives in [`tools/sign.rs`](../tools/sign.rs). It builds only
 under the `sign` feature and never ships.
@@ -15,25 +17,28 @@ under the `sign` feature and never ships.
 | [`src/main.rs`](../src/main.rs) | Entry point, command dispatch, all `stdout` output | every module |
 | [`src/cli.rs`](../src/cli.rs) | Argument parsing, the check that each option applies to the command, and the help text | none |
 | [`src/config.rs`](../src/config.rs) | Settings load, the import check, the root and every path under it (`Layout`), route and URL building, credential checks, size limits, hash validation | `auth`, `provision`, `secretstore`, `url` |
-| [`src/auth.rs`](../src/auth.rs) | The OAuth2 client-credentials exchange, the bound on the token lifetime, and the access token cache | `config`, `remote`, `ureq` |
+| [`src/auth.rs`](../src/auth.rs) | The OAuth2 client-credentials exchange, the bound on the token lifetime, the access token cache with one token per scope, and the `invalid_scope` error | `config`, `remote`, `ureq` |
 | [`src/url.rs`](../src/url.rs) | URL origin parsing, and the rule that a base URL must use TLS | none |
 | [`src/provision.rs`](../src/provision.rs) | Provisioning file discovery, parsing, validation | `url` |
 | [`src/secretstore.rs`](../src/secretstore.rs) | Seal and open the stored settings, report what binds them to the machine, restrict file modes | `ring` |
-| [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, and the signed content release | `auth`, `config`, `digest`, `signature`, `ureq` |
-| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `digest`, `lock`, `remote`, `state` |
+| [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, the signed content release, the note upload, `whoami`, and the removal of control characters from server text | `auth`, `config`, `digest`, `signature`, `ureq` |
+| [`src/outbox.rs`](../src/outbox.rs) | The note rules, the checks of the upload path, push, the moves to `sent/` and `rejected/`, the counts, the report headers, and the operator file | `auth`, `config`, `lock`, `remote`, `selfupdate`, `state` |
+| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `digest`, `lock`, `outbox`, `remote`, `state` |
 | [`src/archive.rs`](../src/archive.rs) | Zip extraction and its safety checks | `config`, `zip` |
 | [`src/state.rs`](../src/state.rs) | `state.json` read and atomic write | `serde_json` |
 | [`src/lock.rs`](../src/lock.rs) | The install lock and the update lock, which keep two runs out of one root | none |
 | [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `link`, `lock`, `remote`, `signature`, `version` |
 | [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `ring` |
 | [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `ring` |
-| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the session context, the shell quoting of the hook command, and the binary copy under the root | `config`, `schedule`, `serde_json` |
+| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the outbox directory, the session context, the shell quoting of the hook command, and the binary copy under the root | `config`, `outbox`, `schedule`, `serde_json` |
 | [`src/schedule.rs`](../src/schedule.rs) | Write, load, unload, and remove the hourly macOS LaunchAgent | none |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
-| [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root | `config`, `link`, `schedule`, `secretstore`, `state` |
+| [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root. The outbox stays. | `config`, `link`, `outbox`, `schedule`, `secretstore`, `state` |
 
 [`src/testutil.rs`](../src/testutil.rs) is built for tests alone; it holds a loopback HTTP server, a
-signer whose key a test trusts, and a zip builder.
+signer whose key a test trusts, and a zip builder. The server records the headers and the body of
+each request, sends response headers, gives a route a list of replies, and answers the token route
+by the scope that the form asks for.
 
 ## Module graph
 
@@ -46,6 +51,7 @@ graph LR
     main --> link
     main --> state
     main --> uninstall
+    main --> outbox
     config --> auth
     config --> provision
     config --> secretstore
@@ -56,6 +62,11 @@ graph LR
     sync --> lock
     sync --> remote
     sync --> state
+    sync --> outbox
+    outbox --> auth
+    outbox --> lock
+    outbox --> remote
+    outbox --> state
     selfupdate --> remote
     selfupdate --> signature
     selfupdate --> version
@@ -64,19 +75,23 @@ graph LR
     remote --> config
     remote --> auth
     link --> config
+    link --> outbox
     uninstall --> config
     uninstall --> link
+    uninstall --> outbox
     uninstall --> secretstore
     uninstall --> state
 ```
 
 ## Boundaries
 
-Four boundaries separate the trusted code from data it does not control.
+Six boundaries separate the trusted code from data it does not control.
 
 | Boundary | Crossed by | Enforced in |
 |---|---|---|
 | Network to disk | The content hash, the zip archive, the software manifest, the replacement binary | `signature::verify`, `config::validate_hash`, `archive::extract`, `version::validate`, `Build::checksum` |
+| Network to disk | The operator name, and the month and the reason in the answer to a note | `outbox::update_operator`, which writes only a name that matches the operator rule; `received_month`, which gives `unknown` for any other shape; `remote::printable` |
+| Disk to network | The notes in the outbox | `outbox::check` and `read_capped`: a regular file and no symbolic link, the name rule, the 64 KiB cap, UTF-8, the frontmatter rules, and 60 seconds with no change |
 | Network to a header | The access token | `auth::check_token`, which refuses a token that holds a control character |
 | Provisioning file to store | The endpoints and the client credentials | `provision::parse`, `Settings::validate`, `provision::check_credential_set`, `url::check_base_url`, `Credentials::new` |
 | Store to process | The sealed settings | `secretstore::open`, which authenticates the file before it returns bytes |
@@ -99,7 +114,14 @@ the injected `log` closure.
 ├── confidential/       0700
 │   └── config.enc      0600, the sealed endpoints, routes, and credentials
 ├── content/            the extracted content
+├── operator            the operator name that whoami gave, and one line feed
+├── outbox/             0700, where Claude writes the end-of-session notes
+│   ├── rejected/       each note that broke a rule, beside <name>.reason.txt
+│   └── sent/<YYYY-MM>/ each note that the server holds, by the month it received it
+├── push.json           {"last_push_at_unix": ..., "last_push_notes": ...}
+├── .admin.lock         the lock that an admin command holds
 ├── .lock               the install lock that sync holds
+├── .outbox.lock        the push lock that sync and push hold
 ├── .update.lock        the update lock that self-update holds
 └── state.json          {"hash": "...", "updated_at_unix": ..., "sequence": ...}
 ```
@@ -113,6 +135,10 @@ works, and removes all three before it exits, on success and on failure alike. `
 replaced on every update, so keep your own files elsewhere. `sync` holds an exclusive lock on
 `.lock` while it installs, and `self-update` holds one on `.update.lock` while it replaces the
 program. Both files stay in the root between runs, and `uninstall` removes them.
+
+`operator` and `push.json` are written through a temporary file, `operator.tmp` and `push.json.tmp`,
+and a rename. `push.json` is the only file that push writes besides the notes it moves: push never
+writes `state.json`, whose only writer is `sync` under `.lock`.
 
 `self-update` writes `.brainmaker-probe-<pid>`, `.brainmaker-update-<pid>`, and `.brainmaker-old`
 beside the binary, and removes them before it exits. On Windows the last two carry the `.exe`
@@ -130,6 +156,16 @@ lock. It leaves every other file there as it is.
 
 A missing or corrupt file reads as `None`, which the caller treats as "not installed". That is not
 an error: the reinstall repairs the state.
+
+### `push.json`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `last_push_at_unix` | integer | Seconds since the Unix epoch at the end of the last push that sent a note |
+| `last_push_notes` | integer | How many notes that push sent |
+
+A missing or corrupt file reads as no push. `status` prints the age of the push on its `pushed`
+line.
 
 ### `config.enc`
 
@@ -149,7 +185,7 @@ an error: the reinstall repairs the state.
 | `Stored` | The sealed store held the settings |
 | `Environment` | The environment supplied the base URL, and no store was needed |
 
-The routes live in the same store, and the environment overrides one route at a time.
+The seven routes live in the same store, and the environment overrides one route at a time.
 
 ## Decisions and tradeoffs
 
@@ -210,15 +246,65 @@ The client takes the lifetime from `expires_in`, and cuts it to one hour. That v
 the network and is added to a clock reading, and the release profile sets `panic = "abort"`, so an
 unbounded sum could stop the process. A sum that the clock still cannot hold caches nothing.
 
-The token lives in `TokenCache`, which one `Config` owns, so one run fetches one token and reuses it
-for up to three requests. The cache never reaches the disk, so nothing on disk holds a usable bearer
-token between runs. The client stops using a token 30 seconds before it expires, so a request that
-starts near the boundary does not arrive with an expired token.
+The token lives in `TokenCache`, which one `Config` owns. The cache holds one token per scope, so one
+run fetches one `sync` token and reuses it for every read, and fetches an `outbox:write` token only
+when a note is ready to send. The cache never reaches the disk, so nothing on disk holds a usable
+bearer token between runs. The client stops using a token 30 seconds before it expires, so a request
+that starts near the boundary does not arrive with an expired token.
+
+Each token request names one scope. A sync token therefore never carries the right to write a note,
+and an issuer client without `outbox:write` still syncs: the issuer answers `invalid_scope`, which
+`auth::InvalidScope` carries, and only the push stops.
 
 The tradeoffs: every run costs one extra HTTP request, the server must serve a token endpoint, and a
 provisioning file now carries three credential keys rather than one. `provision::check_credential_set`
 therefore requires all three or none, so a half-configured file fails at load rather than at the
 first HTTP 401.
+
+### Push runs inside `sync`, after the content step
+
+Only `link` writes the hook and the LaunchAgent, and a linked Mac never runs `link` again. So push
+is code inside `sync`, in [`src/outbox.rs`](../src/outbox.rs), and it reaches every linked Mac with
+the next `self-update`, within an hour, with no second `link`. `sync` also creates `outbox/` with
+mode `0700` when it is missing, for the same reason.
+
+`main.rs` keeps the result of the content step, runs the outbox steps, and then returns that result.
+The outbox steps are `whoami`, then push, and they run only when this run received a `sync` token,
+which proves that the issuer answered. A failed content step does not stop them, because the server
+that has no content to serve can still take a note. Each of their failures is a notice. Push makes
+no request at all when no note is ready.
+
+The tradeoffs: the `SessionStart` hook gives `sync` 60 seconds, and push shares them. A run that the
+timeout stops loses nothing: the server answers a note that it already holds as a duplicate, and the
+next run moves the file to `sent/`.
+
+### Push has its own lock and its own record
+
+Push holds `.outbox.lock` without waiting, and a run that finds it held sends nothing. It records its
+last success in `push.json`, never in `state.json`. `sync` is the only writer of `state.json`, under
+`.lock`, and a second writer under another lock could lose an update.
+
+### The upload path is a trust boundary
+
+Push is the first path from the disk to the network. A symbolic link in the outbox could otherwise
+send any file that the user can read, so push reads the entry with `symlink_metadata`, refuses a link
+and anything that is not a regular file, and checks that the file it opens is the file it checked. It
+then applies the name rule, the 64 KiB cap, UTF-8, and the frontmatter rules that the server applies.
+A file that changed in the last 60 seconds waits, so a note that Claude is still writing never
+leaves half written.
+
+A file that fails a check moves to `rejected/` with its reason, and a name that is taken there gets a
+number. A link moves as a link, and the file it names stays where it is.
+
+### The server names the operator
+
+The name on a note comes from the server, from the credential that sent it: nothing in the note, its
+file name, or a header names the operator. `sync` asks `whoami` with its `sync` token and writes the
+answer to `operator`, so a correction on the server reaches every machine at its next sync with no
+new package. An answer of `null` deletes the file, and a failure leaves it as it is.
+
+The file is a convenience for Claude, never a security control. `session-context` reads it, and a
+file that someone edited into another shape reads as no name.
 
 ### One parser reads every URL origin
 
@@ -234,7 +320,7 @@ The tradeoff: `brainmaker` carries a small URL parser rather than a dependency. 
 The binary compiles in no endpoint, and the release publishes none. The manifest carries a version
 and one SHA-256 per platform, and the client derives the download address from its own base URL and
 `BRAINMAKER_SOFTWARE_BINARY_PATH`. The route names are configurable too, so a deployment that sets
-all five route keys keeps its whole URL layout out of this repository, out of the workflow logs, out
+all seven route keys keeps its whole URL layout out of this repository, out of the workflow logs, out
 of the release notes, and out of the release assets.
 
 This also removes a check rather than adding one. An earlier design put a `url` in each manifest
@@ -430,6 +516,10 @@ of its path methods through its `Layout`, so the two cannot disagree on where a 
 The tradeoff: `uninstall` holds no credential, so it cannot revoke the client on the server. The
 client stays valid until an administrator revokes it.
 
+It also leaves `outbox/`, with every note in it, sent or not, and prints how many notes were never
+sent. A note is the operator's work, and one that was never sent exists nowhere else. The root then
+stays too.
+
 ### `uninstall` removes only a recognised root, one entry at a time
 
 A root is recognised when it holds a `state.json` that parses as the state `sync` writes, or a
@@ -484,7 +574,7 @@ reports that content as up to date.
 `sync` therefore takes an exclusive lock on `.lock` before it downloads, and holds it until the
 install ends. `self-update` takes a second lock, on `.update.lock`, while it replaces the program.
 The two are separate files, so a long content download does not delay a software update, and the
-reverse. The operating system drops a lock when its process ends, including when the process is
+reverse. Push takes a third, `.outbox.lock`, and does not wait for it. The operating system drops a lock when its process ends, including when the process is
 killed, so no stale lock remains.
 
 A run that finds the lock held waits up to 30 seconds. When the holder installed the release in that

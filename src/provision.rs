@@ -55,23 +55,33 @@ pub const KEY_SOFTWARE_MANIFEST_PATH: &str = "BRAINMAKER_SOFTWARE_MANIFEST_PATH"
 /// Route that returns one replacement binary, relative to [`KEY_API_BASE`].
 pub const KEY_SOFTWARE_BINARY_PATH: &str = "BRAINMAKER_SOFTWARE_BINARY_PATH";
 
+/// Route that receives one note, relative to [`KEY_API_BASE`]. The note name
+/// follows it as one more path segment.
+pub const KEY_OUTBOX_PATH: &str = "BRAINMAKER_OUTBOX_PATH";
+
+/// Route that names the operator of this client, relative to
+/// [`KEY_API_BASE`].
+pub const KEY_WHOAMI_PATH: &str = "BRAINMAKER_WHOAMI_PATH";
+
 /// Keys that an earlier version read, each with the key that replaces it.
 ///
 /// A configuration that still carries the old name fails, rather than falling
 /// back to a default and reaching the wrong host.
 pub const RENAMED_KEYS: [(&str, &str); 1] = [("SWETSI_API_BASE", KEY_API_BASE)];
 
-/// The five route keys, in the order the documents list them.
+/// The seven route keys, in the order the documents list them.
 ///
 /// Each one is optional. An absent key takes the generic default in
 /// [`crate::config`], so a customer who does not want their route names in a
-/// public repository sets all five.
-pub const ROUTE_KEYS: [&str; 5] = [
+/// public repository sets all seven.
+pub const ROUTE_KEYS: [&str; 7] = [
     KEY_TOKEN_PATH,
     KEY_CONTENT_LATEST_PATH,
     KEY_CONTENT_ARCHIVE_PATH,
     KEY_SOFTWARE_MANIFEST_PATH,
     KEY_SOFTWARE_BINARY_PATH,
+    KEY_OUTBOX_PATH,
+    KEY_WHOAMI_PATH,
 ];
 
 /// Names we look for when no path is given.
@@ -520,6 +530,8 @@ mod tests {
             KEY_CONTENT_ARCHIVE_PATH,
             KEY_SOFTWARE_MANIFEST_PATH,
             KEY_SOFTWARE_BINARY_PATH,
+            KEY_OUTBOX_PATH,
+            KEY_WHOAMI_PATH,
         ] {
             assert!(key.starts_with("BRAINMAKER_"), "got {key}");
         }

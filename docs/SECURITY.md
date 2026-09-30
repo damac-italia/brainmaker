@@ -12,6 +12,7 @@ exist, and how to report a vulnerability.
 | The holder of the content signing key | Which archive lands in `content/`, and so what runs at every session start |
 | The administrator who issues the provisioning file | The endpoints and the client credentials |
 | The employee who runs the binary | Nothing beyond their own account; they already hold the binary |
+| The server | Which operator a credential belongs to, and so the name on each note. The client never names it. |
 
 The two paths have different anchors.
 
@@ -76,7 +77,11 @@ token already issued stays valid for the rest of its lifetime, which the server 
 | Content API to disk | The zip archive | Path containment, symbolic-link rejection, permission stripping, size caps |
 | Software API to the binary | The manifest | Ed25519 signature over the served bytes, checked before the parse; then version character set and length, platform key lookup, checksum format. The manifest names no URL, so it cannot direct a download. |
 | Software API to the binary | The replacement binary | SHA-256 match, then a `--version` run whose output must be exactly `brainmaker <version>`, before the swap |
-| Provisioning file to the store | `KEY=VALUE` text | Size cap, key character set, TLS rule on both URLs, all-or-none credential check, character rule on both credential values, route rule on all five routes. All run before the store is written, so a file that fails leaves the previous store and the file in place. |
+| Provisioning file to the store | `KEY=VALUE` text | Size cap, key character set, TLS rule on both URLs, all-or-none credential check, character rule on both credential values, route rule on all seven routes. All run before the store is written, so a file that fails leaves the previous store and the file in place. |
+| Disk to the network | The notes in `outbox/` | A regular file only, read with `symlink_metadata`, never through a symbolic link, and the opened file must be the file that was checked; the note-name rule; 64 KiB at most; UTF-8 with no NUL and no byte-order mark; the frontmatter rules; 60 seconds with no change; one run at a time under `.outbox.lock`. A file that fails moves to `rejected/`, and nothing about it is sent. |
+| Content API to disk | The operator name from `whoami` | Written only when it matches `^[a-z0-9][a-z0-9-]{0,31}$`, as the name and one line feed |
+| Content API to disk | The answer to a note | The month for `sent/` must read `YYYY-MM`, or the note goes to `sent/unknown/`. The reason for `rejected/` loses every control character. |
+| Server text to the terminal | An error message | Collapsed onto one line, cut at 200 characters, and stripped of every control character and every character that changes the direction of the text |
 | Token endpoint to a header | The access token | Length cap, printable-ASCII rule, and a `token_type` that must read `Bearer` when the response carries one |
 | Token endpoint to the clock | `expires_in` | Cut to one hour before it is added to a clock reading; a sum that the clock cannot hold caches nothing |
 | Store to the process | `config.enc` | AES-256-GCM authenticates the header and the ciphertext before any byte is used |
@@ -85,10 +90,15 @@ token already issued stays valid for the rest of its lifetime, which the server 
 
 `brainmaker` holds a client identifier and a client secret, and exchanges them for an access token
 at `POST {SWETSI_JWT_ENDPOINT}/oauth2/token`, with HTTP Basic and the `client_credentials` grant. It
-asks for the scope `sync` explicitly, so a client that the server grants more than one scope still
-requests the one scope a sync needs. It then sends `Authorization: Bearer <token>` on every request
-under the base URL. With no credential configured it sends no header. It performs no authorization
-of its own: the server decides what the token may read.
+names one scope in each request, so a client that the server grants more than one scope still
+requests only the scope that the next request needs: `sync` for every read, and `outbox:write` to
+send a note, asked for only when a note is ready. It keeps one token per scope for the run, so a
+sync token never carries the right to write. It then sends `Authorization: Bearer <token>` on every
+request under the base URL. With no credential configured it sends no header. It performs no
+authorization of its own: the server decides what the token may read and write.
+
+An issuer that does not grant `outbox:write` answers `invalid_scope`. The push then stops with a
+notice, the notes stay, and the sync is not affected.
 
 The server expires the token after 10 minutes. That bounds what a token taken from a laptop is
 worth: the client secret stays valuable, and it stays sealed. The token lives in memory for one run
@@ -125,7 +135,7 @@ any route of a deployment.
 | Place | Why it holds no endpoint |
 |---|---|
 | The binary | Only `BRAINMAKER_CONFIG_KEY` and `CARGO_PKG_VERSION` are read at compile time. Two unit tests, `config::tests::no_endpoint_is_compiled_into_this_module` and `auth::tests::no_endpoint_is_compiled_into_this_module`, fail the build if a URL with a host enters either module. `cli::tests::the_help_text_names_no_endpoint` does the same for the help text. |
-| The repository | Every document uses `api.example.test`. The five route keys let a deployment replace every default route name, so even the route layout need not appear here. |
+| The repository | Every document uses `api.example.test`. The seven route keys let a deployment replace every default route name, so even the route layout need not appear here. |
 | The workflow logs | The release workflow takes no URL as input. It builds, checksums, and signs. |
 | The release notes and assets | The manifest carries a version and one SHA-256 per platform. `selfupdate::tests::the_manifest_type_carries_no_url` fails the build if a `url` field returns to the manifest type. GitHub writes the notes from merged pull request titles, so a title must name no endpoint. |
 
@@ -133,7 +143,7 @@ The base URL, the OAuth2 endpoint, and any custom routes reach a machine only in
 file, and that file is sealed on first use and then deleted. A public release therefore discloses
 which versions exist, and nothing about where they are served.
 
-The five routes are checked before use. A route that holds `://` would move a request to another
+The seven routes are checked before use. A route that holds `://` would move a request to another
 host, and a `..` segment would climb out of the base path; `config::check_route` refuses both, along
 with a space or any other character that cannot go into a URL.
 
@@ -341,11 +351,27 @@ and the root as double-quoted words, with a backslash before `$`, the backtick, 
 path that holds a control character stops `link`. The hook and the `CLAUDE.md` block are written
 through a temporary file and a rename, and a file that cannot be read as text is left alone.
 
+### The notes
+
+A note is the first thing that `brainmaker` sends from the disk to the network. The controls of that
+path are in the trust boundary table above. Two more properties matter.
+
+The name on a note comes from the server, from the credential that sent it. Nothing on the laptop
+names the operator: the `author` line of a note is only a claim, and the server keeps it apart. The
+`operator` file that `sync` writes from `whoami` is a convenience for Claude, never a security
+control, and a file that someone edited into another shape reads as no name.
+
+A note that the server stores, or already holds, moves to `sent/`. Nothing else leaves the outbox
+for the network, and a note that fails a check here never leaves the machine. `uninstall` keeps the
+outbox, because a note that was never sent exists nowhere else.
+
 ### Size caps
 
 | Input | Cap |
 |---|---|
 | Provisioning file | 64 KiB |
+| One note in the outbox | 64 KiB |
+| The answer to a note, and the answer of `whoami` | 64 KiB |
 | Content manifest and software manifest | 1 MiB |
 | Content archive | 512 MiB |
 | One archive entry | 256 MiB |

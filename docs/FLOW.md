@@ -1,10 +1,11 @@
 # Flow
 
-Six runtime paths matter: loading the settings, getting an access token, the `sync` command, the
-`self-update` command, `link` with its hourly agent, and the `uninstall` command. `status` reuses
+Seven runtime paths matter: loading the settings, getting an access token, the `sync` command, the
+push of the outbox, the `self-update` command, `link` with its hourly agent, and the `uninstall`
+command. `status` reuses
 the first two paths and then reads both remote endpoints without writing anything. Because it
 writes nothing, an endpoint it cannot reach becomes a value it prints rather than a reason to exit:
-[`main.rs:209`](../src/main.rs) prints `latest    <unknown>` and `state     cannot check: <reason>`.
+[`main.rs:286`](../src/main.rs) prints `latest    <unknown>` and `state     cannot check: <reason>`.
 
 ## Settings load
 
@@ -39,47 +40,48 @@ sequenceDiagram
 
 Steps:
 
-1. [`config.rs:357`](../src/config.rs) resolves the root through
-   [`config.rs:259`](../src/config.rs): `--dir` made absolute, else `~/.brainmaker`.
-2. [`provision.rs:320`](../src/provision.rs) searches up to four locations in order and returns the
+1. [`config.rs:411`](../src/config.rs) resolves the root through
+   [`config.rs:274`](../src/config.rs): `--dir` made absolute, else `~/.brainmaker`.
+2. [`provision.rs:330`](../src/provision.rs) searches up to four locations in order and returns the
    first hit. A `--config` or `$BRAINMAKER_CONFIG` path that is not a file fails the run. The fourth
    location, the working directory, is searched only while `config.enc` does not yet exist.
-3. On a hit, [`config.rs:364`](../src/config.rs) reads the file, and
-   [`config.rs:365`](../src/config.rs) checks the credential values and the five routes through
-   [`config.rs:234`](../src/config.rs). A file that fails here changes nothing: the previous store
+3. On a hit, [`config.rs:418`](../src/config.rs) reads the file, and
+   [`config.rs:419`](../src/config.rs) checks the credential values and the seven routes through
+   [`config.rs:249`](../src/config.rs). A file that fails here changes nothing: the previous store
    and the file itself stay in place.
-4. [`config.rs:367`](../src/config.rs) seals the parsed settings, and
-   [`config.rs:368`](../src/config.rs) writes `confidential/config.enc` with mode `0600` inside a
+4. [`config.rs:421`](../src/config.rs) seals the parsed settings, and
+   [`config.rs:422`](../src/config.rs) writes `confidential/config.enc` with mode `0600` inside a
    `0700` directory.
-5. [`config.rs:374`](../src/config.rs) logs a warning when the system gives no machine identifier,
+5. [`config.rs:428`](../src/config.rs) logs a warning when the system gives no machine identifier,
    because the store is then bound to the home directory path or to nothing.
-6. [`config.rs:386`](../src/config.rs) removes the plain file. A failed removal logs a warning and
+6. [`config.rs:440`](../src/config.rs) removes the plain file. A failed removal logs a warning and
    the run continues, because the settings are already stored.
-7. With no hit and an existing store, [`config.rs:415`](../src/config.rs) decrypts it. A store from
+7. With no hit and an existing store, [`config.rs:469`](../src/config.rs) decrypts it. A store from
    another machine or another build fails here with a message that tells you to reimport.
-8. [`config.rs:429`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
+8. [`config.rs:483`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
    `SWETSI_CLIENT_ID`, and `SWETSI_CLIENT_SECRET` override the stored values, and
-   [`config.rs:440`](../src/config.rs) lets `--url` override the base URL again.
-9. [`config.rs:444`](../src/config.rs) and [`config.rs:456`](../src/config.rs) fail when no source
+   [`config.rs:494`](../src/config.rs) lets `--url` override the base URL again.
+9. [`config.rs:498`](../src/config.rs) and [`config.rs:510`](../src/config.rs) fail when no source
    supplied a base URL.
-10. [`config.rs:464`](../src/config.rs) fails when the base URL is not `https://`, unless its host
+10. [`config.rs:518`](../src/config.rs) fails when the base URL is not `https://`, unless its host
     is this machine.
-11. [`config.rs:468`](../src/config.rs) checks the merged credential set. Three keys, or none of
+11. [`config.rs:522`](../src/config.rs) checks the merged credential set. Three keys, or none of
     them, passes. Any other count fails and names the missing keys. A configuration that still
     carries `SWETSI_TOKEN` and none of the three fails here.
-12. [`config.rs:480`](../src/config.rs) builds the `Credentials`. It applies the TLS rule to
+12. [`config.rs:534`](../src/config.rs) builds the `Credentials`. It applies the TLS rule to
     `SWETSI_JWT_ENDPOINT`, and it refuses a credential value that cannot go into a header.
-13. [`config.rs:487`](../src/config.rs) reads the five routes, and the environment overrides one
+13. [`config.rs:541`](../src/config.rs) reads the seven routes, and the environment overrides one
     route at a time. Each absent key takes its default. A route that holds `://`, a `..` segment,
     or a space fails here, because it would leave the base URL.
 
-[`config.rs:424`](../src/config.rs) runs before steps 8 to 13 and fails when a configuration still
+[`config.rs:478`](../src/config.rs) runs before steps 8 to 13 and fails when a configuration still
 carries a key under its old name, such as `SWETSI_API_BASE`.
 
 ## Access token
 
-`remote.rs` calls [`auth::bearer`](../src/auth.rs) before each request. The first call fetches, and
-every later call in the same run reads the cache.
+`remote.rs` and `outbox.rs` call [`auth::bearer`](../src/auth.rs) before each request, with the
+scope that the request needs: `sync` for every read, and `outbox:write` for a note. The first call
+for a scope fetches, and every later call for it in the same run reads the cache.
 
 ```mermaid
 sequenceDiagram
@@ -87,37 +89,42 @@ sequenceDiagram
     participant auth
     participant cache as TokenCache
     participant JWT as token endpoint
-    remote->>auth: bearer(config)
+    remote->>auth: bearer(config, scope)
     alt no credential is configured
         auth-->>remote: None, so no Authorization header
-    else the cache holds a usable token
-        auth->>cache: get()
+    else the cache holds a usable token for the scope
+        auth->>cache: get(scope)
         cache-->>auth: token
         auth-->>remote: Bearer token
     else
-        auth->>JWT: POST {jwt_endpoint}/{token route}
+        auth->>JWT: POST {jwt_endpoint}/{token route}, scope=<scope>
         JWT-->>auth: {"access_token": "…", "expires_in": 600}
         auth->>auth: check the token_type, then check_token(token)
-        auth->>cache: put(token, min(expires_in, 3600 s) - 30 s)
+        auth->>cache: put(scope, token, min(expires_in, 3600 s) - 30 s)
         auth-->>remote: Bearer token
     end
 ```
 
 Steps:
 
-1. [`auth.rs:141`](../src/auth.rs) returns `Ok(None)` when no credential is configured. The request
+1. [`auth.rs:189`](../src/auth.rs) returns `Ok(None)` when no credential is configured. The request
    then carries no `Authorization` header.
-2. [`auth.rs:145`](../src/auth.rs) returns the cached token while it stays usable.
-3. [`auth.rs:176`](../src/auth.rs) posts `grant_type=client_credentials&scope=sync` with HTTP Basic,
-   and [`auth.rs:189`](../src/auth.rs) reads the response body up to 64 KiB.
-4. [`auth.rs:200`](../src/auth.rs) refuses a `token_type` other than `Bearer`, in any case. A
+2. [`auth.rs:193`](../src/auth.rs) returns the cached token for the scope while it stays usable.
+3. [`auth.rs:236`](../src/auth.rs) posts `grant_type=client_credentials&scope=<scope>` with HTTP
+   Basic, and [`auth.rs:245`](../src/auth.rs) reads the response body up to 64 KiB. An answer of 400
+   or 401 whose `error` is `invalid_scope` becomes `InvalidScope` at
+   [`auth.rs:299`](../src/auth.rs), which a caller can tell apart from every other failure.
+4. [`auth.rs:256`](../src/auth.rs) refuses a `token_type` other than `Bearer`, in any case. A
    response with no `token_type` passes.
-5. [`auth.rs:219`](../src/auth.rs) refuses a token that is empty, longer than 8192 bytes, or holds
+5. [`auth.rs:275`](../src/auth.rs) refuses a token that is empty, longer than 8192 bytes, or holds
    a character outside printable ASCII.
-6. [`auth.rs:160`](../src/auth.rs) computes how long the client uses the token: `expires_in`, or
+6. [`auth.rs:216`](../src/auth.rs) computes how long the client uses the token: `expires_in`, or
    600 seconds when the response has none, cut to at most one hour, less 30 seconds.
-7. [`auth.rs:151`](../src/auth.rs) caches the token for that time. A lifetime that the clock cannot
-   hold caches nothing, so the next request asks for a new token. The cache never reaches the disk.
+7. [`auth.rs:199`](../src/auth.rs) caches the token for that scope and that time. A lifetime that
+   the clock cannot hold caches nothing, so the next request asks for a new token. The cache never
+   reaches the disk.
+8. [`auth.rs:207`](../src/auth.rs) answers whether this run received a token for a scope. The
+   outbox steps of `sync` ask it for `sync`, because that token proves that the issuer answered.
 
 A failed token request fails the command that asked for it. During `sync`, that happens before any
 file changes, so `content/` stays as it was.
@@ -135,7 +142,7 @@ sequenceDiagram
     participant state
     main->>sync: sync(config, force, log)
     sync->>sync: restore_stranded()
-    sync->>remote: latest_release(config)
+    sync->>remote: latest_release(config, report headers)
     remote->>API: GET {base}/{latest hash route}
     API-->>remote: {"payload": "...", "signature": "..."}
     remote-->>sync: ContentRelease
@@ -166,7 +173,9 @@ Steps:
 2. [`sync.rs:74`](../src/sync.rs) restores content that a stopped run left in `.trash/`, through
    [`sync.rs:271`](../src/sync.rs). It acts only when `content/` is missing, `.trash/` is a
    directory, and the install lock is free at once.
-3. [`sync.rs:83`](../src/sync.rs) reads the signed content release. `remote::latest_release` checks
+3. [`sync.rs:83`](../src/sync.rs) reads the signed content release, with the three headers that
+   [`outbox.rs:342`](../src/outbox.rs) builds: the platform, the installed hash or `none`, and the
+   count of notes that wait. `remote::latest_release` checks
    the Ed25519 signature against `signature::CONTENT_KEYS`, and runs `config::validate_hash` on the
    hash from the signed payload, so an out-of-range value fails before it reaches a URL or a path.
 4. [`sync.rs:86`](../src/sync.rs) turns a failed request into `Unreachable` when `state.json` names
@@ -199,7 +208,10 @@ Steps:
     alike.
 16. [`sync.rs:233`](../src/sync.rs) writes `state.json` with the hash and the sequence, only after
     the swap succeeded. The lock is released when `sync` returns.
-17. [`main.rs:132`](../src/main.rs) runs the software check unless `--no-update-check` was given.
+17. [`main.rs:140`](../src/main.rs) keeps the result of the content step, and
+    [`main.rs:144`](../src/main.rs) runs the outbox steps, which [Push](#push) describes. Only then
+    does [`main.rs:145`](../src/main.rs) return a content error.
+18. [`main.rs:146`](../src/main.rs) runs the software check unless `--no-update-check` was given.
 
 ### The swap and its rollback
 
@@ -231,6 +243,75 @@ A run that is killed between steps 1 and 2 leaves no `content/`. Step 2 of the n
 | The second rename fails | The previous `content/` is restored, then the run fails |
 | `state.json` cannot be written | The content is installed, and the run fails with that stated |
 | The software check fails, including on a bad signature | A `notice:` line goes to stderr and the exit code stays 0 |
+
+## Push
+
+`sync` runs these steps after the content step, and `push` runs the push alone.
+
+```mermaid
+sequenceDiagram
+    participant main
+    participant outbox
+    participant auth
+    participant API
+    participant disk as outbox/
+    main->>outbox: ensure_dir(config), mode 0700
+    main->>auth: received(config, sync)?
+    alt this run received a sync token
+        main->>outbox: update_operator(config)
+        outbox->>API: GET {base}/{whoami route}
+        outbox->>outbox: write operator, or delete it on null
+        main->>outbox: push(config, log)
+        outbox->>outbox: take .outbox.lock without waiting
+        outbox->>disk: list the .md entries, check each one
+        alt a note is ready
+            outbox->>auth: bearer(config, outbox:write)
+            loop each ready note, oldest first
+                outbox->>API: POST {base}/{outbox route}/<name>
+                outbox->>disk: move to sent/<YYYY-MM>/, or to rejected/, or stop
+            end
+            outbox->>disk: write push.json when a note was sent
+        end
+    end
+```
+
+Steps:
+
+1. [`main.rs:165`](../src/main.rs) creates `outbox/` with mode `0700` through
+   [`outbox.rs:275`](../src/outbox.rs), because a Mac that linked before the outbox existed never
+   runs `link` again.
+2. [`main.rs:168`](../src/main.rs) stops the steps when this run received no `sync` token. The
+   issuer then did not answer, and a further request would only wait.
+3. [`main.rs:171`](../src/main.rs) asks `whoami`. [`outbox.rs:370`](../src/outbox.rs) writes a name
+   that matches the operator rule to `operator`, and deletes the file on `null`. A failure prints a
+   notice and leaves the file.
+4. [`main.rs:176`](../src/main.rs) runs the push. [`outbox.rs:470`](../src/outbox.rs) takes
+   `.outbox.lock` without waiting, and a run that finds it held sends nothing.
+5. [`outbox.rs:477`](../src/outbox.rs) checks each `.md` entry through
+   [`outbox.rs:562`](../src/outbox.rs). A symbolic link, and anything that is not a regular file,
+   is refused at [`outbox.rs:568`](../src/outbox.rs). A file that changed in the last 60 seconds
+   waits, at [`outbox.rs:578`](../src/outbox.rs). Then the name rule, the 64 KiB cap, and the
+   frontmatter rules apply, and [`outbox.rs:629`](../src/outbox.rs) refuses a file that is not the
+   file that was checked. A refused file moves to `rejected/` through
+   [`outbox.rs:695`](../src/outbox.rs), beside its reason.
+6. [`outbox.rs:489`](../src/outbox.rs) returns when no note is ready, before any request.
+7. [`outbox.rs:493`](../src/outbox.rs) asks for an `outbox:write` token. `InvalidScope` stops the
+   run with a notice, and every note stays.
+8. [`outbox.rs:510`](../src/outbox.rs) orders the notes oldest first, and
+   [`outbox.rs:513`](../src/outbox.rs) sends each one through
+   [`remote.rs:254`](../src/remote.rs).
+9. A `201` or a `200` moves the note to `sent/<YYYY-MM>/` at [`outbox.rs:524`](../src/outbox.rs).
+   The month comes from `received_at`, and [`outbox.rs:657`](../src/outbox.rs) gives `unknown` for
+   any other shape. A `400` or a `413` moves it to `rejected/` at
+   [`outbox.rs:533`](../src/outbox.rs). Every other answer, and a failure to reach the server,
+   keeps it and stops the run at [`outbox.rs:544`](../src/outbox.rs).
+10. [`outbox.rs:711`](../src/outbox.rs) adds `-2`, `-3`, and so on to a name that is taken.
+11. [`outbox.rs:556`](../src/outbox.rs) writes `push.json` when the run sent a note. The lock is
+    released when `push` returns.
+
+Under `sync`, each failure of these steps prints one `notice:` line, which `--quiet` hides, and the
+exit code stays as the content step decided. `push` alone exits 1 at
+[`main.rs:205`](../src/main.rs) when a note had to stay.
 
 ## Self-update
 
@@ -331,23 +412,24 @@ sequenceDiagram
 
 Steps:
 
-1. [`main.rs:109`](../src/main.rs) resolves the agent location through
+1. [`main.rs:110`](../src/main.rs) resolves the agent location through
    [`schedule.rs:60`](../src/schedule.rs). `--agent-dir` names a directory that is never loaded.
    Without it, [`schedule.rs:64`](../src/schedule.rs) returns no agent on a system other than
    macOS, or when `--claude-dir` was given.
-2. [`link.rs:136`](../src/link.rs) fails when the content directory does not exist yet.
-3. [`link.rs:144`](../src/link.rs) links the skills, and
-   [`link.rs:145`](../src/link.rs) copies the program under the root.
-4. [`link.rs:146`](../src/link.rs) builds the command prefix. [`link.rs:485`](../src/link.rs)
+2. [`link.rs:139`](../src/link.rs) fails when the content directory does not exist yet, and
+   [`link.rs:147`](../src/link.rs) creates `outbox/` with mode `0700`.
+3. [`link.rs:148`](../src/link.rs) links the skills, and
+   [`link.rs:149`](../src/link.rs) copies the program under the root.
+4. [`link.rs:150`](../src/link.rs) builds the command prefix. [`link.rs:512`](../src/link.rs)
    writes each path as one double-quoted shell word, puts a backslash before `$`, the backtick,
    `"`, and `\`, and refuses a path that holds a control character.
-5. [`link.rs:147`](../src/link.rs) writes the hook into `settings.json`, and
-   [`link.rs:148`](../src/link.rs) writes the block into `CLAUDE.md`. A file that exists but cannot
+5. [`link.rs:151`](../src/link.rs) writes the hook into `settings.json`, and
+   [`link.rs:152`](../src/link.rs) writes the block into `CLAUDE.md`. A file that exists but cannot
    be read as text fails the run and stays as it is. A `CLAUDE.md` whose markers are not one start
-   followed by one end fails the run too. [`link.rs:572`](../src/link.rs) writes each file through
+   followed by one end fails the run too. [`link.rs:599`](../src/link.rs) writes each file through
    a temporary file and a rename, keeps the mode of an existing file, and keeps a symbolic link as
    a link.
-6. [`link.rs:150`](../src/link.rs) installs the agent with the same command prefix the hook runs.
+6. [`link.rs:154`](../src/link.rs) installs the agent with the same command prefix the hook runs.
 7. [`schedule.rs:103`](../src/schedule.rs) returns with nothing changed when the property list
    already holds the same text.
 8. [`schedule.rs:109`](../src/schedule.rs) writes the property list.
@@ -385,27 +467,30 @@ sequenceDiagram
 
 Steps:
 
-1. [`main.rs:90`](../src/main.rs) sends `uninstall` down its own path before `Config::load`, so no
+1. [`main.rs:91`](../src/main.rs) sends `uninstall` down its own path before `Config::load`, so no
    setting is read and no provisioning file is imported.
-2. [`main.rs:258`](../src/main.rs) fails when stdin is not a terminal and `--yes` was not given.
+2. [`main.rs:377`](../src/main.rs) fails when stdin is not a terminal and `--yes` was not given.
    Otherwise the question prints past `--quiet`, and any answer but `y` or `yes` exits 0 with
    `Nothing was removed.`
-3. [`uninstall.rs:120`](../src/uninstall.rs) stops the run with nothing changed when the root
+3. [`uninstall.rs:126`](../src/uninstall.rs) stops the run with nothing changed when the root
    exists and holds neither a parsable `state.json` nor a sealed `confidential/config.enc`.
-4. [`uninstall.rs:132`](../src/uninstall.rs) resolves the running program before any file goes,
+4. [`uninstall.rs:138`](../src/uninstall.rs) resolves the running program before any file goes,
    so it can later say whether that program was the copy under the root.
-5. [`uninstall.rs:137`](../src/uninstall.rs) removes the bridge through `link::remove_bridge`, the
+5. [`uninstall.rs:143`](../src/uninstall.rs) removes the bridge through `link::remove_bridge`, the
    code that `unlink` runs. The LaunchAgent goes first, before the program copy it runs.
-6. [`uninstall.rs:189`](../src/uninstall.rs) lists `content/`, `.staging/`, `.trash/`,
-   `.download.zip`, `.lock`, `.update.lock`, `agent.log`, the program copy and every
+6. [`uninstall.rs:197`](../src/uninstall.rs) lists `content/`, `.staging/`, `.trash/`,
+   `.download.zip`, `.lock`, `.update.lock`, `.outbox.lock`, `.admin.lock`, `agent.log`,
+   `operator` and `push.json` with their temporary files, the program copy and every
    `bin/.brainmaker*` file, then the two temporary files and the two marks, in that order.
-7. [`uninstall.rs:206`](../src/uninstall.rs) removes each path that exists. A symbolic link goes
+   `outbox/` is not in the list, and [`uninstall.rs:240`](../src/uninstall.rs) counts the notes in
+   it that were never sent, and says how many.
+7. [`uninstall.rs:220`](../src/uninstall.rs) removes each path that exists. A symbolic link goes
    without its target. On Windows, a program copy that is running now yields a `notice:` line
    instead of an error.
-8. [`uninstall.rs:225`](../src/uninstall.rs) removes `bin/`, `confidential/`, and the root when
+8. [`uninstall.rs:251`](../src/uninstall.rs) removes `bin/`, `confidential/`, and the root when
    each one is empty, and names what the root still holds otherwise.
-9. [`uninstall.rs:148`](../src/uninstall.rs) prints the path of the program that ran, unless it
-   was the copy under the root, and [`uninstall.rs:154`](../src/uninstall.rs) asks you to restart
+9. [`uninstall.rs:154`](../src/uninstall.rs) prints the path of the program that ran, unless it
+   was the copy under the root, and [`uninstall.rs:160`](../src/uninstall.rs) asks you to restart
    any open Claude session when the hook was removed.
 
 A removal that fails part-way returns the error, and the run exits 1. The marks go last, so the
