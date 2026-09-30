@@ -34,7 +34,9 @@ A plain `cargo test` skips `tools/sign.rs`. The script does not skip it.
   test fails when one does. A document that names the host of the content API uses
   `api.example.test`.
 - Never print, log, or format a client identifier, a client secret, or an access token into text
-  that a person or a log can read.
+  that a person or a log can read. The admin commands are the one exception: they print the client
+  IDs that the server reports, because the admin needs them to tell two machines apart, and a client
+  ID alone authenticates nothing. No command prints the credential of the machine it runs on.
 - Check a value from the network before it enters a URL, a path, or a header.
 - `PUBLIC_KEYS` and `CONTENT_KEYS` in `src/signature.rs` keep one key per line. No key may be in
   both lists. The release workflow reads each list with `sed` and `grep`.

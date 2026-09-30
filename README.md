@@ -76,6 +76,7 @@ gone. Later runs read the sealed copy and need no file.
 | Outbox | `sync` sends each note from `~/.brainmaker/outbox/` once it has not changed for a minute, with a token of its own scope, and moves it to `sent/` or `rejected/` |
 | Upload guard | Push sends regular files only, never through a symbolic link, with a checked name, at most 64 KiB, in UTF-8, with a checked frontmatter |
 | Operator name | `sync` asks the server which operator the credential belongs to, and writes the answer to `~/.brainmaker/operator` |
+| Admin commands | `admin pull-outbox` collects the notes into a folder with the server's author and flags, `admin status` shows the fleet, and `admin syncs` lists the syncs of an operator |
 
 ## Usage
 
@@ -127,6 +128,54 @@ a claim.
 `push` asks the issuer for a token with the scope `outbox:write`, and only when a note is ready. A
 credential whose issuer client does not have that scope keeps syncing, and its notes stay. `sync`
 treats every push failure as a notice and exits 0; `push` exits 1 when a note stays.
+
+### Collect the notes (admin)
+
+The admin who collects the notes runs three more commands, on a copy of this binary in a root of
+its own. Every one asks the issuer for a token with the scope `outbox:read`, and the server decides
+what that token may read.
+
+```bash
+brainmaker --dir ~/.brainmaker-admin admin pull-outbox inbox/
+brainmaker --dir ~/.brainmaker-admin admin status --json
+brainmaker --dir ~/.brainmaker-admin admin syncs gabriele
+```
+
+`admin pull-outbox <DIR>` writes each note that waits on the server into `DIR`, which must exist, as
+`<YYYY-MM-DD>-<operator>-<name>`. The date is the day the server received the note, in the server's
+time zone, and the name starts with the operator's own date, so the file name holds two dates. The
+command sets `author` and `review_flags` in the frontmatter from the server's values, whatever the
+note says, so the operator can neither choose the name nor clear a flag. It never replaces a file:
+a name that holds other bytes gets `-2`, `-3`, and so on. It then marks each note on disk as
+collected on the server. A note that cannot be written stays on the server for the next run, and
+the command exits 1.
+
+`admin status` prints one line per operator: the last sync, the version, the platform, the notes
+that wait on the laptop, and the notes sent in 7 days. Then it prints one line per client that no
+operator holds. With `--json`, it prints the fleet in the shape of the admin's brief instead.
+
+`admin syncs <OPERATOR>` prints the syncs of every client of that operator, newest first: the time,
+the client ID, the status, the IP address, the platform, the version, and the installed content.
+`admin syncs --client <CLIENT-ID>` reads one client. `--limit` sets the number of rows, 50 by
+default, and `--json` prints the rows as JSON.
+
+These commands print the client IDs that the server reports. No command prints the credential of
+the machine it runs on.
+
+To install the admin copy, put the binary in a fixed place, and import the admin's
+`brainmaker.env` into its own root:
+
+```bash
+/usr/local/bin/brainmaker --dir ~/.brainmaker-admin --config ~/Downloads/brainmaker.env admin status
+```
+
+Do not run the package installer for this copy, because it runs `link`, and never run `link` with
+this root. The admin's issuer client holds `sync` and `outbox:read`, never `publish`. `sync` lets the
+copy run `self-update`:
+
+```bash
+/usr/local/bin/brainmaker --dir ~/.brainmaker-admin self-update --quiet
+```
 
 ### Replace the binary
 
@@ -307,8 +356,8 @@ it fails with a message that asks for a new file.
 
 ### Route names
 
-Seven more keys name the routes. Each one is optional, and an absent key takes the generic default
-below. Set all seven to keep the route names of a deployment out of this public repository.
+Nine more keys name the routes. Each one is optional, and an absent key takes the generic default
+below. Set all nine to keep the route names of a deployment out of this public repository.
 
 | Key | Default | Joins |
 |---|---|---|
@@ -319,6 +368,11 @@ below. Set all seven to keep the route names of a deployment out of this public 
 | `BRAINMAKER_SOFTWARE_BINARY_PATH` | `software/brainmaker-{version}-{platform}{ext}` | `BRAINMAKER_API_BASE` |
 | `BRAINMAKER_OUTBOX_PATH` | `outbox`, then `/<note name>` | `BRAINMAKER_API_BASE` |
 | `BRAINMAKER_WHOAMI_PATH` | `whoami` | `BRAINMAKER_API_BASE` |
+| `BRAINMAKER_ADMIN_OUTBOX_PATH` | `admin/outbox`, and the acknowledgement at `/ack` under it | `BRAINMAKER_API_BASE` |
+| `BRAINMAKER_ADMIN_CLIENTS_PATH` | `admin/clients`, and one sync log at `/<client_id>/syncs` under it | `BRAINMAKER_API_BASE` |
+
+The two admin keys belong in the admin's `brainmaker.env` alone. A laptop package never carries
+them.
 
 `brainmaker` substitutes `{hash}`, `{version}`, `{platform}`, and `{ext}`. `{ext}` is `.exe` on
 Windows and empty everywhere else.
@@ -354,7 +408,7 @@ next run imports it, overwrites the sealed store, and removes the file.
 | `SWETSI_JWT_ENDPOINT` | the sealed value | Base of the OAuth2 routes. The TLS rule above applies to it. |
 | `SWETSI_CLIENT_ID` | the sealed value | Client identifier for the token request. |
 | `SWETSI_CLIENT_SECRET` | the sealed value | Client secret for the token request. |
-| The seven `*_PATH` keys | the sealed value, else the default | One route each. The same rules as above apply. |
+| The nine `*_PATH` keys | the sealed value, else the default | One route each. The same rules as above apply. |
 | `BRAINMAKER_CONFIG` | unset | Path of the provisioning file to import. |
 | `BRAINMAKER_CONFIG_KEY` | a development key | Build-time only. Seals the stored settings. |
 
@@ -382,7 +436,9 @@ disk. Every API request then carries `Authorization: Bearer <token>`.
 
 To send a note, `brainmaker` asks for a second token, with `scope=outbox:write`, and only when a note
 is ready. It keeps one token per scope for the run. A sync token therefore never carries the right
-to write, and an issuer that answers `invalid_scope` stops only the push.
+to write, and an issuer that answers `invalid_scope` stops only the push. The admin commands ask for
+`scope=outbox:read`, and an issuer that does not grant it gives the error
+`this credential cannot read the outbox`.
 
 ### Options
 
@@ -398,6 +454,9 @@ to write, and an issuer that answers `invalid_scope` stops only the push.
 | `--url <URL>` | Use `URL` as the API base |
 | `--claude-dir <PATH>` | With `link`, `unlink`, and `uninstall`, write to `PATH` instead of `~/.claude`, and leave the LaunchAgent alone |
 | `--agent-dir <PATH>` | With `link`, `unlink`, and `uninstall`, write the LaunchAgent to `PATH` and do not load it |
+| `--json` | With `admin status` and `admin syncs`, print JSON instead of lines |
+| `--limit <N>` | With `admin syncs`, print at most `N` rows, from 1 to 1000. Default: 50. |
+| `--client <CLIENT-ID>` | With `admin syncs`, read one client instead of an operator |
 | `-q`, `--quiet` | Print errors only |
 | `-h`, `--help` | Print the help text |
 | `-V`, `--version` | Print the version |
@@ -416,7 +475,7 @@ a hyphen, such as `uninstall --dir --yes`. Write a path that starts with a hyphe
 
 - [Architecture](docs/ARCHITECTURE.md): modules, boundaries, data model, decisions
 - [Flow](docs/FLOW.md): the sync, provisioning, and self-update paths
-- [API](docs/API.md): the CLI surface and the seven HTTP routes the server must serve
+- [API](docs/API.md): the CLI surface and the HTTP routes the server must serve
 - [Security](docs/SECURITY.md): trust model, secret handling, input validation
 
 ## Build and release
