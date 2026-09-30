@@ -21,6 +21,8 @@ COMMANDS:
                    versions, the operator, and the notes in the outbox. It
                    changes nothing.
     push           Send the notes in the outbox now
+    admin          Collect the notes, and read the fleet and its sync log.
+                   For the admin; run brainmaker admin --help
     self-update    Replace this binary with the newest build for this platform
     link           Wire the synced content into ~/.claude, so its skills and
                    its session context load in every project, not only in the
@@ -100,6 +102,53 @@ EXIT CODES:
          outbox because the server or the issuer did not take it.
 ";
 
+pub const ADMIN_HELP: &str = "\
+brainmaker admin — collect the notes, and read the fleet and its sync log
+
+USAGE:
+    brainmaker admin pull-outbox <DIR> [OPTIONS]
+    brainmaker admin status [--json] [OPTIONS]
+    brainmaker admin syncs <OPERATOR> [--limit N] [--json] [OPTIONS]
+    brainmaker admin syncs --client <CLIENT-ID> [--limit N] [--json] [OPTIONS]
+
+Every admin command asks for a token with the scope outbox:read. Keep the
+admin copy in a root of its own, such as ~/.brainmaker-admin, with --dir, and
+never run link there.
+
+COMMANDS:
+    pull-outbox <DIR>
+                   Write each note that waits on the server into DIR, as
+                   <YYYY-MM-DD>-<operator>-<name>, where the date is the day
+                   the server received it. It sets author and review_flags in
+                   the frontmatter from the server, and never replaces a file.
+                   Then it acknowledges each note that is on disk. DIR must
+                   exist.
+    status         Print one line per operator: the last sync, the version,
+                   the platform, the notes that wait on the laptop, and the
+                   notes sent in 7 days. Then one line per client that no
+                   operator holds.
+    syncs <OPERATOR>
+                   Print the syncs of every client of OPERATOR, newest first:
+                   the time, the client ID, the status, the IP address, the
+                   platform, the version, and the installed content.
+
+OPTIONS:
+    --json               With status and syncs, print JSON instead of lines
+    --limit <N>          With syncs, print at most N rows, from 1 to 1000.
+                         Default: 50.
+    --client <CLIENT-ID> With syncs, name one client instead of an operator
+    --dir, --config, --keep-config, --url, and --quiet work as they do for
+    every other command.
+
+These commands print the client IDs that the server reports. No command
+prints the credential of this machine.
+
+EXIT CODES:
+    0    The command succeeded
+    1    The command failed. pull-outbox also exits 1 when a note could not
+         be written; that note stays on the server for the next run.
+";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Sync,
@@ -110,14 +159,26 @@ pub enum Command {
     Uninstall,
     SessionContext,
     Push,
+    AdminPullOutbox,
+    AdminStatus,
+    AdminSyncs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Run(Args),
+    /// Boxed, because `Args` passes the size limit of `clippy::large_enum_variant`
+    /// on Windows, where a path takes more bytes.
+    Run(Box<Args>),
     Help,
+    AdminHelp,
     Version,
 }
+
+/// Longest `--limit` that `admin syncs` takes: one page of the server.
+pub const MAX_SYNCS_LIMIT: u32 = 1000;
+
+/// Rows that `admin syncs` prints when `--limit` is absent.
+pub const DEFAULT_SYNCS_LIMIT: u32 = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
@@ -142,6 +203,15 @@ pub struct Args {
     /// `--agent-dir`, naming the directory that holds the LaunchAgent that
     /// `link` writes and that `unlink` and `uninstall` remove.
     pub agent_dir: Option<PathBuf>,
+    /// With `admin status` and `admin syncs`, print JSON.
+    pub json: bool,
+    /// With `admin syncs`, the number of rows.
+    pub limit: Option<u32>,
+    /// With `admin syncs`, the one client to read.
+    pub client: Option<String>,
+    /// The value after an admin command: the directory of `pull-outbox`, or
+    /// the operator of `syncs`.
+    pub target: Option<String>,
 }
 
 impl Default for Args {
@@ -159,6 +229,10 @@ impl Default for Args {
             url: None,
             claude_dir: None,
             agent_dir: None,
+            json: false,
+            limit: None,
+            client: None,
+            target: None,
         }
     }
 }
@@ -202,10 +276,14 @@ where
 {
     let mut args = Args::default();
     let mut command_seen = false;
+    // True after `admin`, until its subcommand arrives.
+    let mut admin_pending = false;
+    let mut admin_seen = false;
     let mut iter = raw.into_iter().map(Into::into);
 
     while let Some(item) = iter.next() {
         match item.as_str() {
+            "-h" | "--help" if admin_seen => return Ok(Action::AdminHelp),
             "-h" | "--help" => return Ok(Action::Help),
             "-V" | "--version" => return Ok(Action::Version),
             "--force" => args.force = true,
@@ -238,6 +316,50 @@ where
             "--url" => {
                 let value = value_of("--url", "a URL", args.url.is_some(), &mut iter)?;
                 args.url = Some(value);
+            }
+            "--json" => args.json = true,
+            "--limit" => {
+                let value = value_of("--limit", "a number", args.limit.is_some(), &mut iter)?;
+                match value.parse::<u32>() {
+                    Ok(limit) if (1..=MAX_SYNCS_LIMIT).contains(&limit) => {
+                        args.limit = Some(limit);
+                    }
+                    _ => bail!(
+                        "--limit takes a whole number from 1 to {MAX_SYNCS_LIMIT}, got {value:?}"
+                    ),
+                }
+            }
+            "--client" => {
+                let value = value_of("--client", "a client ID", args.client.is_some(), &mut iter)?;
+                args.client = Some(value);
+            }
+            "admin" if !command_seen => {
+                admin_pending = true;
+                admin_seen = true;
+                command_seen = true;
+            }
+            "pull-outbox" if admin_pending => {
+                args.command = Command::AdminPullOutbox;
+                admin_pending = false;
+            }
+            "status" if admin_pending => {
+                args.command = Command::AdminStatus;
+                admin_pending = false;
+            }
+            "syncs" if admin_pending => {
+                args.command = Command::AdminSyncs;
+                admin_pending = false;
+            }
+            other if admin_pending => bail!(
+                "admin takes pull-outbox, status, or syncs, not {other:?}; run brainmaker admin \
+                 --help"
+            ),
+            other
+                if matches!(args.command, Command::AdminPullOutbox | Command::AdminSyncs)
+                    && args.target.is_none()
+                    && !other.starts_with('-') =>
+            {
+                args.target = Some(other.to_string());
             }
             "sync" if !command_seen => {
                 args.command = Command::Sync;
@@ -275,9 +397,26 @@ where
         }
     }
 
+    if admin_pending {
+        bail!("admin needs pull-outbox, status, or syncs; run brainmaker admin --help");
+    }
+    check_admin_target(&args)?;
     check_options(&args)?;
 
-    Ok(Action::Run(args))
+    Ok(Action::Run(Box::new(args)))
+}
+
+/// Fails for an admin command whose value is missing, or given twice over.
+fn check_admin_target(args: &Args) -> Result<()> {
+    match args.command {
+        Command::AdminPullOutbox if args.target.is_none() => {
+            bail!("admin pull-outbox needs the directory to write the notes into")
+        }
+        Command::AdminSyncs if args.target.is_some() == args.client.is_some() => {
+            bail!("admin syncs needs an operator, or --client <CLIENT-ID>, and not both")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Fails for an option that has no effect with the command.
@@ -290,10 +429,23 @@ fn check_options(args: &Args) -> Result<()> {
 
     // The commands that load settings. uninstall does not, so a settings flag
     // would do nothing there.
-    let all_but_uninstall: &[Command] =
-        &[Sync, Status, SelfUpdate, Link, Unlink, SessionContext, Push];
+    let all_but_uninstall: &[Command] = &[
+        Sync,
+        Status,
+        SelfUpdate,
+        Link,
+        Unlink,
+        SessionContext,
+        Push,
+        AdminPullOutbox,
+        AdminStatus,
+        AdminSyncs,
+    ];
 
-    let given: [(&str, bool, &[Command]); 9] = [
+    let given: [(&str, bool, &[Command]); 12] = [
+        ("--json", args.json, &[AdminStatus, AdminSyncs]),
+        ("--limit", args.limit.is_some(), &[AdminSyncs]),
+        ("--client", args.client.is_some(), &[AdminSyncs]),
         ("--force", args.force, &[Sync, SelfUpdate]),
         ("--check", args.check_only, &[SelfUpdate]),
         ("--no-update-check", args.no_update_check, &[Sync]),
@@ -338,6 +490,9 @@ fn name_of(command: Command) -> &'static str {
         Command::Uninstall => "uninstall",
         Command::SessionContext => "session-context",
         Command::Push => "push",
+        Command::AdminPullOutbox => "admin pull-outbox",
+        Command::AdminStatus => "admin status",
+        Command::AdminSyncs => "admin syncs",
     }
 }
 
@@ -347,7 +502,7 @@ mod tests {
 
     fn run(items: &[&str]) -> Args {
         match parse(items.iter().copied()).unwrap() {
-            Action::Run(args) => args,
+            Action::Run(args) => *args,
             other => panic!("expected Action::Run, got {other:?}"),
         }
     }
@@ -428,6 +583,106 @@ mod tests {
         for flag in ["--force", "--check", "--no-update-check", "--yes"] {
             let error = parse(["push", flag]).unwrap_err().to_string();
             assert!(error.contains("has no effect with push"), "{flag}: {error}");
+        }
+    }
+
+    #[test]
+    fn parses_the_three_admin_commands() {
+        let args = run(&["--dir", "/tmp/admin", "admin", "pull-outbox", "inbox"]);
+        assert_eq!(args.command, Command::AdminPullOutbox);
+        assert_eq!(args.target.as_deref(), Some("inbox"));
+
+        let args = run(&["admin", "status", "--json"]);
+        assert_eq!(args.command, Command::AdminStatus);
+        assert!(args.json);
+
+        let args = run(&["admin", "syncs", "gabriele", "--limit", "10", "--json"]);
+        assert_eq!(args.command, Command::AdminSyncs);
+        assert_eq!(args.target.as_deref(), Some("gabriele"));
+        assert_eq!(args.limit, Some(10));
+
+        let args = run(&["admin", "syncs", "--client", "brainmaker-sync-old"]);
+        assert_eq!(args.client.as_deref(), Some("brainmaker-sync-old"));
+        assert_eq!(args.target, None);
+    }
+
+    #[test]
+    fn an_admin_command_needs_its_value_and_no_extra() {
+        for (items, needle) in [
+            (&["admin"][..], "needs pull-outbox, status, or syncs"),
+            (&["admin", "stats"][..], "not \"stats\""),
+            (&["admin", "pull-outbox"][..], "needs the directory"),
+            (&["admin", "syncs"][..], "needs an operator"),
+            (
+                &["admin", "syncs", "gabriele", "--client", "c1c"][..],
+                "and not both",
+            ),
+            (&["admin", "status", "extra"][..], "unknown argument"),
+            (&["admin", "pull-outbox", "a", "b"][..], "unknown argument"),
+        ] {
+            let error = parse(items.iter().copied()).unwrap_err().to_string();
+            assert!(error.contains(needle), "{items:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn an_admin_option_fails_where_it_has_no_effect() {
+        for (items, needle) in [
+            (
+                &["status", "--json"][..],
+                "--json has no effect with status",
+            ),
+            (
+                &["admin", "pull-outbox", "x", "--json"][..],
+                "--json has no effect with admin pull-outbox",
+            ),
+            (
+                &["admin", "status", "--limit", "5"][..],
+                "--limit has no effect with admin status",
+            ),
+            (
+                &["admin", "status", "--client", "c1c"][..],
+                "--client has no effect with admin status",
+            ),
+            (
+                &["admin", "syncs", "g", "--limit", "0"][..],
+                "from 1 to 1000",
+            ),
+            (
+                &["admin", "syncs", "g", "--limit", "1001"][..],
+                "from 1 to 1000",
+            ),
+            (&["admin", "status", "--force"][..], "--force has no effect"),
+        ] {
+            let error = parse(items.iter().copied()).unwrap_err().to_string();
+            assert!(error.contains(needle), "{items:?}: {error}");
+        }
+        // The settings flags work with every admin command.
+        assert!(parse(["admin", "status", "--config", "/tmp/admin.env"]).is_ok());
+    }
+
+    #[test]
+    fn admin_help_holds_the_details_and_the_main_help_one_line() {
+        assert_eq!(parse(["admin", "--help"]).unwrap(), Action::AdminHelp);
+        assert_eq!(
+            parse(["admin", "syncs", "--help"]).unwrap(),
+            Action::AdminHelp
+        );
+        assert_eq!(parse(["--help", "admin"]).unwrap(), Action::Help);
+        let entries = HELP
+            .lines()
+            .filter(|line| line.starts_with("    admin "))
+            .count();
+        assert_eq!(entries, 1, "one entry in the main help");
+        assert!(HELP.contains("run brainmaker admin --help"));
+        assert!(
+            !HELP.contains("pull-outbox"),
+            "the details live in admin --help"
+        );
+        assert!(ADMIN_HELP.contains("pull-outbox <DIR>"));
+        assert!(ADMIN_HELP.contains("outbox:read"));
+        for text in [HELP, ADMIN_HELP] {
+            assert!(!text.contains("http://") && !text.contains("https://"));
         }
     }
 

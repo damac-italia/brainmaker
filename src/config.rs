@@ -48,6 +48,12 @@ pub const DEFAULT_OUTBOX_PATH: &str = "outbox";
 /// Default route that names the operator of this client.
 pub const DEFAULT_WHOAMI_PATH: &str = "whoami";
 
+/// Default route of the notes that wait for the admin.
+pub const DEFAULT_ADMIN_OUTBOX_PATH: &str = "admin/outbox";
+
+/// Default route of the fleet view.
+pub const DEFAULT_ADMIN_CLIENTS_PATH: &str = "admin/clients";
+
 /// Length of a content hash, in characters.
 pub const HASH_LEN: usize = 8;
 
@@ -141,11 +147,11 @@ impl Credentials {
     }
 }
 
-/// The seven routes this client asks for, each relative to a base URL.
+/// The nine routes this client asks for, each relative to a base URL.
 ///
 /// No route name is required in the provisioning file. An absent key takes the
 /// generic default above, so a deployment that does not want its route names in
-/// a public repository sets all seven and the repository learns nothing.
+/// a public repository sets all nine and the repository learns nothing.
 #[derive(Debug, Clone)]
 pub struct Routes {
     token: String,
@@ -155,6 +161,8 @@ pub struct Routes {
     software_binary: String,
     outbox: String,
     whoami: String,
+    admin_outbox: String,
+    admin_clients: String,
 }
 
 impl Default for Routes {
@@ -167,12 +175,14 @@ impl Default for Routes {
             software_binary: DEFAULT_SOFTWARE_BINARY_PATH.to_string(),
             outbox: DEFAULT_OUTBOX_PATH.to_string(),
             whoami: DEFAULT_WHOAMI_PATH.to_string(),
+            admin_outbox: DEFAULT_ADMIN_OUTBOX_PATH.to_string(),
+            admin_clients: DEFAULT_ADMIN_CLIENTS_PATH.to_string(),
         }
     }
 }
 
 impl Routes {
-    /// Reads the seven routes from one source, and checks each one.
+    /// Reads the nine routes from one source, and checks each one.
     ///
     /// `value` returns the configured route for a key, or `None` for the
     /// default.
@@ -189,6 +199,8 @@ impl Routes {
                 provision::KEY_SOFTWARE_BINARY_PATH => routes.software_binary = checked,
                 provision::KEY_OUTBOX_PATH => routes.outbox = checked,
                 provision::KEY_WHOAMI_PATH => routes.whoami = checked,
+                provision::KEY_ADMIN_OUTBOX_PATH => routes.admin_outbox = checked,
+                provision::KEY_ADMIN_CLIENTS_PATH => routes.admin_clients = checked,
                 _ => {}
             }
         }
@@ -243,7 +255,7 @@ fn check_credential_value(key: &str, value: &str) -> Result<()> {
 ///
 /// `provision::read` already checked the base URLs and the credential set.
 /// This adds the two checks that live in this module: the character rules on
-/// the credentials, and the rules on the seven routes. It runs before the
+/// the credentials, and the rules on the nine routes. It runs before the
 /// store is written, so a file that fails leaves the previous store, and the
 /// file itself, in place.
 fn check_importable(settings: &Settings) -> Result<()> {
@@ -633,6 +645,11 @@ impl Config {
         self.layout.operator_file()
     }
 
+    /// File that one admin command locks while it collects notes.
+    pub fn admin_lock_file(&self) -> PathBuf {
+        self.layout.admin_lock_file()
+    }
+
     /// URL that returns the latest content hash as JSON.
     pub fn latest_url(&self) -> String {
         join(&self.base_url, &self.routes.content_latest)
@@ -677,6 +694,36 @@ impl Config {
         join(&self.base_url, &self.routes.whoami)
     }
 
+    /// URL of one page of the notes that wait for the admin, at most `limit`.
+    pub fn admin_outbox_url(&self, limit: u32) -> String {
+        format!(
+            "{}?limit={limit}",
+            join(&self.base_url, &self.routes.admin_outbox)
+        )
+    }
+
+    /// URL that acknowledges collected notes.
+    pub fn admin_ack_url(&self) -> String {
+        join(&self.base_url, &format!("{}/ack", self.routes.admin_outbox))
+    }
+
+    /// URL of the fleet view.
+    pub fn admin_clients_url(&self) -> String {
+        join(&self.base_url, &self.routes.admin_clients)
+    }
+
+    /// URL of the newest `limit` rows of one client's sync log. Check the
+    /// client ID first: it becomes a path segment.
+    pub fn admin_syncs_url(&self, client_id: &str, limit: u32) -> String {
+        format!(
+            "{}?limit={limit}",
+            join(
+                &self.base_url,
+                &format!("{}/{client_id}/syncs", self.routes.admin_clients)
+            )
+        )
+    }
+
     /// URL of the token endpoint, or `None` when no credential is configured.
     pub fn token_url(&self) -> Option<String> {
         self.credentials
@@ -704,10 +751,11 @@ impl Config {
     pub fn credentials_summary(&self) -> String {
         match self.credentials.as_ref() {
             Some(credentials) => format!(
-                "client-credentials grant, scope {}, and {} for the outbox, client id {} \
-                 characters, secret {} characters",
+                "client-credentials grant, scope {}, {} for the outbox, and {} for the admin \
+                 commands, client id {} characters, secret {} characters",
                 auth::SCOPE_SYNC,
                 auth::SCOPE_OUTBOX_WRITE,
+                auth::SCOPE_OUTBOX_READ,
                 credentials.client_id.chars().count(),
                 credentials.client_secret.chars().count()
             ),

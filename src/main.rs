@@ -18,6 +18,7 @@
 
 //! brainmaker keeps `~/.brainmaker/content/` in step with the content API.
 
+mod admin;
 mod archive;
 mod auth;
 mod cli;
@@ -62,11 +63,15 @@ fn main() -> ExitCode {
             print!("{}", cli::HELP);
             return ExitCode::SUCCESS;
         }
+        Action::AdminHelp => {
+            print!("{}", cli::ADMIN_HELP);
+            return ExitCode::SUCCESS;
+        }
         Action::Version => {
             println!("brainmaker {}", selfupdate::CURRENT_VERSION);
             return ExitCode::SUCCESS;
         }
-        Action::Run(args) => args,
+        Action::Run(args) => *args,
     };
 
     match run(&args) {
@@ -80,8 +85,14 @@ fn main() -> ExitCode {
 
 fn run(args: &Args) -> Result<()> {
     let quiet = args.quiet;
+    // With --json, standard output holds the document and nothing else, so
+    // every other line goes to standard error.
+    let json = args.json;
     let log = move |message: &str| {
-        if !quiet {
+        if quiet {
+        } else if json {
+            eprintln!("{message}");
+        } else {
             println!("{message}");
         }
     };
@@ -129,7 +140,68 @@ fn run(args: &Args) -> Result<()> {
         Command::SelfUpdate => self_update(&config, args, &log),
         Command::Sync => sync_command(&config, args, &log),
         Command::Push => push(&config, &log),
+        Command::AdminPullOutbox => admin_pull_outbox(&config, args, &log),
+        Command::AdminStatus => admin_status(&config, args),
+        Command::AdminSyncs => admin_syncs(&config, args),
     }
+}
+
+/// `admin pull-outbox <DIR>`. It fails when a note could not be written; that
+/// note stays on the server for the next run.
+fn admin_pull_outbox(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> {
+    let dir = args
+        .target
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .context("admin pull-outbox needs the directory to write the notes into")?;
+    let pulled = admin::pull_outbox(config, &dir, log)?;
+    log(&format!(
+        "Collected {} note(s) into {}, and the server marked {} as collected.",
+        pulled.written.len(),
+        dir.display(),
+        pulled.acked
+    ));
+    if !pulled.failed.is_empty() {
+        bail!(
+            "{} note(s) could not be written, and stay on the server for the next run",
+            pulled.failed.len()
+        );
+    }
+    Ok(())
+}
+
+/// `admin status`, as lines or, with `--json`, as the admin's brief.
+fn admin_status(config: &Config, args: &Args) -> Result<()> {
+    let state = admin::team_state(&admin::fleet(config)?);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    } else {
+        for line in admin::status_lines(&state) {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// `admin syncs <OPERATOR>` and `admin syncs --client <CLIENT-ID>`.
+fn admin_syncs(config: &Config, args: &Args) -> Result<()> {
+    let selector = match (&args.client, &args.target) {
+        (Some(client), _) => admin::Selector::Client(client.clone()),
+        (None, Some(operator)) => admin::Selector::Operator(operator.clone()),
+        (None, None) => bail!("admin syncs needs an operator, or --client <CLIENT-ID>"),
+    };
+    let limit = args.limit.unwrap_or(cli::DEFAULT_SYNCS_LIMIT);
+    let rows = admin::syncs(config, &selector, limit)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if rows.is_empty() {
+        println!("The server logs no sync for it.");
+    } else {
+        for row in &rows {
+            println!("{}", admin::sync_line(row));
+        }
+    }
+    Ok(())
 }
 
 /// `sync`: the content step, then the outbox steps, then the software check.

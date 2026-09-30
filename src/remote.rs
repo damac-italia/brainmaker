@@ -147,9 +147,51 @@ fn fetch_text_with(
     limit: u64,
     headers: &[(&str, String)],
 ) -> Result<String> {
+    get_text(config, url, limit, headers, auth::SCOPE_SYNC)
+}
+
+/// Reads a URL as text, with an `outbox:read` token. The admin commands read
+/// through this.
+pub fn fetch_admin(config: &Config, url: &str, limit: u64) -> Result<String> {
+    get_text(config, url, limit, &[], auth::SCOPE_OUTBOX_READ)
+}
+
+/// Posts a JSON body with an `outbox:read` token, and returns the answer as
+/// text. A status outside 2xx is an error.
+pub fn post_admin(config: &Config, url: &str, body: &str, limit: u64) -> Result<String> {
+    let agent = build_agent(TEXT_TIMEOUT);
+    let mut request = agent
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json");
+    if let Some(token) = auth::bearer(config, auth::SCOPE_OUTBOX_READ)? {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let mut response = request
+        .send(body)
+        .map_err(describe)
+        .with_context(|| format!("cannot post to {url}"))?;
+    check_status(&mut response, auth::SCOPE_OUTBOX_READ)
+        .with_context(|| format!("cannot post to {url}"))?;
+    response
+        .body_mut()
+        .with_config()
+        .limit(limit)
+        .read_to_string()
+        .with_context(|| format!("cannot read the response body from {url}"))
+}
+
+/// Reads a URL as text with a token for `scope`, and the extra `headers`.
+fn get_text(
+    config: &Config,
+    url: &str,
+    limit: u64,
+    headers: &[(&str, String)],
+    scope: &str,
+) -> Result<String> {
     let agent = build_agent(TEXT_TIMEOUT);
     let mut request = agent.get(url);
-    if let Some(token) = auth::bearer(config, auth::SCOPE_SYNC)? {
+    if let Some(token) = auth::bearer(config, scope)? {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
     for (name, value) in headers {
@@ -161,7 +203,7 @@ fn fetch_text_with(
         .map_err(describe)
         .with_context(|| format!("cannot read {url}"))?;
 
-    check_status(&mut response).with_context(|| format!("cannot read {url}"))?;
+    check_status(&mut response, scope).with_context(|| format!("cannot read {url}"))?;
 
     response
         .body_mut()
@@ -189,7 +231,8 @@ pub fn download(config: &Config, url: &str, dest: &Path, limit: u64) -> Result<u
         .with_context(|| format!("cannot download {url}"))?;
 
     // Before the file is created, so that an error body never lands in `dest`.
-    check_status(&mut response).with_context(|| format!("cannot download {url}"))?;
+    check_status(&mut response, auth::SCOPE_SYNC)
+        .with_context(|| format!("cannot download {url}"))?;
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -338,8 +381,9 @@ pub fn build_agent(total_timeout: Duration) -> ureq::Agent {
 /// The message names the status and, when the server sent one, the server's
 /// own explanation. A 404 from the content route then reads
 /// `no content release is published` rather than the bare status, which tells
-/// an operator that the server is reachable and simply empty.
-fn check_status(response: &mut ureq::http::Response<ureq::Body>) -> Result<()> {
+/// an operator that the server is reachable and simply empty. `scope` is the
+/// scope of the token that the request carried.
+fn check_status(response: &mut ureq::http::Response<ureq::Body>, scope: &str) -> Result<()> {
     let status = response.status();
     if status.is_success() {
         return Ok(());
@@ -349,9 +393,8 @@ fn check_status(response: &mut ureq::http::Response<ureq::Body>) -> Result<()> {
     let headline = match code {
         401 | 403 => format!(
             "the server rejected the request with HTTP {code}; check that {} is configured, and \
-             that the client may read this route with the scope {}",
+             that the client may read this route with the scope {scope}",
             crate::config::CLIENT_ID_ENV,
-            auth::SCOPE_SYNC
         ),
         404 => "the server returned HTTP 404 Not Found".to_string(),
         _ => format!("the server returned HTTP {code}"),
