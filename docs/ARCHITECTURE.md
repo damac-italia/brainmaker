@@ -1,7 +1,8 @@
 # Architecture
 
 `brainmaker` is one Rust binary. It has no background process, no plugin
-system, and no local database. One invocation loads settings, gets one access token for each scope
+system, and no local database. The same binary carries the admin commands, which the admin runs in
+a root of its own. One invocation loads settings, gets one access token for each scope
 that it needs, makes a bounded number of further HTTP requests, writes the filesystem, and exits.
 A `sync` makes at most three requests for the content and the software, one for the operator name,
 and one for each note that is ready in the outbox. `uninstall` is the exception: it loads no
@@ -23,6 +24,7 @@ under the `sign` feature and never ships.
 | [`src/secretstore.rs`](../src/secretstore.rs) | Seal and open the stored settings, report what binds them to the machine, restrict file modes | `ring` |
 | [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, the signed content release, the note upload, `whoami`, and the removal of control characters from server text | `auth`, `config`, `digest`, `signature`, `ureq` |
 | [`src/outbox.rs`](../src/outbox.rs) | The note rules, the checks of the upload path, push, the moves to `sent/` and `rejected/`, the counts, the report headers, and the operator file | `auth`, `config`, `lock`, `remote`, `selfupdate`, `state` |
+| [`src/admin.rs`](../src/admin.rs) | The admin commands: `pull-outbox` with its frontmatter stamp and its no-replace write, the fleet view and the admin's shape of it, and the merged sync log | `auth`, `config`, `lock`, `outbox`, `remote` |
 | [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `digest`, `lock`, `outbox`, `remote`, `state` |
 | [`src/archive.rs`](../src/archive.rs) | Zip extraction and its safety checks | `config`, `zip` |
 | [`src/state.rs`](../src/state.rs) | `state.json` read and atomic write | `serde_json` |
@@ -52,6 +54,10 @@ graph LR
     main --> state
     main --> uninstall
     main --> outbox
+    main --> admin
+    admin --> remote
+    admin --> lock
+    admin --> outbox
     config --> auth
     config --> provision
     config --> secretstore
@@ -92,6 +98,7 @@ Six boundaries separate the trusted code from data it does not control.
 | Network to disk | The content hash, the zip archive, the software manifest, the replacement binary | `signature::verify`, `config::validate_hash`, `archive::extract`, `version::validate`, `Build::checksum` |
 | Network to disk | The operator name, and the month and the reason in the answer to a note | `outbox::update_operator`, which writes only a name that matches the operator rule; `received_month`, which gives `unknown` for any other shape; `remote::printable` |
 | Disk to network | The notes in the outbox | `outbox::check` and `read_capped`: a regular file and no symbolic link, the name rule, the 64 KiB cap, UTF-8, the frontmatter rules, and 60 seconds with no change |
+| Network to disk | The notes that `admin pull-outbox` writes | `admin::place`, which checks every value again and the SHA-256 of the text; `admin::stamp`; `admin::write_new`, which never replaces a file |
 | Network to a header | The access token | `auth::check_token`, which refuses a token that holds a control character |
 | Provisioning file to store | The endpoints and the client credentials | `provision::parse`, `Settings::validate`, `provision::check_credential_set`, `url::check_base_url`, `Credentials::new` |
 | Store to process | The sealed settings | `secretstore::open`, which authenticates the file before it returns bytes |
@@ -260,6 +267,26 @@ The tradeoffs: every run costs one extra HTTP request, the server must serve a t
 provisioning file now carries three credential keys rather than one. `provision::check_credential_set`
 therefore requires all three or none, so a half-configured file fails at load rather than at the
 first HTTP 401.
+
+### The admin commands live in the same binary
+
+`brainmaker admin pull-outbox`, `admin status`, and `admin syncs` are commands of this binary, not of
+a second one. The crate has no library target, so a second binary would have to include `config`,
+`auth`, `remote`, and more by path. The server enforces what a token may read, so the commands grant
+nothing by themselves. The admin's copy uses its own root, `~/.brainmaker-admin`, never runs `link`,
+and holds `sync` and `outbox:read`: `sync` lets it run `self-update`, and `outbox:read` lets it read
+the notes and the fleet.
+
+`pull-outbox` never replaces a file, and it acknowledges only the notes that are on disk. It always
+writes `author` and `review_flags` from the server's values, so the operator can neither choose the
+name on a note nor clear a flag. A note that cannot be written stays on the server for the next run.
+
+The admin commands print the client IDs that the server reports. That is the one exception to the
+rule against printing a client identifier, and the credential of the machine that runs them is
+never printed.
+
+The tradeoff: every laptop carries code that only the admin runs. It is small, and it does nothing
+without a credential that holds `outbox:read`.
 
 ### Push runs inside `sync`, after the content step
 

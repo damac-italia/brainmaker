@@ -1,7 +1,7 @@
 # API
 
-`brainmaker` exposes a command-line surface, and it consumes seven HTTP routes. Both are described
-here. The crate is a binary, not a library, so it exports nothing to other Rust code.
+`brainmaker` exposes a command-line surface, and it consumes the HTTP routes that nine route keys
+name. Both are described here. The crate is a binary, not a library, so it exports nothing to other Rust code.
 
 ## Command-line surface
 
@@ -16,6 +16,10 @@ brainmaker [COMMAND] [OPTIONS]
 | `sync` | Update the content when the server has a newer version. The default when no command is given. Then ask the server for the operator name, and send the notes in the outbox. | `content/`, `state.json`, `operator`, `outbox/`, `push.json` |
 | `status` | Print the installed hash, the latest hash, both software versions, the operator, and the notes in the outbox | nothing |
 | `push` | Send the notes in the outbox now | `outbox/`, `push.json` |
+| `admin pull-outbox <DIR>` | Write each note that waits on the server into `DIR`, and mark it as collected | files in `DIR` |
+| `admin status` | Print the fleet: one line per operator, then one per client that no operator holds | nothing |
+| `admin syncs <OPERATOR>` | Print the syncs of every client of `OPERATOR`, newest first | nothing |
+| `admin syncs --client <CLIENT-ID>` | Print the syncs of one client, newest first | nothing |
 | `self-update` | Replace this binary with the newest build for this platform | the binary |
 | `link` | Bridge the synced content into `~/.claude`, and create the outbox. On macOS, also install and load the hourly LaunchAgent. | `~/.claude/skills`, `settings.json`, `CLAUDE.md`, `~/Library/LaunchAgents/it.damac.brainmaker.plist`, `outbox/` |
 | `unlink` | Remove what `link` wrote, and nothing else | the same four |
@@ -23,6 +27,8 @@ brainmaker [COMMAND] [OPTIONS]
 | `session-context` | Print the `SessionStart` JSON the linked hook returns | nothing |
 
 The parser accepts one command. A second command is an error, and so is any unrecognised argument.
+`admin` takes one subcommand, `pull-outbox`, `status`, or `syncs`, and `pull-outbox` and `syncs`
+take one value after it. `brainmaker admin --help` prints the admin help.
 
 `link` and `unlink` replace `settings.json` and `CLAUDE.md` through a temporary file and a rename.
 They exit 1 and leave the file as it is when it exists but cannot be read as text, and when
@@ -44,6 +50,9 @@ the root holds a control character, because the hook command cannot carry it.
 | `--url` | `<URL>` | all but `uninstall`, which rejects it | Use `URL` as the API base |
 | `--claude-dir` | `<PATH>` | `link`, `unlink`, `uninstall` | Write to `PATH` instead of `~/.claude`. The LaunchAgent is then left alone, unless `--agent-dir` is also given. |
 | `--agent-dir` | `<PATH>` | `link`, `unlink`, `uninstall` | Write the LaunchAgent to `PATH` instead of `~/Library/LaunchAgents`, and do not load it |
+| `--json` | none | `admin status`, `admin syncs` | Print JSON on stdout. Every other line goes to stderr. |
+| `--limit` | `<N>` | `admin syncs` | Print at most `N` rows, from 1 to 1000. Default: 50. |
+| `--client` | `<CLIENT-ID>` | `admin syncs` | Read one client instead of an operator |
 | `-q`, `--quiet` | none | all | Print errors only |
 | `-h`, `--help` | none | any | Print the help text and exit 0 |
 | `-V`, `--version` | none | any | Print `brainmaker <version>` and exit 0 |
@@ -51,7 +60,8 @@ the root holds a control character, because the hook command cannot carry it.
 The parser enforces the "Applies to" column. An option given with another command exits 1 with
 `<flag> has no effect with <command>; run brainmaker --help`.
 
-`--config`, `--dir`, `--url`, `--claude-dir`, and `--agent-dir` take a value, and each one fails:
+`--config`, `--dir`, `--url`, `--claude-dir`, `--agent-dir`, `--limit`, and `--client` take a value,
+and each one fails:
 
 - when the value is absent, with `<flag> needs a path` or `<flag> needs a URL`;
 - when the value starts with a hyphen, because that is the next option. For a path, the message
@@ -114,6 +124,11 @@ returned.
 could not be reached. It exits 0 when every ready note was sent or rejected, when no note waits,
 and when another run holds the push lock.
 
+`admin pull-outbox` exits 1 when a note could not be written. That note stays on the server,
+unacknowledged, for the next run. It also exits 1 when `DIR` is not a directory, and when another
+admin command holds `.admin.lock`. Every admin command exits 1 when the issuer does not grant the
+scope `outbox:read`, with `this credential cannot read the outbox`.
+
 `uninstall` exits 0 and removes nothing when the answer to its question is not `y` or `yes`. It
 exits 1 when stdin is not a terminal and `--yes` is absent. A removal that fails part-way exits 1
 with part of the install already gone; run the command again to finish.
@@ -162,7 +177,7 @@ the run prints a notice and the path to delete after the command exits.
 | `settings` | `imported from <path>`, `read from the sealed store`, or `read from the environment` |
 | `api base` | The base URL in use |
 | `token url` | The token endpoint in use, or `<none>` |
-| `auth` | `absent`, or `client-credentials grant, scope sync, and outbox:write for the outbox, client id N characters, secret N characters`. Never a credential itself. |
+| `auth` | `absent`, or `client-credentials grant, scope sync, outbox:write for the outbox, and outbox:read for the admin commands, client id N characters, secret N characters`. Never a credential itself. |
 | `key` | `release` or `development`, naming which build key this binary carries |
 | `binding` | What ties the sealed store to this machine: `machine identifier`, `home directory path (weak)`, or `none (weak)`. A `(weak)` value means a copy of `config.enc` opens on another machine. |
 | `signing` | Both key counts, as `N trusted software key(s), N trusted content key(s)`. `0` software keys means it installs no update; `0` content keys means it installs no content. |
@@ -254,6 +269,96 @@ A run that sent at least one note writes `<root>/push.json` through a temporary 
 { "last_push_at_unix": 1790500000, "last_push_notes": 2 }
 ```
 
+### `admin pull-outbox <DIR>`
+
+1. `DIR` must be a directory. Otherwise the command writes nothing and exits 1.
+2. The command takes `<root>/.admin.lock` without waiting.
+3. It reads one page of 100 notes from `GET {base}/{admin outbox route}?limit=100`.
+4. For each note it checks again the operator, the client ID, the note name, `received_at`, the kind,
+   the domain, each flag, the size, and the SHA-256 of the text. A note that fails one stays on the
+   server.
+5. It names the file `<YYYY-MM-DD>-<operator>-<name>`, where the date is the first 10 characters of
+   `received_at`.
+6. It sets `author: <operator>` and `review_flags: [<flags>]`, or `review_flags: []`, in the
+   frontmatter. A key that is present gives way, with the indented and list lines under it, to the
+   new line in its place. A key that is absent goes right after the opening `---`. The note's own
+   line end is kept.
+7. It writes a temporary file in `DIR`, flushes it, and hard-links it to the final name, so an
+   existing file is never replaced. A name that holds the same bytes counts as written. A name that
+   holds other bytes gets `-2`, `-3`, and so on before `.md`.
+8. It posts the ids of the notes on disk to `POST {base}/{admin outbox route}/ack`, then reads the
+   next page.
+9. It stops at a page with no note, at a page that brings no note to disk, or after 1000 notes.
+
+### `admin status` output
+
+Without `--json`, one line per operator, then one line per client that no operator holds. A value
+the server does not know prints as `-`.
+
+```text
+gabriele  last sync 2026-09-29T20:00:03+02:00  version 0.1.8  platform darwin-arm64  waiting 0  sent in 7 days 3
+unregistered  brainmaker-sync-old  last sync 2026-09-20T09:00:00+02:00  ip 198.51.100.4
+```
+
+With `--json`, the command prints this shape. A key without a value is left out.
+
+```json
+{
+  "generated_at": "2026-09-29T21:00:00+02:00",
+  "bundle": { "version": "a377aa94", "published_at": "2026-09-29T18:00:00+02:00", "files": 641 },
+  "operators": {
+    "gabriele": {
+      "client_id": "brainmaker-sync-gabriele",
+      "platform": "darwin-arm64",
+      "brainmaker_version": "0.1.8",
+      "content_version": "a377aa94",
+      "last_sync_at": "2026-09-29T20:00:03+02:00",
+      "last_push_at": "2026-09-29T18:12:40+02:00",
+      "notes_pushed_total": 12,
+      "notes_pushed_7d": 3,
+      "outbox_pending": 0,
+      "clients": [
+        {
+          "client_id": "brainmaker-sync-gabriele",
+          "retired": false,
+          "platform": "darwin-arm64",
+          "brainmaker_version": "0.1.8",
+          "content_version": "a377aa94",
+          "last_sync_at": "2026-09-29T20:00:03+02:00",
+          "last_ip": "203.0.113.7"
+        }
+      ]
+    }
+  },
+  "unregistered": [
+    { "client_id": "brainmaker-sync-old", "last_sync_at": "2026-09-20T09:00:00+02:00", "last_ip": "198.51.100.4" }
+  ]
+}
+```
+
+| Field | Source |
+|---|---|
+| `last_sync_at` | The server's `last_seen_at` |
+| `client_id`, `platform`, `brainmaker_version`, `content_version`, `last_sync_at`, `outbox_pending` | The operator's most recently seen client that is not retired |
+| `last_push_at`, `notes_pushed_total`, `notes_pushed_7d` | All of the operator's clients |
+| `platform` | Brainmaker's platform key, such as `darwin-arm64` |
+
+Every time passes through as the server sent it, in its report time zone with the offset. The
+command checks the shape of each time, and compares two times by the instant that each one names.
+
+### `admin syncs` output
+
+One line per sync, newest first: the time, the client ID, the status that `content/latest`
+answered, the IP address, the platform, the version, and the installed content.
+
+```text
+2026-09-29T20:00:03+02:00  brainmaker-sync-gabriele  200  203.0.113.7  darwin-arm64  0.1.8  a377aa94
+```
+
+With `--json`, the command prints the rows as a JSON array. Each row holds `client_id`, `id`, `at`,
+`status`, `ip`, `user_agent`, `platform`, `brainmaker_version`, `content_version`, and
+`outbox_pending`, and a key without a value is left out.
+
 ### The operator file
 
 When a `sync` run received a `sync` token, it asks `GET {base}/{whoami route}`. A name in the answer
@@ -264,14 +369,14 @@ a security control.
 
 ## HTTP routes the server must serve
 
-Six routes sit under `BRAINMAKER_API_BASE`. One further route, the token endpoint, sits under
+Ten routes sit under `BRAINMAKER_API_BASE`. One further route, the token endpoint, sits under
 `SWETSI_JWT_ENDPOINT`. The two hosts may differ. Serve them all over TLS: `brainmaker` refuses a
 plain-HTTP URL unless its host is this machine. `brainmaker` sends `Authorization: Bearer <token>`
 on every request under the base URL when a credential is configured, and sends the `User-Agent`
 `brainmaker/<version>`.
 
 Every route name below is the default. Each one has a key in the provisioning file, so a deployment
-can serve these seven requests at any path it likes:
+can serve these requests at any path it likes:
 
 | Route | Key | Default |
 |---|---|---|
@@ -282,6 +387,10 @@ can serve these seven requests at any path it likes:
 | Replacement binary | `BRAINMAKER_SOFTWARE_BINARY_PATH` | `software/brainmaker-{version}-{platform}{ext}` |
 | Note upload | `BRAINMAKER_OUTBOX_PATH` | `outbox`, then `/<note name>` |
 | Operator name | `BRAINMAKER_WHOAMI_PATH` | `whoami` |
+| Notes for the admin, and their acknowledgement | `BRAINMAKER_ADMIN_OUTBOX_PATH` | `admin/outbox`, and `/ack` under it |
+| Fleet view, and one client's sync log | `BRAINMAKER_ADMIN_CLIENTS_PATH` | `admin/clients`, and `/<client_id>/syncs` under it |
+
+A laptop package never carries the two admin keys. Only the admin commands read them.
 
 `brainmaker` substitutes `{hash}`, `{version}`, `{platform}`, and `{ext}`. `{ext}` is `.exe` on
 Windows and empty everywhere else. A route is a path under its base URL: a value holding `://`, a
@@ -301,7 +410,8 @@ grant_type=client_credentials&scope=sync
 ```
 
 `brainmaker` names one scope in every request rather than relying on a server default: `sync` for
-every read, and `outbox:write` for the notes, asked for only when a note is ready. It keeps one
+every read, `outbox:write` for the notes, asked for only when a note is ready, and `outbox:read` for
+the admin commands. It keeps one
 token per scope for the run. An answer of `400` or `401` whose body is `{"error": "invalid_scope"}`
 means the issuer does not grant that scope to the client: the push stops with a notice, and the
 sync is not affected.
@@ -471,6 +581,35 @@ the file as it is on disk, with `Content-Type: text/markdown; charset=utf-8`.
 The client reads the answer body up to 64 KiB. It removes every control character from the reason
 before the reason reaches a file or the terminal.
 
+### `GET {base}/{admin outbox route}?limit=<N>`
+
+Returns the notes that nobody acknowledged, oldest first, with an `outbox:read` token.
+
+```json
+{ "notes": [ { "id": "5b1c…", "operator": "gabriele", "client_id": "brainmaker-sync-gabriele",
+  "name": "2026-09-29-lezioni-damac-firma.md", "kind": "fact", "domain": "damac", "flags": ["iban"],
+  "sha256": "…", "size_bytes": 812, "received_at": "2026-09-29T18:12:40+02:00", "body": "---\n…" } ] }
+```
+
+The client asks for 100 notes a page, and reads a page up to 8 MiB. A field that it does not know
+fails the command.
+
+### `POST {base}/{admin outbox route}/ack`
+
+Marks notes as collected, with an `outbox:read` token. The body is `{"ids": [...]}`, and the answer
+is `{"acked": n}`.
+
+### `GET {base}/{admin clients route}`
+
+Returns the fleet view, with an `outbox:read` token. The client reads it up to 4 MiB, and refuses
+any other shape: a field that it does not know, a client ID or an operator outside its rule, or a
+time of another shape.
+
+### `GET {base}/{admin clients route}/<client_id>/syncs?limit=<N>`
+
+Returns one client's sync log, newest first, with an `outbox:read` token. The client checks the
+client ID before it becomes a path segment, and reads the log up to 4 MiB.
+
 ### Error responses
 
 | Status | Message the client prints |
@@ -510,7 +649,7 @@ its file was created removes that file.
 | `SWETSI_JWT_ENDPOINT` | Base of the OAuth2 routes. The same URL rule applies. A trailing slash is accepted and stripped. |
 | `SWETSI_CLIENT_ID` | Client identifier. Printable ASCII, and no colon. |
 | `SWETSI_CLIENT_SECRET` | Client secret. Printable ASCII. |
-| The seven `*_PATH` keys | Optional. Each is a route under its base URL. A value holding `://`, a `..` segment, or a space fails. A leading `/` is stripped. |
+| The nine `*_PATH` keys | Optional. Each is a route under its base URL. A value holding `://`, a `..` segment, or a space fails. A leading `/` is stripped. |
 | `SWETSI_TOKEN` | Refused. The key names the static token that earlier versions read. A file that carries it, and none of the three credential keys, fails. |
 | `SWETSI_API_BASE` | Refused. The key is now `BRAINMAKER_API_BASE`. A file that carries the old name and not the new one fails. |
 

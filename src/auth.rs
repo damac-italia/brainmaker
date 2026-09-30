@@ -27,8 +27,8 @@
 //! [`crate::config::Config::token_url`] builds the whole URL.
 //!
 //! brainmaker names one scope in each request rather than relying on a
-//! default: `sync` to read content and software, and `outbox:write` to send a
-//! note. A sync token therefore never carries the right to write, and a client
+//! default: `sync` to read content and software, `outbox:write` to send a
+//! note, and `outbox:read` for the admin commands. A sync token therefore never carries the right to write, and a client
 //! whose issuer grants no `outbox:write` still syncs. The issuer answers a
 //! scope it does not grant with `invalid_scope`, which [`InvalidScope`] carries.
 //!
@@ -55,6 +55,10 @@ pub const SCOPE_SYNC: &str = "sync";
 /// The scope that sending a note needs. brainmaker asks for it only when a
 /// note waits in the outbox.
 pub const SCOPE_OUTBOX_WRITE: &str = "outbox:write";
+
+/// The scope that the admin commands need: reading the notes, the fleet view,
+/// and the sync log. A laptop never asks for it.
+pub const SCOPE_OUTBOX_READ: &str = "outbox:read";
 
 /// Lifetime we assume when the response omits `expires_in`. The server issues a
 /// token that lasts 10 minutes.

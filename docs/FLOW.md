@@ -1,11 +1,11 @@
 # Flow
 
-Seven runtime paths matter: loading the settings, getting an access token, the `sync` command, the
-push of the outbox, the `self-update` command, `link` with its hourly agent, and the `uninstall`
-command. `status` reuses
+Eight runtime paths matter: loading the settings, getting an access token, the `sync` command, the
+push of the outbox, the `self-update` command, `link` with its hourly agent, the `uninstall`
+command, and the admin commands. `status` reuses
 the first two paths and then reads both remote endpoints without writing anything. Because it
 writes nothing, an endpoint it cannot reach becomes a value it prints rather than a reason to exit:
-[`main.rs:286`](../src/main.rs) prints `latest    <unknown>` and `state     cannot check: <reason>`.
+[`main.rs:358`](../src/main.rs) prints `latest    <unknown>` and `state     cannot check: <reason>`.
 
 ## Settings load
 
@@ -40,41 +40,41 @@ sequenceDiagram
 
 Steps:
 
-1. [`config.rs:411`](../src/config.rs) resolves the root through
-   [`config.rs:274`](../src/config.rs): `--dir` made absolute, else `~/.brainmaker`.
-2. [`provision.rs:330`](../src/provision.rs) searches up to four locations in order and returns the
+1. [`config.rs:423`](../src/config.rs) resolves the root through
+   [`config.rs:286`](../src/config.rs): `--dir` made absolute, else `~/.brainmaker`.
+2. [`provision.rs:341`](../src/provision.rs) searches up to four locations in order and returns the
    first hit. A `--config` or `$BRAINMAKER_CONFIG` path that is not a file fails the run. The fourth
    location, the working directory, is searched only while `config.enc` does not yet exist.
-3. On a hit, [`config.rs:418`](../src/config.rs) reads the file, and
-   [`config.rs:419`](../src/config.rs) checks the credential values and the seven routes through
-   [`config.rs:249`](../src/config.rs). A file that fails here changes nothing: the previous store
+3. On a hit, [`config.rs:430`](../src/config.rs) reads the file, and
+   [`config.rs:431`](../src/config.rs) checks the credential values and the seven routes through
+   [`config.rs:261`](../src/config.rs). A file that fails here changes nothing: the previous store
    and the file itself stay in place.
-4. [`config.rs:421`](../src/config.rs) seals the parsed settings, and
-   [`config.rs:422`](../src/config.rs) writes `confidential/config.enc` with mode `0600` inside a
+4. [`config.rs:433`](../src/config.rs) seals the parsed settings, and
+   [`config.rs:434`](../src/config.rs) writes `confidential/config.enc` with mode `0600` inside a
    `0700` directory.
-5. [`config.rs:428`](../src/config.rs) logs a warning when the system gives no machine identifier,
+5. [`config.rs:440`](../src/config.rs) logs a warning when the system gives no machine identifier,
    because the store is then bound to the home directory path or to nothing.
-6. [`config.rs:440`](../src/config.rs) removes the plain file. A failed removal logs a warning and
+6. [`config.rs:452`](../src/config.rs) removes the plain file. A failed removal logs a warning and
    the run continues, because the settings are already stored.
-7. With no hit and an existing store, [`config.rs:469`](../src/config.rs) decrypts it. A store from
+7. With no hit and an existing store, [`config.rs:481`](../src/config.rs) decrypts it. A store from
    another machine or another build fails here with a message that tells you to reimport.
-8. [`config.rs:483`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
+8. [`config.rs:495`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
    `SWETSI_CLIENT_ID`, and `SWETSI_CLIENT_SECRET` override the stored values, and
-   [`config.rs:494`](../src/config.rs) lets `--url` override the base URL again.
-9. [`config.rs:498`](../src/config.rs) and [`config.rs:510`](../src/config.rs) fail when no source
+   [`config.rs:506`](../src/config.rs) lets `--url` override the base URL again.
+9. [`config.rs:510`](../src/config.rs) and [`config.rs:522`](../src/config.rs) fail when no source
    supplied a base URL.
-10. [`config.rs:518`](../src/config.rs) fails when the base URL is not `https://`, unless its host
+10. [`config.rs:530`](../src/config.rs) fails when the base URL is not `https://`, unless its host
     is this machine.
-11. [`config.rs:522`](../src/config.rs) checks the merged credential set. Three keys, or none of
+11. [`config.rs:534`](../src/config.rs) checks the merged credential set. Three keys, or none of
     them, passes. Any other count fails and names the missing keys. A configuration that still
     carries `SWETSI_TOKEN` and none of the three fails here.
-12. [`config.rs:534`](../src/config.rs) builds the `Credentials`. It applies the TLS rule to
+12. [`config.rs:546`](../src/config.rs) builds the `Credentials`. It applies the TLS rule to
     `SWETSI_JWT_ENDPOINT`, and it refuses a credential value that cannot go into a header.
-13. [`config.rs:541`](../src/config.rs) reads the seven routes, and the environment overrides one
+13. [`config.rs:553`](../src/config.rs) reads the seven routes, and the environment overrides one
     route at a time. Each absent key takes its default. A route that holds `://`, a `..` segment,
     or a space fails here, because it would leave the base URL.
 
-[`config.rs:478`](../src/config.rs) runs before steps 8 to 13 and fails when a configuration still
+[`config.rs:490`](../src/config.rs) runs before steps 8 to 13 and fails when a configuration still
 carries a key under its old name, such as `SWETSI_API_BASE`.
 
 ## Access token
@@ -107,23 +107,23 @@ sequenceDiagram
 
 Steps:
 
-1. [`auth.rs:189`](../src/auth.rs) returns `Ok(None)` when no credential is configured. The request
+1. [`auth.rs:193`](../src/auth.rs) returns `Ok(None)` when no credential is configured. The request
    then carries no `Authorization` header.
-2. [`auth.rs:193`](../src/auth.rs) returns the cached token for the scope while it stays usable.
-3. [`auth.rs:236`](../src/auth.rs) posts `grant_type=client_credentials&scope=<scope>` with HTTP
-   Basic, and [`auth.rs:245`](../src/auth.rs) reads the response body up to 64 KiB. An answer of 400
+2. [`auth.rs:197`](../src/auth.rs) returns the cached token for the scope while it stays usable.
+3. [`auth.rs:240`](../src/auth.rs) posts `grant_type=client_credentials&scope=<scope>` with HTTP
+   Basic, and [`auth.rs:249`](../src/auth.rs) reads the response body up to 64 KiB. An answer of 400
    or 401 whose `error` is `invalid_scope` becomes `InvalidScope` at
-   [`auth.rs:299`](../src/auth.rs), which a caller can tell apart from every other failure.
-4. [`auth.rs:256`](../src/auth.rs) refuses a `token_type` other than `Bearer`, in any case. A
+   [`auth.rs:303`](../src/auth.rs), which a caller can tell apart from every other failure.
+4. [`auth.rs:260`](../src/auth.rs) refuses a `token_type` other than `Bearer`, in any case. A
    response with no `token_type` passes.
-5. [`auth.rs:275`](../src/auth.rs) refuses a token that is empty, longer than 8192 bytes, or holds
+5. [`auth.rs:279`](../src/auth.rs) refuses a token that is empty, longer than 8192 bytes, or holds
    a character outside printable ASCII.
-6. [`auth.rs:216`](../src/auth.rs) computes how long the client uses the token: `expires_in`, or
+6. [`auth.rs:220`](../src/auth.rs) computes how long the client uses the token: `expires_in`, or
    600 seconds when the response has none, cut to at most one hour, less 30 seconds.
-7. [`auth.rs:199`](../src/auth.rs) caches the token for that scope and that time. A lifetime that
+7. [`auth.rs:203`](../src/auth.rs) caches the token for that scope and that time. A lifetime that
    the clock cannot hold caches nothing, so the next request asks for a new token. The cache never
    reaches the disk.
-8. [`auth.rs:207`](../src/auth.rs) answers whether this run received a token for a scope. The
+8. [`auth.rs:211`](../src/auth.rs) answers whether this run received a token for a scope. The
    outbox steps of `sync` ask it for `sync`, because that token proves that the issuer answered.
 
 A failed token request fails the command that asked for it. During `sync`, that happens before any
@@ -208,10 +208,10 @@ Steps:
     alike.
 16. [`sync.rs:233`](../src/sync.rs) writes `state.json` with the hash and the sequence, only after
     the swap succeeded. The lock is released when `sync` returns.
-17. [`main.rs:140`](../src/main.rs) keeps the result of the content step, and
-    [`main.rs:144`](../src/main.rs) runs the outbox steps, which [Push](#push) describes. Only then
-    does [`main.rs:145`](../src/main.rs) return a content error.
-18. [`main.rs:146`](../src/main.rs) runs the software check unless `--no-update-check` was given.
+17. [`main.rs:212`](../src/main.rs) keeps the result of the content step, and
+    [`main.rs:216`](../src/main.rs) runs the outbox steps, which [Push](#push) describes. Only then
+    does [`main.rs:217`](../src/main.rs) return a content error.
+18. [`main.rs:218`](../src/main.rs) runs the software check unless `--no-update-check` was given.
 
 ### The swap and its rollback
 
@@ -277,15 +277,15 @@ sequenceDiagram
 
 Steps:
 
-1. [`main.rs:165`](../src/main.rs) creates `outbox/` with mode `0700` through
+1. [`main.rs:237`](../src/main.rs) creates `outbox/` with mode `0700` through
    [`outbox.rs:275`](../src/outbox.rs), because a Mac that linked before the outbox existed never
    runs `link` again.
-2. [`main.rs:168`](../src/main.rs) stops the steps when this run received no `sync` token. The
+2. [`main.rs:240`](../src/main.rs) stops the steps when this run received no `sync` token. The
    issuer then did not answer, and a further request would only wait.
-3. [`main.rs:171`](../src/main.rs) asks `whoami`. [`outbox.rs:370`](../src/outbox.rs) writes a name
+3. [`main.rs:243`](../src/main.rs) asks `whoami`. [`outbox.rs:370`](../src/outbox.rs) writes a name
    that matches the operator rule to `operator`, and deletes the file on `null`. A failure prints a
    notice and leaves the file.
-4. [`main.rs:176`](../src/main.rs) runs the push. [`outbox.rs:470`](../src/outbox.rs) takes
+4. [`main.rs:248`](../src/main.rs) runs the push. [`outbox.rs:470`](../src/outbox.rs) takes
    `.outbox.lock` without waiting, and a run that finds it held sends nothing.
 5. [`outbox.rs:477`](../src/outbox.rs) checks each `.md` entry through
    [`outbox.rs:562`](../src/outbox.rs). A symbolic link, and anything that is not a regular file,
@@ -299,7 +299,7 @@ Steps:
    run with a notice, and every note stays.
 8. [`outbox.rs:510`](../src/outbox.rs) orders the notes oldest first, and
    [`outbox.rs:513`](../src/outbox.rs) sends each one through
-   [`remote.rs:254`](../src/remote.rs).
+   [`remote.rs:297`](../src/remote.rs).
 9. A `201` or a `200` moves the note to `sent/<YYYY-MM>/` at [`outbox.rs:524`](../src/outbox.rs).
    The month comes from `received_at`, and [`outbox.rs:657`](../src/outbox.rs) gives `unknown` for
    any other shape. A `400` or a `413` moves it to `rejected/` at
@@ -311,7 +311,7 @@ Steps:
 
 Under `sync`, each failure of these steps prints one `notice:` line, which `--quiet` hides, and the
 exit code stays as the content step decided. `push` alone exits 1 at
-[`main.rs:205`](../src/main.rs) when a note had to stay.
+[`main.rs:277`](../src/main.rs) when a note had to stay.
 
 ## Self-update
 
@@ -412,7 +412,7 @@ sequenceDiagram
 
 Steps:
 
-1. [`main.rs:110`](../src/main.rs) resolves the agent location through
+1. [`main.rs:121`](../src/main.rs) resolves the agent location through
    [`schedule.rs:60`](../src/schedule.rs). `--agent-dir` names a directory that is never loaded.
    Without it, [`schedule.rs:64`](../src/schedule.rs) returns no agent on a system other than
    macOS, or when `--claude-dir` was given.
@@ -467,9 +467,9 @@ sequenceDiagram
 
 Steps:
 
-1. [`main.rs:91`](../src/main.rs) sends `uninstall` down its own path before `Config::load`, so no
+1. [`main.rs:102`](../src/main.rs) sends `uninstall` down its own path before `Config::load`, so no
    setting is read and no provisioning file is imported.
-2. [`main.rs:377`](../src/main.rs) fails when stdin is not a terminal and `--yes` was not given.
+2. [`main.rs:449`](../src/main.rs) fails when stdin is not a terminal and `--yes` was not given.
    Otherwise the question prints past `--quiet`, and any answer but `y` or `yes` exits 0 with
    `Nothing was removed.`
 3. [`uninstall.rs:126`](../src/uninstall.rs) stops the run with nothing changed when the root
@@ -496,3 +496,57 @@ Steps:
 A removal that fails part-way returns the error, and the run exits 1. The marks go last, so the
 next run still recognises the root and removes the rest. `uninstall` takes no lock, so do not run
 it while a `sync` or a `self-update` runs.
+
+## Admin commands
+
+The admin runs these on a copy in a root of its own. Each one loads the settings as every other
+command does, then asks for a token with the scope `outbox:read`.
+
+```mermaid
+sequenceDiagram
+    participant main
+    participant admin
+    participant auth
+    participant API
+    participant dir as DIR
+    main->>admin: pull_outbox(config, DIR, log)
+    admin->>admin: DIR is a directory, take .admin.lock
+    loop until a page is empty or brings nothing to disk, or 1000 notes
+        admin->>auth: bearer(config, outbox:read)
+        admin->>API: GET {base}/{admin outbox route}?limit=100
+        loop each note
+            admin->>admin: check again, compare the SHA-256, stamp author and review_flags
+            admin->>dir: temporary file, then hard link to <date>-<operator>-<name>
+        end
+        admin->>API: POST {base}/{admin outbox route}/ack, the notes on disk
+    end
+```
+
+Steps of `admin pull-outbox`:
+
+1. [`main.rs:157`](../src/main.rs) runs the command with the directory that the parser took.
+2. [`admin.rs:237`](../src/admin.rs) refuses a directory that does not exist, before any request,
+   so a wrong working directory writes nothing.
+3. [`admin.rs:244`](../src/admin.rs) takes `.admin.lock` without waiting.
+4. [`admin.rs:255`](../src/admin.rs) reads one page of 100 notes. `InvalidScope` becomes
+   `this credential cannot read the outbox` at [`admin.rs:175`](../src/admin.rs).
+5. [`admin.rs:317`](../src/admin.rs) checks the operator, the client ID, the name, `received_at`,
+   the kind, the domain, the flags, and the size again, and
+   [`admin.rs:340`](../src/admin.rs) compares the SHA-256 of the text with the one the server
+   stored.
+6. [`admin.rs:347`](../src/admin.rs) takes the date from `received_at`, and
+   [`admin.rs:349`](../src/admin.rs) sets `author` and `review_flags` through
+   [`admin.rs:360`](../src/admin.rs).
+7. [`admin.rs:454`](../src/admin.rs) writes a flushed temporary file and hard-links it at
+   [`admin.rs:482`](../src/admin.rs). A name that holds the same bytes counts as written, and a
+   name that holds other bytes gets a number.
+8. [`admin.rs:287`](../src/admin.rs) acknowledges the notes of the page that are on disk.
+   [`admin.rs:284`](../src/admin.rs) and [`admin.rs:288`](../src/admin.rs) stop the loop.
+9. A note that could not be written stays unacknowledged, and the command exits 1.
+
+`admin status` reads the fleet view through [`admin.rs:559`](../src/admin.rs), which refuses any
+other shape at [`admin.rs:568`](../src/admin.rs), and builds the admin's shape at
+[`admin.rs:656`](../src/admin.rs). `admin syncs` resolves an operator to its clients through the
+same view, reads each client's log, and merges the rows newest first at
+[`admin.rs:843`](../src/admin.rs), by the instant that each time names
+([`admin.rs:85`](../src/admin.rs)).
