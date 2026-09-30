@@ -454,6 +454,8 @@ enum Checked {
     Settling,
     /// Broke a rule, for this reason.
     Refused(String),
+    /// Went away after the listing, as a file that Claude renamed does.
+    Gone,
 }
 
 /// Sends the notes in the outbox, oldest first.
@@ -476,6 +478,7 @@ pub fn push(config: &Config, log: &dyn Fn(&str)) -> Result<Pushed> {
         match check(&name, &path, now) {
             Checked::Ready(note) => ready.push(note),
             Checked::Settling => pushed.settling += 1,
+            Checked::Gone => {}
             Checked::Refused(reason) => {
                 reject(config, &path, &name, &reason)?;
                 log(&format!("Rejected {name}: {reason}"));
@@ -559,6 +562,7 @@ pub fn push(config: &Config, log: &dyn Fn(&str)) -> Result<Pushed> {
 fn check(name: &str, path: &Path, now: SystemTime) -> Checked {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Checked::Gone,
         Err(error) => return Checked::Refused(format!("cannot read the file: {error}")),
     };
     if meta.file_type().is_symlink() {
@@ -581,12 +585,13 @@ fn check(name: &str, path: &Path, now: SystemTime) -> Checked {
         return Checked::Refused(reason);
     }
     let bytes = match read_capped(path, &meta) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
+        Ok(Capped::Bytes(bytes)) => bytes,
+        Ok(Capped::TooLarge) => {
             return Checked::Refused(format!(
                 "the note is larger than the limit of {MAX_NOTE_BYTES} bytes"
             ));
         }
+        Ok(Capped::Gone) => return Checked::Gone,
         Err(reason) => return Checked::Refused(reason),
     };
     match check_note(&bytes) {
@@ -601,13 +606,23 @@ fn check(name: &str, path: &Path, now: SystemTime) -> Checked {
     }
 }
 
-/// Reads a note of at most [`MAX_NOTE_BYTES`] bytes, or `None` for a larger
-/// one.
+/// What [`read_capped`] found.
+enum Capped {
+    Bytes(Vec<u8>),
+    TooLarge,
+    Gone,
+}
+
+/// Reads a note of at most [`MAX_NOTE_BYTES`] bytes.
 ///
 /// The open follows no link that appeared after the check: the file handle
 /// must be the same regular file that `before` describes.
-fn read_capped(path: &Path, before: &fs::Metadata) -> Result<Option<Vec<u8>>, String> {
-    let file = File::open(path).map_err(|error| format!("cannot open the file: {error}"))?;
+fn read_capped(path: &Path, before: &fs::Metadata) -> Result<Capped, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Capped::Gone),
+        Err(error) => return Err(format!("cannot open the file: {error}")),
+    };
     let after = file
         .metadata()
         .map_err(|error| format!("cannot read the file: {error}"))?;
@@ -619,9 +634,9 @@ fn read_capped(path: &Path, before: &fs::Metadata) -> Result<Option<Vec<u8>>, St
         .read_to_end(&mut bytes)
         .map_err(|error| format!("cannot read the file: {error}"))?;
     if bytes.len() as u64 > MAX_NOTE_BYTES {
-        return Ok(None);
+        return Ok(Capped::TooLarge);
     }
-    Ok(Some(bytes))
+    Ok(Capped::Bytes(bytes))
 }
 
 #[cfg(unix)]
@@ -1186,6 +1201,17 @@ mod tests {
         assert!(server.received().is_empty());
         assert_eq!(counts(&config).waiting, 1);
         drop(held);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_note_that_went_away_after_the_listing_is_skipped() {
+        let dir = temp_dir("outbox-gone");
+        let gone = dir.join("2026-09-30-a.md");
+        assert!(matches!(
+            check("2026-09-30-a.md", &gone, SystemTime::now()),
+            Checked::Gone
+        ));
         fs::remove_dir_all(&dir).unwrap();
     }
 

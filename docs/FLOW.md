@@ -285,28 +285,28 @@ Steps:
 3. [`main.rs:171`](../src/main.rs) asks `whoami`. [`outbox.rs:370`](../src/outbox.rs) writes a name
    that matches the operator rule to `operator`, and deletes the file on `null`. A failure prints a
    notice and leaves the file.
-4. [`main.rs:176`](../src/main.rs) runs the push. [`outbox.rs:468`](../src/outbox.rs) takes
+4. [`main.rs:176`](../src/main.rs) runs the push. [`outbox.rs:470`](../src/outbox.rs) takes
    `.outbox.lock` without waiting, and a run that finds it held sends nothing.
-5. [`outbox.rs:475`](../src/outbox.rs) checks each `.md` entry through
-   [`outbox.rs:559`](../src/outbox.rs). A symbolic link, and anything that is not a regular file,
-   is refused at [`outbox.rs:564`](../src/outbox.rs). A file that changed in the last 60 seconds
-   waits, at [`outbox.rs:574`](../src/outbox.rs). Then the name rule, the 64 KiB cap, and the
-   frontmatter rules apply, and [`outbox.rs:614`](../src/outbox.rs) refuses a file that is not the
+5. [`outbox.rs:477`](../src/outbox.rs) checks each `.md` entry through
+   [`outbox.rs:562`](../src/outbox.rs). A symbolic link, and anything that is not a regular file,
+   is refused at [`outbox.rs:568`](../src/outbox.rs). A file that changed in the last 60 seconds
+   waits, at [`outbox.rs:578`](../src/outbox.rs). Then the name rule, the 64 KiB cap, and the
+   frontmatter rules apply, and [`outbox.rs:629`](../src/outbox.rs) refuses a file that is not the
    file that was checked. A refused file moves to `rejected/` through
-   [`outbox.rs:680`](../src/outbox.rs), beside its reason.
-6. [`outbox.rs:486`](../src/outbox.rs) returns when no note is ready, before any request.
-7. [`outbox.rs:490`](../src/outbox.rs) asks for an `outbox:write` token. `InvalidScope` stops the
+   [`outbox.rs:695`](../src/outbox.rs), beside its reason.
+6. [`outbox.rs:489`](../src/outbox.rs) returns when no note is ready, before any request.
+7. [`outbox.rs:493`](../src/outbox.rs) asks for an `outbox:write` token. `InvalidScope` stops the
    run with a notice, and every note stays.
-8. [`outbox.rs:507`](../src/outbox.rs) orders the notes oldest first, and
-   [`outbox.rs:510`](../src/outbox.rs) sends each one through
+8. [`outbox.rs:510`](../src/outbox.rs) orders the notes oldest first, and
+   [`outbox.rs:513`](../src/outbox.rs) sends each one through
    [`remote.rs:254`](../src/remote.rs).
-9. A `201` or a `200` moves the note to `sent/<YYYY-MM>/` at [`outbox.rs:521`](../src/outbox.rs).
-   The month comes from `received_at`, and [`outbox.rs:642`](../src/outbox.rs) gives `unknown` for
+9. A `201` or a `200` moves the note to `sent/<YYYY-MM>/` at [`outbox.rs:524`](../src/outbox.rs).
+   The month comes from `received_at`, and [`outbox.rs:657`](../src/outbox.rs) gives `unknown` for
    any other shape. A `400` or a `413` moves it to `rejected/` at
-   [`outbox.rs:530`](../src/outbox.rs). Every other answer, and a failure to reach the server,
-   keeps it and stops the run at [`outbox.rs:541`](../src/outbox.rs).
-10. [`outbox.rs:696`](../src/outbox.rs) adds `-2`, `-3`, and so on to a name that is taken.
-11. [`outbox.rs:553`](../src/outbox.rs) writes `push.json` when the run sent a note. The lock is
+   [`outbox.rs:533`](../src/outbox.rs). Every other answer, and a failure to reach the server,
+   keeps it and stops the run at [`outbox.rs:544`](../src/outbox.rs).
+10. [`outbox.rs:711`](../src/outbox.rs) adds `-2`, `-3`, and so on to a name that is taken.
+11. [`outbox.rs:556`](../src/outbox.rs) writes `push.json` when the run sent a note. The lock is
     released when `push` returns.
 
 Under `sync`, each failure of these steps prints one `notice:` line, which `--quiet` hides, and the
