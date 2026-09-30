@@ -33,6 +33,22 @@
 //! write: a skill name that already exists as a real directory is reported and
 //! skipped.
 //!
+//! # The admin's install
+//!
+//! Before it writes anything, `link` asks the issuer whether the credential
+//! may read the outbox and whether it may send notes; see
+//! [`crate::auth::grants`]. A credential that reads and cannot send belongs to
+//! the admin who collects the notes. For it, `link` writes the program copy and
+//! an agent that runs `self-update` alone, and connects nothing to Claude: the
+//! briefing is written for operators, and the admin's Claude must not take it
+//! as its own. Any piece of the bridge that an earlier run wrote goes. The
+//! admin needs no content directory, and gets no outbox.
+//!
+//! Every other credential gets the bridge, one with both scopes included, and
+//! so does a run with no credential. A check that gets no clear answer stops
+//! `link` before it changes anything, because a guess could connect the
+//! admin's Claude.
+//!
 //! # What it deliberately leaves out
 //!
 //! The content also ships `PreToolUse`, `PostToolUse`, `PreCompact` and `Stop`
@@ -47,9 +63,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
 
+use crate::auth;
 use crate::config::Config;
 use crate::outbox;
-use crate::schedule::{self, Agents};
+use crate::schedule::{self, Agents, Runs};
 
 /// Largest context this emits, in bytes.
 ///
@@ -129,12 +146,21 @@ pub fn claude_dir() -> Result<PathBuf> {
 }
 
 /// Writes the bridge, and the agent when `agents` names where it goes.
+///
+/// A credential that reads the outbox and cannot send notes gets the admin's
+/// install instead; see the module documentation.
 pub fn link(
     config: &Config,
     claude: &Path,
     agents: Option<&Agents>,
     log: &dyn Fn(&str),
 ) -> Result<Report> {
+    if collects_without_sending(config)? {
+        let program = install_program(config)?;
+        let prefix = command_prefix(&program, Some(config.root()))?;
+        return link_admin(config, claude, agents, &prefix, log);
+    }
+
     let content = config.content_dir();
     if !content.is_dir() {
         bail!(
@@ -151,9 +177,64 @@ pub fn link(
     report.settings_changed = write_settings(claude, Some(&prefix))?;
     report.briefing_changed = write_briefing(&content, claude, Some(&prefix))?;
     if let Some(agents) = agents {
-        report.agent_changed = schedule::install(agents, &prefix, config.root(), log)?;
+        report.agent_changed =
+            schedule::install(agents, &prefix, config.root(), Runs::UpdateAndSync, log)?;
     }
     describe(&report, true, log);
+    Ok(report)
+}
+
+/// True when the issuer lets this credential read the outbox and not send a
+/// note: the admin who collects the notes.
+///
+/// The `outbox:write` request goes out only when `outbox:read` was granted, so
+/// an operator's `link` asks the issuer once. Any failure but `invalid_scope`
+/// is an error, and `link` then changes nothing.
+fn collects_without_sending(config: &Config) -> Result<bool> {
+    let check = || -> Result<bool> {
+        Ok(auth::grants(config, auth::SCOPE_OUTBOX_READ)?
+            && !auth::grants(config, auth::SCOPE_OUTBOX_WRITE)?)
+    };
+    check().context(
+        "cannot learn from the issuer which role this credential holds, so link changed nothing",
+    )
+}
+
+/// The admin's install: the agent that runs `self-update` alone, and no
+/// bridge to Claude.
+///
+/// `prefix` names the program copy, which the caller made. Any skill link,
+/// hook entry, or block that an earlier run wrote goes, because each one puts
+/// the operator briefing in front of the admin's Claude.
+fn link_admin(
+    config: &Config,
+    claude: &Path,
+    agents: Option<&Agents>,
+    prefix: &str,
+    log: &dyn Fn(&str),
+) -> Result<Report> {
+    log("This credential collects the notes and sends none, so link connects nothing to Claude.");
+    let content = config.content_dir();
+    let mut report = Report::default();
+    unlink_skills(&content, claude, &mut report)?;
+    report.settings_changed = write_settings(claude, None)?;
+    report.briefing_changed = write_briefing(&content, claude, None)?;
+    if report.changed() {
+        describe(&report, false, log);
+    }
+    if let Some(agents) = agents {
+        report.agent_changed =
+            schedule::install(agents, prefix, config.root(), Runs::UpdateOnly, log)?;
+        if report.agent_changed {
+            log(&format!(
+                "Wrote the hourly LaunchAgent {}, which runs self-update.",
+                schedule::LABEL
+            ));
+        }
+    }
+    log(&format!(
+        "Collect the notes with: {prefix} admin pull-outbox <DIR>"
+    ));
     Ok(report)
 }
 
@@ -826,6 +907,7 @@ pub fn describe(report: &Report, installing: bool, log: &dyn Fn(&str)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{Route, Server};
 
     #[test]
     fn the_session_context_names_the_operator_and_the_outbox() {
@@ -1625,5 +1707,149 @@ mod tests {
         assert_eq!(floor_char_boundary(&text, 5), 4);
         assert_eq!(floor_char_boundary(&text, 4), 4);
         assert_eq!(floor_char_boundary("abc", 99), 3);
+    }
+
+    // ------------------------------------------------------------ roles ---
+
+    const PREFIX: &str = "\"/opt/bm/bin/brainmaker\" --dir \"/opt/bm\"";
+
+    fn quiet(_: &str) {}
+
+    /// A token endpoint that grants `outbox:read` and `outbox:write`, or
+    /// answers `invalid_scope`, as `read` and `write` say.
+    fn issuer(read: bool, write: bool) -> Server {
+        let answer = |scope: &str, granted: bool| {
+            if granted {
+                Route::token(scope, r#"{"access_token":"t","expires_in":600}"#)
+            } else {
+                Route::token(scope, r#"{"error":"invalid_scope"}"#).status(400)
+            }
+        };
+        Server::start(vec![
+            answer(auth::SCOPE_OUTBOX_READ, read),
+            answer(auth::SCOPE_OUTBOX_WRITE, write),
+        ])
+    }
+
+    fn scopes_asked(server: &Server) -> Vec<String> {
+        server
+            .received()
+            .iter()
+            .filter_map(|request| request.form("scope"))
+            .collect()
+    }
+
+    #[test]
+    fn a_credential_that_reads_and_cannot_send_is_the_admin() {
+        let server = issuer(true, false);
+        let base = temp_dir("role-admin");
+        let config = Config::for_test_with_credentials(&base, &server.base(), &server.base());
+
+        assert!(collects_without_sending(&config).unwrap());
+        assert_eq!(scopes_asked(&server), ["outbox:read", "outbox:write"]);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn an_operator_credential_is_asked_once_and_gets_the_bridge() {
+        let server = issuer(false, true);
+        let base = temp_dir("role-operator");
+        let config = Config::for_test_with_credentials(&base, &server.base(), &server.base());
+
+        assert!(!collects_without_sending(&config).unwrap());
+        assert_eq!(scopes_asked(&server), ["outbox:read"]);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_credential_with_both_scopes_gets_the_bridge() {
+        let server = issuer(true, true);
+        let base = temp_dir("role-both");
+        let config = Config::for_test_with_credentials(&base, &server.base(), &server.base());
+
+        assert!(!collects_without_sending(&config).unwrap());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_run_with_no_credential_gets_the_bridge_and_asks_nobody() {
+        let server = issuer(true, false);
+        let base = temp_dir("role-none");
+        let config = Config::for_test(&base, &server.base());
+
+        assert!(!collects_without_sending(&config).unwrap());
+        assert!(scopes_asked(&server).is_empty());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_role_check_with_no_answer_changes_nothing() {
+        let server = Server::start(vec![
+            Route::token(auth::SCOPE_OUTBOX_READ, "the issuer is down").status(500),
+        ]);
+        let base = temp_dir("role-down");
+        let config = Config::for_test_with_credentials(&base, &server.base(), &server.base());
+        let claude = base.join("claude");
+        let agents = Agents::unloaded(&base.join("LaunchAgents"));
+
+        let error = link(&config, &claude, Some(&agents), &quiet).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("so link changed nothing"),
+            "{error:#}"
+        );
+        assert!(!claude.exists());
+        assert!(!agents.plist().exists());
+        assert!(!installed_program(config.root()).exists());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_admin_install_removes_the_bridge_and_writes_an_update_agent() {
+        let base = temp_dir("admin-install");
+        let config = Config::for_test(&base, "http://127.0.0.1:9");
+        let content = config.content_dir();
+        let claude = base.join("claude");
+        let agents = Agents::unloaded(&base.join("LaunchAgents"));
+        // An earlier link, with an operator's credential, wrote the bridge.
+        content_with_skills(&content, &["query"]);
+        link_skills(&content, &claude, &mut Report::default()).unwrap();
+        write_settings(&claude, Some(PREFIX)).unwrap();
+        write_briefing(&content, &claude, Some(PREFIX)).unwrap();
+
+        let report = link_admin(&config, &claude, Some(&agents), PREFIX, &quiet).unwrap();
+
+        assert_eq!(report.removed, vec!["query".to_string()]);
+        assert!(report.settings_changed && report.briefing_changed && report.agent_changed);
+        assert!(fs::symlink_metadata(claude.join("skills").join("query")).is_err());
+        let settings = fs::read_to_string(claude.join("settings.json")).unwrap();
+        assert!(!settings.contains(MARKER), "{settings}");
+        assert!(!claude.join("CLAUDE.md").exists());
+        let agent = fs::read_to_string(agents.plist()).unwrap();
+        assert!(
+            agent.contains(&format!("{PREFIX} self-update --quiet")),
+            "{agent}"
+        );
+        assert!(!agent.contains(" sync "), "{agent}");
+        assert!(!config.outbox_dir().exists());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_admin_install_needs_no_content_and_touches_no_claude_file() {
+        let base = temp_dir("admin-empty");
+        let config = Config::for_test(&base, "http://127.0.0.1:9");
+        let claude = base.join("claude");
+        let agents = Agents::unloaded(&base.join("LaunchAgents"));
+
+        let report = link_admin(&config, &claude, Some(&agents), PREFIX, &quiet).unwrap();
+
+        assert!(report.agent_changed);
+        assert!(!report.settings_changed && !report.briefing_changed);
+        assert!(!claude.exists());
+        assert!(!config.content_dir().exists());
+        let again = link_admin(&config, &claude, Some(&agents), PREFIX, &quiet).unwrap();
+        assert!(!again.changed(), "a second run changes nothing");
+        fs::remove_dir_all(&base).ok();
     }
 }

@@ -27,7 +27,10 @@ COMMANDS:
     link           Wire the synced content into ~/.claude, so its skills and
                    its session context load in every project, not only in the
                    content directory. On macOS it also installs a LaunchAgent
-                   that runs self-update, then sync, every hour.
+                   that runs self-update, then sync, every hour. For the
+                   admin's credential, which reads the outbox and sends no
+                   notes, it wires nothing, and the LaunchAgent runs
+                   self-update alone.
     unlink         Remove what link wrote, the LaunchAgent included
     uninstall      Remove brainmaker from this machine: what link wrote, then
                    the content, the sealed settings, and the program copy
@@ -111,9 +114,10 @@ USAGE:
     brainmaker admin syncs <OPERATOR> [--limit N] [--json] [OPTIONS]
     brainmaker admin syncs --client <CLIENT-ID> [--limit N] [--json] [OPTIONS]
 
-Every admin command asks for a token with the scope outbox:read. Keep the
-admin copy in a root of its own, such as ~/.brainmaker-admin, with --dir, and
-never run link there.
+Every admin command asks for a token with the scope outbox:read. The admin
+installs from a package into ~/.brainmaker, like everyone else: link sees a
+credential that reads the outbox and sends no notes, and wires nothing into
+~/.claude.
 
 COMMANDS:
     pull-outbox <DIR>

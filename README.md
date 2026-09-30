@@ -131,14 +131,13 @@ treats every push failure as a notice and exits 0; `push` exits 1 when a note st
 
 ### Collect the notes (admin)
 
-The admin who collects the notes runs three more commands, on a copy of this binary in a root of
-its own. Every one asks the issuer for a token with the scope `outbox:read`, and the server decides
-what that token may read.
+The admin who collects the notes runs three more commands. Every one asks the issuer for a token
+with the scope `outbox:read`, and the server decides what that token may read.
 
 ```bash
-brainmaker --dir ~/.brainmaker-admin admin pull-outbox inbox/
-brainmaker --dir ~/.brainmaker-admin admin status --json
-brainmaker --dir ~/.brainmaker-admin admin syncs gabriele
+brainmaker admin pull-outbox inbox/
+brainmaker admin status --json
+brainmaker admin syncs gabriele
 ```
 
 `admin pull-outbox <DIR>` writes each note that waits on the server into `DIR`, which must exist, as
@@ -162,20 +161,18 @@ default, and `--json` prints the rows as JSON.
 These commands print the client IDs that the server reports. No command prints the credential of
 the machine it runs on.
 
-To install the admin copy, put the binary in a fixed place, and import the admin's
-`brainmaker.env` into its own root:
+The admin installs from a package with the one-line command, like everyone else, into
+`~/.brainmaker`. The admin's issuer client holds `sync` and `outbox:read`, never `publish`, and
+`sync` lets the copy run `self-update`. `link` sees that this credential reads the outbox and cannot
+send notes, so it connects nothing to Claude, whose briefing is written for operators. It copies the
+binary to `~/.brainmaker/bin/brainmaker`, and writes an hourly agent that runs `self-update` alone.
+[Let Claude read the content in every session](#let-claude-read-the-content-in-every-session) says
+how `link` decides.
 
-```bash
-/usr/local/bin/brainmaker --dir ~/.brainmaker-admin --config ~/Downloads/brainmaker.env admin status
-```
-
-Do not run the package installer for this copy, because it runs `link`, and never run `link` with
-this root. The admin's issuer client holds `sync` and `outbox:read`, never `publish`. `sync` lets the
-copy run `self-update`:
-
-```bash
-/usr/local/bin/brainmaker --dir ~/.brainmaker-admin self-update --quiet
-```
+One client may hold both roles, with `sync outbox:write outbox:read`. Give both only to a person who
+needs both. That person's Claude reads the content as instructions, and could then read every note.
+And `pull-outbox` marks each note as collected, so a second admin who runs it takes notes away from
+the admin's harvest.
 
 ### Replace the binary
 
@@ -214,6 +211,13 @@ that project is open. `link` bridges it to user scope, so it applies everywhere:
 - A marked block in `~/.claude/CLAUDE.md` naming the content directory.
 - The outbox, `~/.brainmaker/outbox/`, with mode `0700`.
 - On macOS, the hourly LaunchAgent that [Keep it current between sessions](#keep-it-current-between-sessions) describes.
+
+Before it writes anything, `link` asks the issuer which of the two outbox scopes the credential
+holds. A credential with `outbox:read` and without `outbox:write` is the admin's. For it, `link`
+connects nothing to Claude: no skill link, no hook, and no block, and it removes any that an earlier
+run wrote. It copies the binary, and writes an agent that runs `self-update` alone. Every other
+credential gets the list above, one with both scopes included, and so does a run with no
+credential. When the issuer gives no clear answer, `link` stops and changes nothing.
 
 `session-context` prints the JSON that hook returns: the shared briefing and the working notes, each
 file capped so one growing file cannot crowd out the rest, then the operator name, the outbox path,
@@ -286,7 +290,8 @@ date; "/Users/you/.brainmaker/bin/brainmaker" --dir "/Users/you/.brainmaker" sel
 
 So a new signed build reaches every linked Mac within an hour of its promotion, and the content
 stays current when no Claude session starts. `sync` runs even when `self-update` fails. The output
-goes to `~/.brainmaker/agent.log`: one date line per run, and the errors, if any.
+goes to `~/.brainmaker/agent.log`: one date line per run, and the errors, if any. On the admin's
+Mac, the agent runs `self-update` alone, because no Claude there reads the content.
 
 `unlink` and `uninstall` unload the agent and remove the file. With `--claude-dir`, `link` leaves
 the agent alone, so the installer's dry run starts no hourly job; `--agent-dir <PATH>` writes the
@@ -371,8 +376,8 @@ below. Set all nine to keep the route names of a deployment out of this public r
 | `BRAINMAKER_ADMIN_OUTBOX_PATH` | `admin/outbox`, and the acknowledgement at `/ack` under it | `BRAINMAKER_API_BASE` |
 | `BRAINMAKER_ADMIN_CLIENTS_PATH` | `admin/clients`, and one sync log at `/<client_id>/syncs` under it | `BRAINMAKER_API_BASE` |
 
-The two admin keys belong in the admin's `brainmaker.env` alone. A laptop package never carries
-them.
+No package carries the two admin keys, the admin's included, so the admin commands use the
+defaults. Set a key only for a server that names the admin routes differently.
 
 `brainmaker` substitutes `{hash}`, `{version}`, `{platform}`, and `{ext}`. `{ext}` is `.exe` on
 Windows and empty everywhere else.
@@ -438,7 +443,8 @@ To send a note, `brainmaker` asks for a second token, with `scope=outbox:write`,
 is ready. It keeps one token per scope for the run. A sync token therefore never carries the right
 to write, and an issuer that answers `invalid_scope` stops only the push. The admin commands ask for
 `scope=outbox:read`, and an issuer that does not grant it gives the error
-`this credential cannot read the outbox`.
+`this credential cannot read the outbox`. `link` asks for `scope=outbox:read` and, when the issuer
+grants it, for `scope=outbox:write`, to learn whether the credential is the admin's.
 
 ### Options
 

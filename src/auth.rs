@@ -28,9 +28,14 @@
 //!
 //! brainmaker names one scope in each request rather than relying on a
 //! default: `sync` to read content and software, `outbox:write` to send a
-//! note, and `outbox:read` for the admin commands. A sync token therefore never carries the right to write, and a client
-//! whose issuer grants no `outbox:write` still syncs. The issuer answers a
-//! scope it does not grant with `invalid_scope`, which [`InvalidScope`] carries.
+//! note, and `outbox:read` for the admin commands. A sync token therefore
+//! never carries the right to write, and a client whose issuer grants no
+//! `outbox:write` still syncs. The issuer answers a scope it does not grant
+//! with `invalid_scope`, which [`InvalidScope`] carries.
+//!
+//! `link` asks for the two outbox scopes once, through [`grants`], to learn
+//! whether the credential is the admin's. [`crate::link`] says what it does
+//! with the answer.
 //!
 //! # The cache
 //!
@@ -57,7 +62,7 @@ pub const SCOPE_SYNC: &str = "sync";
 pub const SCOPE_OUTBOX_WRITE: &str = "outbox:write";
 
 /// The scope that the admin commands need: reading the notes, the fleet view,
-/// and the sync log. A laptop never asks for it.
+/// and the sync log. Besides them, only `link` asks for it, to learn the role.
 pub const SCOPE_OUTBOX_READ: &str = "outbox:read";
 
 /// Lifetime we assume when the response omits `expires_in`. The server issues a
@@ -210,6 +215,19 @@ pub fn bearer(config: &Config, scope: &str) -> Result<Option<String>> {
 /// the content step ask this before they make a request of their own.
 pub fn received(config: &Config, scope: &str) -> bool {
     config.tokens().received(scope)
+}
+
+/// True when the issuer gives this client a token for `scope`.
+///
+/// An `invalid_scope` answer is false, and so is a run with no credential,
+/// which sends its requests with no token at all. Any other failure is an
+/// error, because it says nothing about what the issuer grants.
+pub fn grants(config: &Config, scope: &str) -> Result<bool> {
+    match bearer(config, scope) {
+        Ok(token) => Ok(token.is_some()),
+        Err(error) if is_invalid_scope(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Returns the time for which this client uses a token.
@@ -625,6 +643,47 @@ mod tests {
             server.requests(),
             vec![("GET".to_string(), "/x".to_string(), String::new())]
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn grants_a_scope_that_the_issuer_answers_with_a_token() {
+        let server = Server::start(vec![
+            Route::token(
+                SCOPE_OUTBOX_READ,
+                r#"{"access_token":"r","expires_in":600}"#,
+            ),
+            Route::token(SCOPE_OUTBOX_WRITE, r#"{"error":"invalid_scope"}"#).status(400),
+        ]);
+        let dir = temp_dir("auth-grants");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        assert!(grants(&config, SCOPE_OUTBOX_READ).unwrap());
+        assert!(!grants(&config, SCOPE_OUTBOX_WRITE).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_credential_grants_nothing_and_asks_nobody() {
+        let server = Server::start(vec![]);
+        let dir = temp_dir("auth-grants-none");
+        let config = Config::for_test(&dir, &server.base());
+
+        assert!(!grants(&config, SCOPE_OUTBOX_READ).unwrap());
+        assert!(server.requests().is_empty());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_token_request_is_an_error_and_not_a_refusal() {
+        let server = serving_token(500, "the issuer is down");
+        let dir = temp_dir("auth-grants-down");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        assert!(grants(&config, SCOPE_OUTBOX_READ).is_err());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

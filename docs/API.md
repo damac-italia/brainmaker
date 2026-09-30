@@ -21,7 +21,7 @@ brainmaker [COMMAND] [OPTIONS]
 | `admin syncs <OPERATOR>` | Print the syncs of every client of `OPERATOR`, newest first | nothing |
 | `admin syncs --client <CLIENT-ID>` | Print the syncs of one client, newest first | nothing |
 | `self-update` | Replace this binary with the newest build for this platform | the binary |
-| `link` | Bridge the synced content into `~/.claude`, and create the outbox. On macOS, also install and load the hourly LaunchAgent. | `~/.claude/skills`, `settings.json`, `CLAUDE.md`, `~/Library/LaunchAgents/it.damac.brainmaker.plist`, `outbox/` |
+| `link` | Bridge the synced content into `~/.claude`, and create the outbox. On macOS, also install and load the hourly LaunchAgent. For the admin's credential, write the LaunchAgent alone, and remove the rest. | `~/.claude/skills`, `settings.json`, `CLAUDE.md`, `~/Library/LaunchAgents/it.damac.brainmaker.plist`, `outbox/` |
 | `unlink` | Remove what `link` wrote, and nothing else | the same four |
 | `uninstall` | Remove what `link` wrote, then what brainmaker wrote under the root, then the root when it is empty. It asks first. | the same four, and the root |
 | `session-context` | Print the `SessionStart` JSON the linked hook returns | nothing |
@@ -35,6 +35,16 @@ They exit 1 and leave the file as it is when it exists but cannot be read as tex
 `CLAUDE.md` holds a marker pair that is not one start marker followed by one end marker. The error
 names the file and the count of each marker. `link` also exits 1 when the path of the program or of
 the root holds a control character, because the hook command cannot carry it.
+
+Before it writes anything, `link` asks the issuer for an `outbox:read` token and, when it gets one,
+for an `outbox:write` token. A credential that gets the first and not the second is the admin's.
+For it, `link` prints
+`This credential collects the notes and sends none, so link connects nothing to Claude.`, removes
+any skill link, hook entry, or block that an earlier run wrote, copies the program, writes the
+LaunchAgent with `self-update` alone, and prints the `admin pull-outbox` command. It creates no
+outbox and needs no content directory. Every other credential, and a run with no credential, gets
+the bridge. When a token request fails for a reason other than `invalid_scope`, `link` exits 1 with
+`cannot learn from the issuer which role this credential holds, so link changed nothing`.
 
 ### Options
 
@@ -80,7 +90,8 @@ date; "<root>/bin/brainmaker" --dir "<root>" self-update --quiet; "<root>/bin/br
 ```
 
 `sync` runs even when `self-update` fails. Both write to `<root>/agent.log`, so the log holds one
-date line per run and the errors, if any. `link` loads the agent with `launchctl bootstrap`; a
+date line per run and the errors, if any. The admin's agent runs `date` and `self-update --quiet`
+only. `link` loads the agent with `launchctl bootstrap`; a
 `launchctl` failure prints a notice and does not fail `link`, because launchd loads the file at the
 next login. An unchanged file is neither rewritten nor reloaded. `unlink` and `uninstall` run
 `launchctl bootout` and remove the file.
@@ -412,7 +423,7 @@ grant_type=client_credentials&scope=sync
 
 `brainmaker` names one scope in every request rather than relying on a server default: `sync` for
 every read, `outbox:write` for the notes, asked for only when a note is ready, and `outbox:read` for
-the admin commands. It keeps one
+the admin commands. `link` asks for the two outbox scopes once, to learn the role. It keeps one
 token per scope for the run. An answer of `400` or `401` whose body is `{"error": "invalid_scope"}`
 means the issuer does not grant that scope to the client: the push stops with a notice, and the
 sync is not affected.

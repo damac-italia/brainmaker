@@ -757,7 +757,14 @@ mod tests {
         let root = base.join("root");
         let layout = installed(&root);
         let agents = Agents::unloaded(&base.join("LaunchAgents"));
-        schedule::install(&agents, "\"/x/bin/brainmaker\"", &root, &quiet).unwrap();
+        schedule::install(
+            &agents,
+            "\"/x/bin/brainmaker\"",
+            &root,
+            schedule::Runs::UpdateAndSync,
+            &quiet,
+        )
+        .unwrap();
         write(
             &schedule::log_path(&root),
             b"Mon Sep 28 17:00:00 CEST 2026\n",
@@ -779,7 +786,14 @@ mod tests {
         write(&root.join("content").join("post.md"), b"mine\n");
         let layout = Layout::resolve(Some(&root)).unwrap();
         let agents = Agents::unloaded(&base.join("LaunchAgents"));
-        schedule::install(&agents, "\"/x/bin/brainmaker\"", &base, &quiet).unwrap();
+        schedule::install(
+            &agents,
+            "\"/x/bin/brainmaker\"",
+            &base,
+            schedule::Runs::UpdateAndSync,
+            &quiet,
+        )
+        .unwrap();
 
         let report = uninstall(&layout, &base.join("claude"), Some(&agents), &quiet).unwrap();
 

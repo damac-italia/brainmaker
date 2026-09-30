@@ -5,10 +5,11 @@
 //!
 //! # Who runs them
 //!
-//! The admin, on a copy of this binary in a root of its own, such as
-//! `~/.brainmaker-admin`, that never runs `link`. Every command asks the issuer
-//! for a token with the scope `outbox:read`. The server decides what that token
-//! may read, so these commands grant nothing by themselves.
+//! The admin, on an install like everyone else's, in `~/.brainmaker`. `link`
+//! connects nothing to Claude there, because the credential reads the outbox
+//! and sends no notes; see [`crate::link`]. Every command asks the issuer for a
+//! token with the scope `outbox:read`. The server decides what that token may
+//! read, so these commands grant nothing by themselves.
 //!
 //! # What they print
 //!

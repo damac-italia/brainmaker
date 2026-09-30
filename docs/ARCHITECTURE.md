@@ -1,8 +1,8 @@
 # Architecture
 
 `brainmaker` is one Rust binary. It has no background process, no plugin
-system, and no local database. The same binary carries the admin commands, which the admin runs in
-a root of its own. One invocation loads settings, gets one access token for each scope
+system, and no local database. The same binary carries the admin commands, which the admin runs on
+an install like everyone else's. One invocation loads settings, gets one access token for each scope
 that it needs, makes a bounded number of further HTTP requests, writes the filesystem, and exits.
 A `sync` makes at most three requests for the content and the software, one for the operator name,
 and one for each note that is ready in the outbox. `uninstall` is the exception: it loads no
@@ -32,7 +32,7 @@ under the `sign` feature and never ships.
 | [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `link`, `lock`, `remote`, `signature`, `version` |
 | [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `ring` |
 | [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `ring` |
-| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the outbox directory, the session context, the shell quoting of the hook command, and the binary copy under the root | `config`, `outbox`, `schedule`, `serde_json` |
+| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the outbox directory, the session context, the shell quoting of the hook command, the binary copy under the root, and the role check that leaves the admin's Claude unconnected | `auth`, `config`, `outbox`, `schedule`, `serde_json` |
 | [`src/schedule.rs`](../src/schedule.rs) | Write, load, unload, and remove the hourly macOS LaunchAgent | none |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
 | [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root. The outbox stays. | `config`, `link`, `outbox`, `schedule`, `secretstore`, `state` |
@@ -80,6 +80,7 @@ graph LR
     selfupdate --> lock
     remote --> config
     remote --> auth
+    link --> auth
     link --> config
     link --> outbox
     uninstall --> config
@@ -273,9 +274,26 @@ first HTTP 401.
 `brainmaker admin pull-outbox`, `admin status`, and `admin syncs` are commands of this binary, not of
 a second one. The crate has no library target, so a second binary would have to include `config`,
 `auth`, `remote`, and more by path. The server enforces what a token may read, so the commands grant
-nothing by themselves. The admin's copy uses its own root, `~/.brainmaker-admin`, never runs `link`,
-and holds `sync` and `outbox:read`: `sync` lets it run `self-update`, and `outbox:read` lets it read
-the notes and the fleet.
+nothing by themselves. The admin's credential holds `sync` and `outbox:read`: `sync` lets it run
+`self-update`, and `outbox:read` lets it read the notes and the fleet.
+
+### `link` asks the issuer for the role
+
+The admin installs from a package into `~/.brainmaker`, like everyone else, and the installer runs
+`link`. The bridge would put the operator briefing in front of the admin's Claude, so `link` first
+asks the issuer for an `outbox:read` token and, when it gets one, for an `outbox:write` token. A
+credential that reads the outbox and cannot send notes is the admin's: `link` connects nothing to
+Claude, removes any piece of the bridge that an earlier run wrote, and writes an agent that runs
+`self-update` alone. Every other credential gets the bridge, one with both scopes included.
+
+The issuer is the only authority on the role, so a new admin needs no new client code and no marker
+on the disk. A check that gets no clear answer, such as a timeout, stops `link` before it writes
+anything: a guess could connect the admin's Claude. Before this check, the admin's copy had a root
+of its own and a manual install, and "never run `link` there" was a sentence in the documents.
+
+The tradeoffs: `link` now needs the issuer, where it needed no network before, and an operator's
+`link` asks for one token that the issuer refuses. The installer runs `sync` just before `link`, so
+the issuer is reachable at that moment anyway.
 
 `pull-outbox` never replaces a file, and it acknowledges only the notes that are on disk. It always
 writes `author` and `review_flags` from the server's values, so the operator can neither choose the
@@ -478,7 +496,8 @@ The `SessionStart` hook only syncs, and it never installs a binary, so a Mac sta
 until someone ran `self-update`, and a Mac that started no session kept old content. On macOS,
 `link` therefore also writes a LaunchAgent that runs `self-update` and then `sync` through
 `/bin/sh` at minute 0 of every hour and at each login. `;` joins the two, so a failed update never
-holds the content back. The agent runs the same copy under the root that the hook runs.
+holds the content back. The agent runs the same copy under the root that the hook runs. The admin's
+agent runs `self-update` alone, because no Claude on that Mac reads the content.
 
 The agent is part of the bridge. `link` writes it, and `unlink` and `uninstall` remove it before
 the program copy goes, so no hourly run starts a file that is gone. The installer already runs
