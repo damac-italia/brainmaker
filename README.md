@@ -20,6 +20,11 @@ writes one note into `~/.brainmaker/outbox/`, and the next `sync` sends it. The 
 name on each note from the credential that sent it, and `sync` writes that name to
 `~/.brainmaker/operator` for Claude to read.
 
+It also tells the server what it did, so that the admin can see why a client sends no note. Each run
+writes one line into `~/.brainmaker/diagnostics.jsonl`, and `sync` sends the new lines with the
+state of the machine. That report holds words from fixed lists and numbers, and never a credential,
+a path, or the name or the text of a note.
+
 ## Quick start
 
 `brainmaker` needs a provisioning file before it can reach a server. Your administrator issues it.
@@ -77,6 +82,9 @@ gone. Later runs read the sealed copy and need no file.
 | Upload guard | Push sends regular files only, never through a symbolic link, with a checked name, at most 64 KiB, in UTF-8, with a checked frontmatter |
 | Operator name | `sync` asks the server which operator the credential belongs to, and writes the answer to `~/.brainmaker/operator` |
 | Admin commands | `admin pull-outbox` collects the notes into a folder with the server's author and flags, `admin status` shows the fleet, and `admin syncs` lists the syncs of an operator |
+| Diagnostic report | `sync` sends the state of the machine and the new lines of its run log, at most once in 30 minutes, with the `sync` token. The server never asks for it, and a report that fails changes nothing else. |
+| No text in a report | Every value of a report is a word from a fixed list, a bounded number, a content hash, or a version, so a report cannot hold a credential, a path, a URL, or anything of a note |
+| Admin diagnosis | `admin diagnose` prints what a client reported and the newest lines of its run log, and names why no note arrives |
 
 ## Usage
 
@@ -98,8 +106,8 @@ brainmaker status
 the token URL, the credential lengths, the key class, the machine binding of the store, the number
 of trusted software keys and of trusted content keys, the installed hash, the latest hash, the
 platform key, and the published version. It then prints the operator name that the last `sync`
-wrote, the notes that wait and the notes that were rejected, and the age of the last push that sent
-a note. It changes nothing.
+wrote, the notes that wait and the notes that were rejected, the age of the last push that sent a
+note, and the age of the last diagnostic report that the server stored. It changes nothing.
 
 ### Send the notes
 
@@ -173,6 +181,69 @@ One client may hold both roles, with `sync outbox:write outbox:read`. Give both 
 needs both. That person's Claude reads the content as instructions, and could then read every note.
 And `pull-outbox` marks each note as collected, so a second admin who runs it takes notes away from
 the admin's harvest.
+
+### See why a client sends no note (admin)
+
+A client that syncs and sends no note looks healthy from the server. The causes are on the
+machine: the program is too old, `link` never connected Claude, every note broke a rule, or no note
+was written. `admin diagnose` shows which one, from the admin's machine:
+
+```bash
+brainmaker admin diagnose gabriele
+brainmaker admin diagnose --client brainmaker-sync-gabriele --limit 100
+```
+
+It prints, for every client of the operator, what the server saw of it, the state that the client
+last reported, and the newest lines of its run log:
+
+```text
+gabriele  brainmaker-sync-gabriele
+  server    last sync 2026-10-05T10:00:03+02:00  version 0.2.0  notes stored 0
+  report    received 2026-10-05T10:00:04+02:00  read on the client at 2026-10-05T10:00:02+02:00
+  software  0.2.0  darwin-arm64
+  content   a377aa94  installed 2026-10-01T09:00:00+02:00  present
+  link      hook present  block present  skills 12  agent present
+  outbox    waiting 0  rejected 4  sent 0  last push -  operator named
+  finding   4 note(s) broke a rule on that machine and moved to rejected/, and none was sent. The run log names the rule: frontmatter (1), kind (3).
+  log       2026-10-05T10:00:02+02:00  sync  push.rejected  rule kind  count 3
+  log       2026-10-05T10:00:02+02:00  sync  push.rejected  rule frontmatter  count 1
+  log       2026-10-05T10:00:02+02:00  sync  content.up_to_date  a377aa94
+```
+
+A line that starts with `finding` names a cause. `--limit` sets the lines of the run log for each
+client, 20 by default, and `--json` prints everything as JSON. A client older than the diagnostic
+report sends none: the command then says so, with the version that the client named at its last
+sync. The command asks no client for anything. Each client sends its report itself, and the
+command reads what the server stored.
+
+### What the diagnostic report holds
+
+`sync`, `push`, `self-update`, `link`, and `unlink` write one line for each thing that they did
+into `~/.brainmaker/diagnostics.jsonl`, the run log. After the outbox steps, `sync` sends a report
+to the server: the new lines of the run log, and the state of the machine. It sends one at most
+once in 30 minutes. A `link` or an `unlink` that worked cuts that wait to 90 seconds, so the
+report soon says what the command changed.
+
+| The report holds | From |
+|---|---|
+| The version and the platform key of the program | the binary |
+| The installed content hash, when it was installed, and whether `content/` is there | `state.json` |
+| Whether the `SessionStart` hook and the `CLAUDE.md` block are there, and how many skills are linked | `~/.claude` |
+| Whether the hourly agent has its file | `~/Library/LaunchAgents` |
+| How many notes wait, were rejected, and were sent, and when the last push sent a note | `outbox/`, `push.json` |
+| Whether the server named an operator | `operator` |
+| The new lines of the run log: the command, what it did, and a cause, an HTTP status, a rule, a count, a content hash, or a version | `diagnostics.jsonl` |
+
+Every value is a word from a fixed list, a bounded number, a content hash, or a version. No field
+holds free text. The report therefore never holds the client identifier, the client secret, a
+token, a URL, a path, the name or the text of a note, the reason beside a rejected note, or an
+error message. A failure is named by a word such as `unreachable`, and a rejected note by the rule
+that it broke, such as `kind`.
+
+The server never asks for a report, and nothing in its answer changes what `brainmaker` does. Only
+the admin reads the reports: no route gives a client a report back. A report that fails prints
+nothing and changes no exit code, and its lines go with the next one. The run log stays under
+256 KiB: past that size it is cut to its newest 128 KiB.
 
 ### Replace the binary
 
@@ -307,8 +378,9 @@ brainmaker uninstall
 
 1. What `link` wrote, the LaunchAgent included, exactly as `unlink` removes it.
 2. What brainmaker wrote under `~/.brainmaker`: the content, the program copy that the hook runs,
-   the state file, the sealed settings, the agent log, the operator file, the push record, the
-   four lock files, and any temporary file that a stopped run left.
+   the state file, the sealed settings, the agent log, the operator file, the push record, the run
+   log, the record of the diagnostic report, the five lock files, and any temporary file that a
+   stopped run left.
 3. `~/.brainmaker` itself, when nothing else is left in it.
 
 The outbox stays, with every note in it, and the run says how many notes were never sent. The root
@@ -361,8 +433,8 @@ it fails with a message that asks for a new file.
 
 ### Route names
 
-Nine more keys name the routes. Each one is optional, and an absent key takes the generic default
-below. Set all nine to keep the route names of a deployment out of this public repository.
+Ten more keys name the routes. Each one is optional, and an absent key takes the generic default
+below. Set all ten to keep the route names of a deployment out of this public repository.
 
 | Key | Default | Joins |
 |---|---|---|
@@ -373,8 +445,9 @@ below. Set all nine to keep the route names of a deployment out of this public r
 | `BRAINMAKER_SOFTWARE_BINARY_PATH` | `software/brainmaker-{version}-{platform}{ext}` | `BRAINMAKER_API_BASE` |
 | `BRAINMAKER_OUTBOX_PATH` | `outbox`, then `/<note name>` | `BRAINMAKER_API_BASE` |
 | `BRAINMAKER_WHOAMI_PATH` | `whoami` | `BRAINMAKER_API_BASE` |
+| `BRAINMAKER_DIAGNOSTICS_PATH` | `diagnostics` | `BRAINMAKER_API_BASE` |
 | `BRAINMAKER_ADMIN_OUTBOX_PATH` | `admin/outbox`, and the acknowledgement at `/ack` under it | `BRAINMAKER_API_BASE` |
-| `BRAINMAKER_ADMIN_CLIENTS_PATH` | `admin/clients`, and one sync log at `/<client_id>/syncs` under it | `BRAINMAKER_API_BASE` |
+| `BRAINMAKER_ADMIN_CLIENTS_PATH` | `admin/clients`, and under it one sync log at `/<client_id>/syncs` and the diagnostics of one client at `/<client_id>/diagnostics` | `BRAINMAKER_API_BASE` |
 
 No package carries the two admin keys, the admin's included, so the admin commands use the
 defaults. Set a key only for a server that names the admin routes differently.
@@ -413,7 +486,7 @@ next run imports it, overwrites the sealed store, and removes the file.
 | `SWETSI_JWT_ENDPOINT` | the sealed value | Base of the OAuth2 routes. The TLS rule above applies to it. |
 | `SWETSI_CLIENT_ID` | the sealed value | Client identifier for the token request. |
 | `SWETSI_CLIENT_SECRET` | the sealed value | Client secret for the token request. |
-| The nine `*_PATH` keys | the sealed value, else the default | One route each. The same rules as above apply. |
+| The ten `*_PATH` keys | the sealed value, else the default | One route each. The same rules as above apply. |
 | `BRAINMAKER_CONFIG` | unset | Path of the provisioning file to import. |
 | `BRAINMAKER_CONFIG_KEY` | a development key | Build-time only. Seals the stored settings. |
 
@@ -446,6 +519,9 @@ to write, and an issuer that answers `invalid_scope` stops only the push. The ad
 `this credential cannot read the outbox`. `link` asks for `scope=outbox:read` and, when the issuer
 grants it, for `scope=outbox:write`, to learn whether the credential is the admin's.
 
+The diagnostic report goes with the `sync` token that the run already holds, so it asks the issuer
+for nothing more, and a client whose issuer grants `sync` alone can still report.
+
 ### Options
 
 | Option | Effect |
@@ -460,9 +536,9 @@ grants it, for `scope=outbox:write`, to learn whether the credential is the admi
 | `--url <URL>` | Use `URL` as the API base |
 | `--claude-dir <PATH>` | With `link`, `unlink`, and `uninstall`, write to `PATH` instead of `~/.claude`, and leave the LaunchAgent alone |
 | `--agent-dir <PATH>` | With `link`, `unlink`, and `uninstall`, write the LaunchAgent to `PATH` and do not load it |
-| `--json` | With `admin status` and `admin syncs`, print JSON instead of lines |
-| `--limit <N>` | With `admin syncs`, print at most `N` rows, from 1 to 1000. Default: 50. |
-| `--client <CLIENT-ID>` | With `admin syncs`, read one client instead of an operator |
+| `--json` | With `admin status`, `admin syncs`, and `admin diagnose`, print JSON instead of lines |
+| `--limit <N>` | With `admin syncs`, print at most `N` rows, from 1 to 1000. Default: 50. With `admin diagnose`, print at most `N` lines of the run log of each client. Default: 20. |
+| `--client <CLIENT-ID>` | With `admin syncs` and `admin diagnose`, read one client instead of an operator |
 | `-q`, `--quiet` | Print errors only |
 | `-h`, `--help` | Print the help text |
 | `-V`, `--version` | Print the version |

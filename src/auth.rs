@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::cause::{self, Cause};
 use crate::config::{Config, Credentials};
 use crate::remote;
 
@@ -338,10 +339,17 @@ fn reject(code: u16, body: &str, scope: &str) -> anyhow::Error {
         _ => format!("the token endpoint returned HTTP {code}"),
     };
 
-    match remote::message_from_body(body) {
-        Some(message) => anyhow::anyhow!("{headline}: {message}"),
-        None => anyhow::anyhow!("{headline}"),
-    }
+    // A report names the cause as a word: the issuer refused the credentials,
+    // or it answered some other status.
+    let cause = match code {
+        400 | 401 => Cause::Credentials,
+        _ => Cause::Http,
+    };
+    let text = match remote::message_from_body(body) {
+        Some(message) => format!("{headline}: {message}"),
+        None => headline,
+    };
+    cause::failed(cause, Some(code), text)
 }
 
 /// The `error` code of an OAuth2 error body, such as `invalid_scope`.
@@ -363,8 +371,10 @@ fn oauth_error(body: &str) -> Option<String> {
 fn describe(error: ureq::Error) -> anyhow::Error {
     match error {
         ureq::Error::StatusCode(code) => anyhow::anyhow!("the token endpoint returned HTTP {code}"),
-        ureq::Error::Timeout(_) => anyhow::anyhow!("the token request timed out"),
-        ureq::Error::HostNotFound => anyhow::anyhow!("cannot resolve the token endpoint host name"),
+        ureq::Error::Timeout(_) => remote::unanswered("the token request timed out"),
+        ureq::Error::HostNotFound => {
+            remote::unanswered("cannot resolve the token endpoint host name")
+        }
         other => anyhow::anyhow!(other),
     }
 }

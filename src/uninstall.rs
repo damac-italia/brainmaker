@@ -9,8 +9,9 @@
 //!    would name a program that is gone, and would then fail on every run.
 //! 2. What brainmaker writes under the root: the content, the program copy
 //!    that the hook runs, the state file, the sealed settings, the agent's
-//!    log, the operator file, the push record, the four lock files, and any
-//!    temporary file that a stopped run left behind.
+//!    log, the operator file, the push record, the run log and the record of
+//!    the diagnostic report, the five lock files, and any temporary file that
+//!    a stopped run left behind.
 //! 3. The root itself, once nothing else is left in it.
 //!
 //! # What it leaves
@@ -194,6 +195,8 @@ fn remove_root(
 
     let operator = layout.operator_file();
     let push_state = layout.push_state_file();
+    let run_log = layout.run_log_file();
+    let report_record = layout.report_record_file();
     let mut paths = vec![
         layout.content_dir(),
         layout.staging_dir(),
@@ -203,11 +206,16 @@ fn remove_root(
         layout.update_lock_file(),
         layout.outbox_lock_file(),
         layout.admin_lock_file(),
+        layout.report_lock_file(),
         schedule::log_path(root),
         outbox::temporary_path(&operator),
         operator,
         outbox::temporary_path(&push_state),
         push_state,
+        outbox::temporary_path(&run_log),
+        run_log,
+        outbox::temporary_path(&report_record),
+        report_record,
     ];
     paths.extend(program_files(bin, &installed)?);
     paths.extend([
@@ -586,6 +594,12 @@ mod tests {
         write(&root.join("operator.tmp"), b"gabriele\n");
         write(&root.join("push.json"), b"{}\n");
         write(&root.join("push.json.tmp"), b"{}\n");
+        // The run log, the record of the diagnostic report, and its lock.
+        write(&root.join(".diagnostics.lock"), b"");
+        write(&root.join("diagnostics.jsonl"), b"{}\n");
+        write(&root.join("diagnostics.jsonl.tmp"), b"{}\n");
+        write(&root.join("diagnostics.json"), b"{}\n");
+        write(&root.join("diagnostics.json.tmp"), b"{}\n");
         write(&state::temporary_path(&layout.state_file()), b"{}\n");
         write(&secretstore::temporary_path(&layout.store_path()), b"x\n");
         // What link and self-update stage beside the program copy.

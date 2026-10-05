@@ -16,13 +16,15 @@ COMMANDS:
     sync           Update the content when the server has a newer version
                    (default). It also reports a newer brainmaker, but it
                    never installs one. Then it asks the server for the
-                   operator name, and sends the notes in the outbox.
+                   operator name, sends the notes in the outbox, and sends
+                   the diagnostic report when one is due.
     status         Print the installed hash, the latest hash, both software
                    versions, the operator, and the notes in the outbox. It
                    changes nothing.
     push           Send the notes in the outbox now
-    admin          Collect the notes, and read the fleet and its sync log.
-                   For the admin; run brainmaker admin --help
+    admin          Collect the notes, read the fleet and its sync log, and
+                   see why a client sends no note. For the admin;
+                   run brainmaker admin --help
     self-update    Replace this binary with the newest build for this platform
     link           Wire the synced content into ~/.claude, so its skills and
                    its session context load in every project, not only in the
@@ -78,7 +80,7 @@ ENVIRONMENT:
     SWETSI_CLIENT_SECRET  Client secret for the token request.
     BRAINMAKER_CONFIG     Path of the provisioning file to import.
 
-    Seven more variables name the routes, and each one has a default:
+    Eight more variables name the routes, and each one has a default:
 
     SWETSI_TOKEN_PATH                  under SWETSI_JWT_ENDPOINT
     BRAINMAKER_CONTENT_LATEST_PATH     under BRAINMAKER_API_BASE
@@ -87,6 +89,7 @@ ENVIRONMENT:
     BRAINMAKER_SOFTWARE_BINARY_PATH    the same
     BRAINMAKER_OUTBOX_PATH             the same
     BRAINMAKER_WHOAMI_PATH             the same
+    BRAINMAKER_DIAGNOSTICS_PATH        the same
 
     Each variable overrides the stored value. Supply all three credential
     variables, or none of them. None of them means no Authorization header.
@@ -98,6 +101,17 @@ OUTBOX:
     moves to outbox/rejected/, beside a .reason.txt file. The name on a note
     comes from the server, never from the note.
 
+DIAGNOSTICS:
+    sync, push, self-update, link, and unlink write one line for each thing
+    that they did into ~/.brainmaker/diagnostics.jsonl. At most once in 30
+    minutes, sync sends the new lines to the server, with the state of this
+    machine: the version, the platform, the installed content, which pieces
+    link wrote into ~/.claude, and how many notes wait, were rejected, and
+    were sent. Every value is a word from a fixed list, a number, a content
+    hash, or a version. The report never holds a credential, a path, or the
+    name or the text of a note. Only the admin reads it, and the server never
+    asks for it. A report that fails changes nothing else.
+
 EXIT CODES:
     0    The content is up to date, or the update succeeded. A failure to
          send a note is a notice, and sync still exits 0.
@@ -106,13 +120,17 @@ EXIT CODES:
 ";
 
 pub const ADMIN_HELP: &str = "\
-brainmaker admin — collect the notes, and read the fleet and its sync log
+brainmaker admin — collect the notes, read the fleet and its sync log, and
+see why a client sends no note
 
 USAGE:
     brainmaker admin pull-outbox <DIR> [OPTIONS]
     brainmaker admin status [--json] [OPTIONS]
     brainmaker admin syncs <OPERATOR> [--limit N] [--json] [OPTIONS]
     brainmaker admin syncs --client <CLIENT-ID> [--limit N] [--json] [OPTIONS]
+    brainmaker admin diagnose <OPERATOR> [--limit N] [--json] [OPTIONS]
+    brainmaker admin diagnose --client <CLIENT-ID> [--limit N] [--json]
+                              [OPTIONS]
 
 Every admin command asks for a token with the scope outbox:read. The admin
 installs from a package into ~/.brainmaker, like everyone else: link sees a
@@ -135,12 +153,23 @@ COMMANDS:
                    Print the syncs of every client of OPERATOR, newest first:
                    the time, the client ID, the status, the IP address, the
                    platform, the version, and the installed content.
+    diagnose <OPERATOR>
+                   Print, for every client of OPERATOR, what the server saw
+                   of it, the state that the client last reported, and the
+                   newest lines of its run log. A line that starts with
+                   finding names why no note arrives: the client is too old,
+                   link never connected Claude, every note broke a rule, or
+                   no note was written. The client sends that report itself,
+                   with its sync: the server asks for nothing.
 
 OPTIONS:
-    --json               With status and syncs, print JSON instead of lines
+    --json               With status, syncs, and diagnose, print JSON instead
+                         of lines
     --limit <N>          With syncs, print at most N rows, from 1 to 1000.
-                         Default: 50.
-    --client <CLIENT-ID> With syncs, name one client instead of an operator
+                         Default: 50. With diagnose, print at most N lines of
+                         the run log of each client. Default: 20.
+    --client <CLIENT-ID> With syncs and diagnose, name one client instead of
+                         an operator
     --dir, --config, --keep-config, --url, and --quiet work as they do for
     every other command.
 
@@ -166,6 +195,7 @@ pub enum Command {
     AdminPullOutbox,
     AdminStatus,
     AdminSyncs,
+    AdminDiagnose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +213,10 @@ pub const MAX_SYNCS_LIMIT: u32 = 1000;
 
 /// Rows that `admin syncs` prints when `--limit` is absent.
 pub const DEFAULT_SYNCS_LIMIT: u32 = 50;
+
+/// Lines of the run log that `admin diagnose` prints for each client when
+/// `--limit` is absent.
+pub const DEFAULT_DIAGNOSE_LIMIT: u32 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
@@ -207,14 +241,14 @@ pub struct Args {
     /// `--agent-dir`, naming the directory that holds the LaunchAgent that
     /// `link` writes and that `unlink` and `uninstall` remove.
     pub agent_dir: Option<PathBuf>,
-    /// With `admin status` and `admin syncs`, print JSON.
+    /// With `admin status`, `admin syncs`, and `admin diagnose`, print JSON.
     pub json: bool,
-    /// With `admin syncs`, the number of rows.
+    /// With `admin syncs` and `admin diagnose`, the number of rows.
     pub limit: Option<u32>,
-    /// With `admin syncs`, the one client to read.
+    /// With `admin syncs` and `admin diagnose`, the one client to read.
     pub client: Option<String>,
     /// The value after an admin command: the directory of `pull-outbox`, or
-    /// the operator of `syncs`.
+    /// the operator of `syncs` and of `diagnose`.
     pub target: Option<String>,
 }
 
@@ -354,13 +388,19 @@ where
                 args.command = Command::AdminSyncs;
                 admin_pending = false;
             }
+            "diagnose" if admin_pending => {
+                args.command = Command::AdminDiagnose;
+                admin_pending = false;
+            }
             other if admin_pending => bail!(
-                "admin takes pull-outbox, status, or syncs, not {other:?}; run brainmaker admin \
-                 --help"
+                "admin takes pull-outbox, status, syncs, or diagnose, not {other:?}; run \
+                 brainmaker admin --help"
             ),
             other
-                if matches!(args.command, Command::AdminPullOutbox | Command::AdminSyncs)
-                    && args.target.is_none()
+                if matches!(
+                    args.command,
+                    Command::AdminPullOutbox | Command::AdminSyncs | Command::AdminDiagnose
+                ) && args.target.is_none()
                     && !other.starts_with('-') =>
             {
                 args.target = Some(other.to_string());
@@ -402,7 +442,7 @@ where
     }
 
     if admin_pending {
-        bail!("admin needs pull-outbox, status, or syncs; run brainmaker admin --help");
+        bail!("admin needs pull-outbox, status, syncs, or diagnose; run brainmaker admin --help");
     }
     check_admin_target(&args)?;
     check_options(&args)?;
@@ -418,6 +458,9 @@ fn check_admin_target(args: &Args) -> Result<()> {
         }
         Command::AdminSyncs if args.target.is_some() == args.client.is_some() => {
             bail!("admin syncs needs an operator, or --client <CLIENT-ID>, and not both")
+        }
+        Command::AdminDiagnose if args.target.is_some() == args.client.is_some() => {
+            bail!("admin diagnose needs an operator, or --client <CLIENT-ID>, and not both")
         }
         _ => Ok(()),
     }
@@ -444,12 +487,25 @@ fn check_options(args: &Args) -> Result<()> {
         AdminPullOutbox,
         AdminStatus,
         AdminSyncs,
+        AdminDiagnose,
     ];
 
     let given: [(&str, bool, &[Command]); 12] = [
-        ("--json", args.json, &[AdminStatus, AdminSyncs]),
-        ("--limit", args.limit.is_some(), &[AdminSyncs]),
-        ("--client", args.client.is_some(), &[AdminSyncs]),
+        (
+            "--json",
+            args.json,
+            &[AdminStatus, AdminSyncs, AdminDiagnose],
+        ),
+        (
+            "--limit",
+            args.limit.is_some(),
+            &[AdminSyncs, AdminDiagnose],
+        ),
+        (
+            "--client",
+            args.client.is_some(),
+            &[AdminSyncs, AdminDiagnose],
+        ),
         ("--force", args.force, &[Sync, SelfUpdate]),
         ("--check", args.check_only, &[SelfUpdate]),
         ("--no-update-check", args.no_update_check, &[Sync]),
@@ -497,6 +553,7 @@ fn name_of(command: Command) -> &'static str {
         Command::AdminPullOutbox => "admin pull-outbox",
         Command::AdminStatus => "admin status",
         Command::AdminSyncs => "admin syncs",
+        Command::AdminDiagnose => "admin diagnose",
     }
 }
 
@@ -611,9 +668,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_diagnose_command_with_an_operator_or_a_client() {
+        let args = run(&["admin", "diagnose", "gabriele", "--limit", "5", "--json"]);
+        assert_eq!(args.command, Command::AdminDiagnose);
+        assert_eq!(args.target.as_deref(), Some("gabriele"));
+        assert_eq!(args.limit, Some(5));
+        assert!(args.json);
+
+        let args = run(&["admin", "diagnose", "--client", "brainmaker-sync-old"]);
+        assert_eq!(args.command, Command::AdminDiagnose);
+        assert_eq!(args.client.as_deref(), Some("brainmaker-sync-old"));
+        assert_eq!(args.target, None);
+
+        for (items, needle) in [
+            (&["admin", "diagnose"][..], "needs an operator"),
+            (
+                &["admin", "diagnose", "gabriele", "--client", "c1c"][..],
+                "and not both",
+            ),
+            (&["admin", "diagnose", "a", "b"][..], "unknown argument"),
+            (
+                &["admin", "diagnose", "g", "--force"][..],
+                "--force has no effect with admin diagnose",
+            ),
+            (&["diagnose"][..], "unknown argument"),
+        ] {
+            let error = parse(items.iter().copied()).unwrap_err().to_string();
+            assert!(error.contains(needle), "{items:?}: {error}");
+        }
+        assert!(ADMIN_HELP.contains("diagnose <OPERATOR>"));
+    }
+
+    #[test]
     fn an_admin_command_needs_its_value_and_no_extra() {
         for (items, needle) in [
-            (&["admin"][..], "needs pull-outbox, status, or syncs"),
+            (
+                &["admin"][..],
+                "needs pull-outbox, status, syncs, or diagnose",
+            ),
             (&["admin", "stats"][..], "not \"stats\""),
             (&["admin", "pull-outbox"][..], "needs the directory"),
             (&["admin", "syncs"][..], "needs an operator"),
@@ -695,6 +787,17 @@ mod tests {
         assert!(HELP.contains("\n    push "), "the command list names push");
         assert!(HELP.contains("BRAINMAKER_OUTBOX_PATH"));
         assert!(HELP.contains("BRAINMAKER_WHOAMI_PATH"));
+        assert!(HELP.contains("BRAINMAKER_DIAGNOSTICS_PATH"));
+    }
+
+    #[test]
+    fn the_help_says_what_the_diagnostic_report_holds() {
+        // The help ships to every employee, and the report leaves their
+        // machine, so the help says what is in it and who reads it.
+        assert!(HELP.contains("\nDIAGNOSTICS:\n"));
+        assert!(HELP.contains("diagnostics.jsonl"));
+        assert!(HELP.contains("never holds a credential"));
+        assert!(HELP.contains("Only the admin reads it"));
     }
 
     #[test]

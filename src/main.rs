@@ -21,8 +21,10 @@
 mod admin;
 mod archive;
 mod auth;
+mod cause;
 mod cli;
 mod config;
+mod diagnostics;
 mod digest;
 mod link;
 mod lock;
@@ -119,7 +121,9 @@ fn run(args: &Args) -> Result<()> {
                 None => link::claude_dir()?,
             };
             let agents = agents(args)?;
-            link::link(&config, &claude, agents.as_ref(), &log)?;
+            let linked = link::link(&config, &claude, agents.as_ref(), &log);
+            record(&config, Recorded::LINK, &linked);
+            linked?;
             Ok(())
         }
         Command::Unlink => {
@@ -128,7 +132,9 @@ fn run(args: &Args) -> Result<()> {
                 None => link::claude_dir()?,
             };
             let agents = agents(args)?;
-            link::unlink(&config, &claude, agents.as_ref(), &log)?;
+            let unlinked = link::unlink(&config, &claude, agents.as_ref(), &log);
+            record(&config, Recorded::UNLINK, &unlinked);
+            unlinked?;
             Ok(())
         }
         Command::Uninstall => unreachable!("uninstall returns before the settings load"),
@@ -137,12 +143,23 @@ fn run(args: &Args) -> Result<()> {
             println!("{}", link::session_context(&config)?);
             Ok(())
         }
-        Command::SelfUpdate => self_update(&config, args, &log),
+        Command::SelfUpdate => {
+            let mut run = diagnostics::Run::new(diagnostics::Command::SelfUpdate);
+            let updated = self_update(&config, args, &log, &mut run);
+            // A failure that named itself, such as a missing build, has its
+            // line already.
+            if let (Err(error), true) = (&updated, run.is_empty()) {
+                run.failed(diagnostics::Code::UpdateFailed, error);
+            }
+            run.save(&config);
+            updated
+        }
         Command::Sync => sync_command(&config, args, &log),
         Command::Push => push(&config, &log),
         Command::AdminPullOutbox => admin_pull_outbox(&config, args, &log),
         Command::AdminStatus => admin_status(&config, args),
         Command::AdminSyncs => admin_syncs(&config, args),
+        Command::AdminDiagnose => admin_diagnose(&config, args),
     }
 }
 
@@ -204,16 +221,45 @@ fn admin_syncs(config: &Config, args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// `sync`: the content step, then the outbox steps, then the software check.
+/// `admin diagnose <OPERATOR>` and `admin diagnose --client <CLIENT-ID>`.
+fn admin_diagnose(config: &Config, args: &Args) -> Result<()> {
+    let selector = match (&args.client, &args.target) {
+        (Some(client), _) => admin::Selector::Client(client.clone()),
+        (None, Some(operator)) => admin::Selector::Operator(operator.clone()),
+        (None, None) => bail!("admin diagnose needs an operator, or --client <CLIENT-ID>"),
+    };
+    let limit = args.limit.unwrap_or(cli::DEFAULT_DIAGNOSE_LIMIT);
+    let diagnoses = admin::diagnose(config, &selector, limit)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&diagnoses)?);
+        return Ok(());
+    }
+    for (index, diagnosis) in diagnoses.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+        for line in admin::diagnosis_lines(diagnosis) {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// `sync`: the content step, then the outbox steps, then the diagnostic
+/// report, then the software check.
 ///
-/// The content result waits until the outbox steps ran, because a failed
-/// content step does not stop them. It is returned after them.
+/// The content result waits until the outbox steps and the report ran,
+/// because a failed content step does not stop them. It is returned after
+/// them.
 fn sync_command(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> {
+    let mut run = diagnostics::Run::new(diagnostics::Command::Sync);
     let result = sync::sync(config, args.force, log);
     if let Ok(outcome) = &result {
         report(config, outcome, args.quiet);
     }
-    outbox_steps(config, args.quiet, log);
+    run.content(&result);
+    outbox_steps(config, args.quiet, log, &mut run);
+    diagnostics_step(config, run, log);
     result?;
     if !args.no_update_check {
         report_software_check(config, args.quiet);
@@ -227,7 +273,9 @@ fn sync_command(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> 
 /// `whoami` and push run only when this run received a `sync` token, which
 /// proves that the issuer answered. Push makes no request when the outbox is
 /// empty.
-fn outbox_steps(config: &Config, quiet: bool, log: &dyn Fn(&str)) {
+///
+/// `run` takes one line for each thing that these steps did, for the run log.
+fn outbox_steps(config: &Config, quiet: bool, log: &dyn Fn(&str), run: &mut diagnostics::Run) {
     let notice = |message: String| {
         if !quiet {
             eprintln!("notice: {message}");
@@ -240,12 +288,16 @@ fn outbox_steps(config: &Config, quiet: bool, log: &dyn Fn(&str)) {
     if !auth::received(config, auth::SCOPE_SYNC) {
         return;
     }
-    if let Err(error) = outbox::update_operator(config) {
+    let operator = outbox::update_operator(config);
+    run.operator(&operator);
+    if let Err(error) = operator {
         notice(format!(
             "cannot ask the server for the operator name: {error:#}"
         ));
     }
-    match outbox::push(config, log) {
+    let pushed = outbox::push(config, log);
+    run.pushed(&pushed);
+    match pushed {
         Ok(pushed) => {
             if pushed.busy {
                 log("Another brainmaker run is sending the notes.");
@@ -258,12 +310,67 @@ fn outbox_steps(config: &Config, quiet: bool, log: &dyn Fn(&str)) {
     }
 }
 
+/// The last step of `sync`: writes the lines of this run to the run log, and
+/// sends the diagnostic report when one is due.
+///
+/// A report that was not sent, or not stored, prints nothing and changes no
+/// exit code. `sync` then does what it did before the report existed.
+fn diagnostics_step(config: &Config, run: diagnostics::Run, log: &dyn Fn(&str)) {
+    run.save(config);
+    if let diagnostics::Sent::Stored(lines) = diagnostics::send(config) {
+        log(&format!(
+            "Sent the diagnostic report: the state of this machine, and {lines} line(s) of its \
+             run log."
+        ));
+    }
+}
+
+/// The two lines that a command with one outcome can leave in the run log.
+struct Recorded {
+    command: diagnostics::Command,
+    done: diagnostics::Code,
+    failed: diagnostics::Code,
+}
+
+impl Recorded {
+    const LINK: Self = Self {
+        command: diagnostics::Command::Link,
+        done: diagnostics::Code::LinkDone,
+        failed: diagnostics::Code::LinkFailed,
+    };
+    const UNLINK: Self = Self {
+        command: diagnostics::Command::Unlink,
+        done: diagnostics::Code::UnlinkDone,
+        failed: diagnostics::Code::UnlinkFailed,
+    };
+}
+
+/// Writes one line to the run log for a command that worked or failed.
+///
+/// A command that worked changed what the report says of this machine, so the
+/// next report is due 90 seconds later, whatever the interval says.
+fn record<T>(config: &Config, lines: Recorded, result: &Result<T>) {
+    let mut run = diagnostics::Run::new(lines.command);
+    match result {
+        Ok(_) => {
+            run.did(lines.done);
+            diagnostics::make_due(config);
+        }
+        Err(error) => run.failed(lines.failed, error),
+    }
+    run.save(config);
+}
+
 /// Sends the notes in the outbox now.
 ///
 /// It fails when a note had to stay, so a person who runs it sees the
 /// reason in the exit code as well as in the text.
 fn push(config: &Config, log: &dyn Fn(&str)) -> Result<()> {
-    let pushed = outbox::push(config, log)?;
+    let pushed = outbox::push(config, log);
+    let mut run = diagnostics::Run::new(diagnostics::Command::Push);
+    run.pushed(&pushed);
+    run.save(config);
+    let pushed = pushed?;
     if pushed.busy {
         log("Another brainmaker run is sending the notes, so this one sent none.");
         return Ok(());
@@ -406,6 +513,13 @@ fn status(config: &Config) -> Result<()> {
             .map(|state| age(state.last_push_at_unix))
             .unwrap_or_else(|| "<none>".to_string())
     );
+    println!(
+        "reported  {}",
+        diagnostics::read_record(config)
+            .and_then(|record| record.last_report_at_unix)
+            .map(age)
+            .unwrap_or_else(|| "<none>".to_string())
+    );
 
     Ok(())
 }
@@ -475,7 +589,14 @@ fn uninstall(args: &Args, log: &dyn Fn(&str)) -> Result<()> {
     Ok(())
 }
 
-fn self_update(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> {
+fn self_update(
+    config: &Config,
+    args: &Args,
+    log: &dyn Fn(&str),
+    run: &mut diagnostics::Run,
+) -> Result<()> {
+    use diagnostics::Code;
+
     log("Checking the published software version.");
     let check = selfupdate::check(config)?;
 
@@ -488,6 +609,9 @@ fn self_update(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> {
             log(&format!(
                 "brainmaker {version} is the newest published build."
             ));
+            if !args.force || args.check_only {
+                run.did_for(Code::UpdateCurrent, &version);
+            }
             if !args.force {
                 return Ok(());
             }
@@ -503,6 +627,7 @@ fn self_update(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> {
             };
             log(&format!("--force was given, so {version} is reinstalled."));
             let replaced = selfupdate::apply(config, &version, &build, log)?;
+            run.did_for(Code::UpdateInstalled, &version);
             log(&format!(
                 "Replaced {} with version {version}.",
                 replaced.display()
@@ -514,6 +639,7 @@ fn self_update(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> {
             platform,
             offered,
         } => {
+            run.did_for(Code::UpdateNoBuild, &latest);
             bail!(
                 "version {latest} is published, but the manifest has no build for {platform}; \
                  it offers {}",
@@ -531,11 +657,13 @@ fn self_update(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> {
             ));
 
             if args.check_only {
+                run.did_for(Code::UpdateAvailable, &latest);
                 log("--check was given, so nothing was installed.");
                 return Ok(());
             }
 
             let replaced = selfupdate::apply(config, &latest, &build, log)?;
+            run.did_for(Code::UpdateInstalled, &latest);
             log(&format!(
                 "Replaced {} with version {latest}.",
                 replaced.display()
@@ -579,7 +707,7 @@ fn report(config: &Config, outcome: &sync::Outcome, quiet: bool) {
         }
         // A notice, not an error: the installed content is in place and the
         // exit code stays 0. Quiet suppresses it, as it does the software one.
-        sync::Outcome::Unreachable { hash, error } => {
+        sync::Outcome::Unreachable { hash, error, .. } => {
             eprintln!("notice: cannot check the latest content version: {error}");
             eprintln!("notice: the installed content {hash} stays in place.");
         }
@@ -651,6 +779,35 @@ mod tests {
 
     fn paths(server: &Server) -> Vec<String> {
         server.received().into_iter().map(|r| r.path).collect()
+    }
+
+    /// What the lines of the run log say that the runs did, oldest first.
+    fn logged(config: &Config) -> Vec<String> {
+        fs::read_to_string(config.run_log_file())
+            .unwrap_or_default()
+            .lines()
+            .map(|line| {
+                let line: serde_json::Value = serde_json::from_str(line).unwrap();
+                line["code"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    /// The routes of a server that names the operator and stores one note.
+    fn outbox_routes() -> Vec<Route> {
+        vec![
+            Route::token("sync", r#"{"access_token":"s"}"#),
+            Route::token("outbox:write", r#"{"access_token":"w"}"#),
+            Route::get(
+                "/whoami",
+                r#"{"client_id":"c","operator":"gabriele","display_name":"G"}"#,
+            ),
+            Route::post(
+                "/outbox/2026-09-30-a.md",
+                r#"{"received_at":"2026-09-30T10:00:00+02:00"}"#,
+            )
+            .status(201),
+        ]
     }
 
     #[test]
@@ -762,6 +919,149 @@ mod tests {
         let seen = paths(&server);
         assert_eq!(seen, vec!["/oauth2/token"], "got {seen:?}");
         assert_eq!(outbox::counts(&config).waiting, 1);
+        // The run still leaves its line, for a report that a later run sends.
+        assert_eq!(logged(&config), ["content.failed"]);
+        assert!(diagnostics::read_record(&config).is_none(), "no report");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_sends_the_diagnostic_report_after_the_outbox_steps() {
+        let signer = Signer::new();
+        signer.trust();
+        let mut routes = outbox_routes();
+        routes.push(Route::post("/diagnostics", r#"{"stored":2,"dropped":0}"#));
+        routes.extend(release(&signer));
+        let server = Server::start(routes);
+        let dir = temp_dir("main-sync-report");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+        settled_note(&config, "2026-09-30-a.md");
+
+        sync_command(&config, &args(), &quiet).unwrap();
+
+        let seen = paths(&server);
+        let note = seen
+            .iter()
+            .position(|p| p == "/outbox/2026-09-30-a.md")
+            .unwrap();
+        let report = seen.iter().position(|p| p == "/diagnostics").unwrap();
+        assert!(note < report, "got {seen:?}");
+        let request = &server.received()[report];
+        assert_eq!(request.header("authorization"), Some("Bearer s"));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let codes: Vec<&str> = body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, ["content.updated", "push.sent"]);
+        assert_eq!(body["events"][0]["hash"], "a1b2c3d4");
+        assert_eq!(body["events"][1]["count"], 1);
+        // The state is read after the steps ran: the note is sent by then.
+        assert_eq!(body["state"]["content"]["installed_hash"], "a1b2c3d4");
+        assert_eq!(body["state"]["outbox"]["waiting"], 0);
+        assert_eq!(body["state"]["outbox"]["sent"], 1);
+        assert_eq!(body["state"]["outbox"]["operator"], true);
+        assert_eq!(logged(&config), ["content.updated", "push.sent"]);
+
+        // The next run is inside the interval: it leaves its line, and sends
+        // no second report.
+        sync_command(&config, &args(), &quiet).unwrap();
+        let reports = paths(&server)
+            .iter()
+            .filter(|p| *p == "/diagnostics")
+            .count();
+        assert_eq!(reports, 1);
+        assert_eq!(
+            logged(&config),
+            ["content.updated", "push.sent", "content.up_to_date"]
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_does_what_it_did_before_when_the_server_has_no_report_route() {
+        // The test server answers 404 for a route that it does not have, as a
+        // server older than the diagnostic report does.
+        let signer = Signer::new();
+        signer.trust();
+        let mut routes = outbox_routes();
+        routes.extend(release(&signer));
+        let server = Server::start(routes);
+        let dir = temp_dir("main-sync-old-server");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+        settled_note(&config, "2026-09-30-a.md");
+
+        sync_command(&config, &args(), &quiet).unwrap();
+
+        assert!(config.content_dir().join("CLAUDE.md").is_file());
+        assert_eq!(
+            fs::read_to_string(config.operator_file()).unwrap(),
+            "gabriele\n"
+        );
+        assert_eq!(outbox::counts(&config).waiting, 0, "the note was sent");
+        // The report was tried once, and its lines wait for a later server.
+        let record = diagnostics::read_record(&config).unwrap();
+        assert_eq!(record.last_report_at_unix, None);
+        assert_eq!(logged(&config), ["content.updated", "push.sent"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_content_step_still_sends_the_report_with_its_cause() {
+        let server = Server::start(vec![
+            Route::token("sync", r#"{"access_token":"s"}"#),
+            Route::get(
+                "/content/latest",
+                r#"{"error":"no content release is published"}"#,
+            )
+            .status(404),
+            Route::get("/whoami", "not json"),
+            Route::post("/diagnostics", r#"{"stored":2,"dropped":0}"#),
+        ]);
+        let dir = temp_dir("main-sync-report-failed");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let error = sync_command(&config, &args(), &quiet).unwrap_err();
+
+        assert!(format!("{error:#}").contains("404"), "got {error:#}");
+        let request = server
+            .received()
+            .into_iter()
+            .find(|r| r.path == "/diagnostics")
+            .expect("the report was sent");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["events"][0]["code"], "content.failed");
+        assert_eq!(body["events"][0]["cause"], "http");
+        assert_eq!(body["events"][0]["status"], 404);
+        assert_eq!(body["events"][1]["code"], "operator.failed");
+        // Neither the text of the error nor the URL is in the report.
+        let text = String::from_utf8(request.body).unwrap();
+        assert!(!text.contains("no content release"), "{text}");
+        assert!(!text.contains("127.0.0.1"), "{text}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn push_and_link_leave_their_lines_and_send_no_report() {
+        let mut routes = outbox_routes();
+        routes.push(Route::post("/diagnostics", r#"{"stored":1,"dropped":0}"#));
+        let server = Server::start(routes);
+        let dir = temp_dir("main-push-lines");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+        settled_note(&config, "2026-09-30-a.md");
+
+        push(&config, &quiet).unwrap();
+        record(&config, Recorded::LINK, &Ok(()));
+        record::<()>(
+            &config,
+            Recorded::UNLINK,
+            &Err(anyhow::anyhow!("cannot read the settings")),
+        );
+
+        assert_eq!(logged(&config), ["push.sent", "link.done", "unlink.failed"]);
+        assert!(!paths(&server).iter().any(|p| p == "/diagnostics"));
         fs::remove_dir_all(&dir).unwrap();
     }
 

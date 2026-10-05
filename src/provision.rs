@@ -63,13 +63,18 @@ pub const KEY_OUTBOX_PATH: &str = "BRAINMAKER_OUTBOX_PATH";
 /// [`KEY_API_BASE`].
 pub const KEY_WHOAMI_PATH: &str = "BRAINMAKER_WHOAMI_PATH";
 
+/// Route that receives the diagnostic report of this client, relative to
+/// [`KEY_API_BASE`].
+pub const KEY_DIAGNOSTICS_PATH: &str = "BRAINMAKER_DIAGNOSTICS_PATH";
+
 /// Route of the notes that wait for the admin, relative to [`KEY_API_BASE`].
 /// The acknowledgement is `/ack` under it. An admin copy alone reads it; a
 /// laptop package never carries it.
 pub const KEY_ADMIN_OUTBOX_PATH: &str = "BRAINMAKER_ADMIN_OUTBOX_PATH";
 
 /// Route of the fleet view, relative to [`KEY_API_BASE`]. The sync log of one
-/// client is `/<client_id>/syncs` under it. An admin copy alone reads it.
+/// client is `/<client_id>/syncs` under it, and its diagnostics are
+/// `/<client_id>/diagnostics`. An admin copy alone reads it.
 pub const KEY_ADMIN_CLIENTS_PATH: &str = "BRAINMAKER_ADMIN_CLIENTS_PATH";
 
 /// Keys that an earlier version read, each with the key that replaces it.
@@ -78,12 +83,12 @@ pub const KEY_ADMIN_CLIENTS_PATH: &str = "BRAINMAKER_ADMIN_CLIENTS_PATH";
 /// back to a default and reaching the wrong host.
 pub const RENAMED_KEYS: [(&str, &str); 1] = [("SWETSI_API_BASE", KEY_API_BASE)];
 
-/// The nine route keys, in the order the documents list them.
+/// The ten route keys, in the order the documents list them.
 ///
 /// Each one is optional. An absent key takes the generic default in
 /// [`crate::config`], so a customer who does not want their route names in a
-/// public repository sets all nine.
-pub const ROUTE_KEYS: [&str; 9] = [
+/// public repository sets all ten.
+pub const ROUTE_KEYS: [&str; 10] = [
     KEY_TOKEN_PATH,
     KEY_CONTENT_LATEST_PATH,
     KEY_CONTENT_ARCHIVE_PATH,
@@ -91,6 +96,7 @@ pub const ROUTE_KEYS: [&str; 9] = [
     KEY_SOFTWARE_BINARY_PATH,
     KEY_OUTBOX_PATH,
     KEY_WHOAMI_PATH,
+    KEY_DIAGNOSTICS_PATH,
     KEY_ADMIN_OUTBOX_PATH,
     KEY_ADMIN_CLIENTS_PATH,
 ];

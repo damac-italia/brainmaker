@@ -904,6 +904,99 @@ pub fn describe(report: &Report, installing: bool, log: &dyn Fn(&str)) {
     }
 }
 
+/// Whether one piece of the bridge is in the Claude configuration directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Presence {
+    Present,
+    Absent,
+    /// The file is there, and it could not be read as what it must be.
+    Unknown,
+}
+
+/// The pieces of the bridge that a Claude configuration directory holds, as
+/// far as its files tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bridge {
+    /// A `SessionStart` hook entry that this module wrote.
+    pub hook: Presence,
+    /// The marked block in `CLAUDE.md`.
+    pub block: Presence,
+    /// How many skill links name the content directory.
+    pub skills: usize,
+}
+
+/// Largest `settings.json` or `CLAUDE.md` that [`bridge`] reads.
+const MAX_BRIDGE_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Reads which pieces of the bridge are in `claude`. It changes nothing.
+///
+/// The diagnostic report carries the answer. A machine with no hook starts no
+/// session that reads the briefing, so its Claude writes no note, and nothing
+/// else shows that to the admin.
+pub fn bridge(content: &Path, claude: &Path) -> Bridge {
+    let hook = match read_bounded(&claude.join("settings.json")) {
+        Ok(None) => Presence::Absent,
+        Ok(Some(text)) if text.trim().is_empty() => Presence::Absent,
+        Ok(Some(text)) => match serde_json::from_str::<Value>(&text) {
+            Ok(settings) if holds_our_hook(&settings) => Presence::Present,
+            Ok(_) => Presence::Absent,
+            Err(_) => Presence::Unknown,
+        },
+        Err(()) => Presence::Unknown,
+    };
+    let block = match read_bounded(&claude.join("CLAUDE.md")) {
+        Ok(Some(text)) if text.contains(BLOCK_START) => Presence::Present,
+        Ok(_) => Presence::Absent,
+        Err(()) => Presence::Unknown,
+    };
+    Bridge {
+        hook,
+        block,
+        skills: linked_skills(content, claude),
+    }
+}
+
+/// The text of `path`, or `None` when no file is there. A file that is too
+/// large, or that is not text, is an error.
+fn read_bounded(path: &Path) -> Result<Option<String>, ()> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_BRIDGE_FILE_BYTES => Err(()),
+        Ok(_) => fs::read_to_string(path).map(Some).map_err(|_| ()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// True when `settings` holds a `SessionStart` hook entry that this module
+/// wrote.
+fn holds_our_hook(settings: &Value) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("SessionStart"))
+        .and_then(Value::as_array)
+        .is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("hooks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|entries| entries.iter().any(is_ours))
+            })
+        })
+}
+
+/// How many links under `<claude>/skills` name a path in the content
+/// directory.
+fn linked_skills(content: &Path, claude: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(claude.join("skills")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| fs::read_link(entry.path()).is_ok_and(|target| target.starts_with(content)))
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1263,6 +1356,62 @@ mod tests {
                 .unwrap();
         assert_eq!(value["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
         assert_eq!(value["model"], "opus");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn the_bridge_state_follows_what_link_wrote_and_removed() {
+        let base = temp_dir("bridge-state");
+        let content = base.join("content");
+        let claude = base.join("claude");
+        content_with_skills(&content, &["query", "today"]);
+        let nothing = Bridge {
+            hook: Presence::Absent,
+            block: Presence::Absent,
+            skills: 0,
+        };
+        // No Claude directory at all, and then an empty one.
+        assert_eq!(bridge(&content, &claude), nothing);
+        fs::create_dir_all(&claude).unwrap();
+        assert_eq!(bridge(&content, &claude), nothing);
+        // A hook of the user is not ours.
+        write(
+            &claude.join("settings.json"),
+            r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}"#,
+        );
+        assert_eq!(bridge(&content, &claude).hook, Presence::Absent);
+
+        let prefix = command_prefix(Path::new("/opt/bm/bin/brainmaker"), None).unwrap();
+        let mut report = Report::default();
+        link_skills(&content, &claude, &mut report).unwrap();
+        write_settings(&claude, Some(&prefix)).unwrap();
+        write_briefing(&content, &claude, Some(&prefix)).unwrap();
+        assert_eq!(
+            bridge(&content, &claude),
+            Bridge {
+                hook: Presence::Present,
+                block: Presence::Present,
+                skills: 2,
+            }
+        );
+
+        remove_bridge(&content, &claude, None).unwrap();
+        assert_eq!(bridge(&content, &claude), nothing);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_json_reads_as_unknown() {
+        let base = temp_dir("bridge-unknown");
+        let claude = base.join("claude");
+        write(&claude.join("settings.json"), "{ not json");
+        fs::write(claude.join("CLAUDE.md"), [0xff, 0xfe, 0x00]).unwrap();
+
+        let state = bridge(&base.join("content"), &claude);
+
+        assert_eq!(state.hook, Presence::Unknown);
+        assert_eq!(state.block, Presence::Unknown);
+        assert_eq!(state.skills, 0);
         fs::remove_dir_all(&base).ok();
     }
 

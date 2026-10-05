@@ -42,6 +42,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
+use crate::cause::{self, Cause, Failure};
 use crate::config::{Config, MAX_NOTE_BYTES};
 use crate::lock;
 use crate::remote;
@@ -71,6 +72,51 @@ pub const HEADER_CONTENT: &str = "Brainmaker-Content";
 pub const HEADER_OUTBOX: &str = "Brainmaker-Outbox";
 
 // -------------------------------------------------------------- the rules ---
+
+/// The rule that a refused note broke, as one word from a fixed list.
+///
+/// The reason text beside a rejected note can quote the note. The diagnostic
+/// report therefore carries this word, and never the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Rule {
+    /// The entry is a symbolic link.
+    Symlink,
+    /// The entry is not a regular file.
+    NotAFile,
+    /// The file could not be read, or it changed while push read it.
+    Unreadable,
+    /// The name is not `YYYY-MM-DD-<slug>.md`.
+    Name,
+    /// The note is larger than the limit.
+    Size,
+    /// The body is empty, is not UTF-8, or holds a NUL or a byte-order mark.
+    Text,
+    /// The frontmatter does not have the shape that the rules give it.
+    Frontmatter,
+    /// `kind` is absent, or is not one of the four values.
+    Kind,
+    /// `domain` is absent, or is not a slug.
+    Domain,
+    /// The server refused the note with HTTP 400 or 413.
+    Server,
+}
+
+/// A rule that a note body breaks, and the reason as a person reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Broken {
+    rule: Rule,
+    reason: String,
+}
+
+impl Broken {
+    fn new(rule: Rule, reason: impl Into<String>) -> Self {
+        Self {
+            rule,
+            reason: reason.into(),
+        }
+    }
+}
 
 /// A note name is `YYYY-MM-DD-<slug>.md`, where the slug is lowercase ASCII
 /// letters, digits, and `-`, starting with a letter or a digit. The server
@@ -115,17 +161,22 @@ pub struct Note {
 }
 
 /// Checks a note body, and reads its frontmatter. The size cap is the
-/// caller's. The error names the rule that the body breaks.
-pub fn check_note(body: &[u8]) -> Result<Note, String> {
+/// caller's. The error names the rule that the body breaks, as a word and as
+/// the reason that a person reads.
+fn check_note(body: &[u8]) -> Result<Note, Broken> {
     if body.is_empty() {
-        return Err("the note is empty".to_string());
+        return Err(Broken::new(Rule::Text, "the note is empty"));
     }
     if body.starts_with(BOM) {
-        return Err("the note starts with a byte-order mark".to_string());
+        return Err(Broken::new(
+            Rule::Text,
+            "the note starts with a byte-order mark",
+        ));
     }
-    let text = std::str::from_utf8(body).map_err(|_| "the note is not valid UTF-8".to_string())?;
+    let text = std::str::from_utf8(body)
+        .map_err(|_| Broken::new(Rule::Text, "the note is not valid UTF-8"))?;
     if text.contains('\0') {
-        return Err("the note holds a NUL character".to_string());
+        return Err(Broken::new(Rule::Text, "the note holds a NUL character"));
     }
     parse_frontmatter(text)
 }
@@ -135,11 +186,12 @@ pub fn check_note(body: &[u8]) -> Result<Note, String> {
 ///
 /// Only the keys a note needs are read. Indented lines and list items belong
 /// to the key above them, and blank lines and comments carry nothing.
-fn parse_frontmatter(text: &str) -> Result<Note, String> {
+fn parse_frontmatter(text: &str) -> Result<Note, Broken> {
+    let shape = |reason: String| Broken::new(Rule::Frontmatter, reason);
     let rest = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))
-        .ok_or_else(|| "the note does not start with a --- line".to_string())?;
+        .ok_or_else(|| shape("the note does not start with a --- line".to_string()))?;
 
     let mut seen: Vec<&str> = Vec::new();
     let mut kind = None;
@@ -155,24 +207,24 @@ fn parse_frontmatter(text: &str) -> Result<Note, String> {
             Line::Ignored => continue,
             Line::Other => {
                 // Line 1 is the opening ---, so the first line here is line 2.
-                return Err(format!(
+                return Err(shape(format!(
                     "line {} of the frontmatter is not `key: value`, an indented line, a list \
                      item, or a comment",
                     index + 2
-                ));
+                )));
             }
             Line::Key(key, value) => {
                 if seen.contains(&key) {
-                    return Err(format!("the frontmatter repeats the key {key}"));
+                    return Err(shape(format!("the frontmatter repeats the key {key}")));
                 }
                 seen.push(key);
                 match key {
-                    "kind" => kind = Some(read_value(key, value)?),
-                    "domain" => domain = Some(read_value(key, value)?),
+                    "kind" => kind = Some(read_value(key, value).map_err(shape)?),
+                    "domain" => domain = Some(read_value(key, value).map_err(shape)?),
                     // Nothing reads the author for attribution, and the
                     // server applies the same value rule to it.
                     "author" => {
-                        read_value(key, value)?;
+                        read_value(key, value).map_err(shape)?;
                     }
                     _ => {}
                 }
@@ -180,21 +232,25 @@ fn parse_frontmatter(text: &str) -> Result<Note, String> {
         }
     }
     if !closed {
-        return Err("the frontmatter has no closing --- line".to_string());
+        return Err(shape("the frontmatter has no closing --- line".to_string()));
     }
 
-    let kind = kind.ok_or_else(|| "the frontmatter has no kind".to_string())?;
+    let kind = kind.ok_or_else(|| Broken::new(Rule::Kind, "the frontmatter has no kind"))?;
     if !KINDS.contains(&kind.as_str()) {
-        return Err(format!(
-            "the kind {kind:?} is not one of {}",
-            KINDS.join(", ")
+        return Err(Broken::new(
+            Rule::Kind,
+            format!("the kind {kind:?} is not one of {}", KINDS.join(", ")),
         ));
     }
-    let domain = domain.ok_or_else(|| "the frontmatter has no domain".to_string())?;
+    let domain =
+        domain.ok_or_else(|| Broken::new(Rule::Domain, "the frontmatter has no domain"))?;
     if !is_slug(&domain, MAX_NAME_LEN) {
-        return Err(format!(
-            "the domain {domain:?} is not 1 to {MAX_NAME_LEN} lowercase letters, digits, and \
-             '-', starting with a letter or a digit"
+        return Err(Broken::new(
+            Rule::Domain,
+            format!(
+                "the domain {domain:?} is not 1 to {MAX_NAME_LEN} lowercase letters, digits, \
+                 and '-', starting with a letter or a digit"
+            ),
         ));
     }
     Ok(Note { kind, domain })
@@ -337,6 +393,22 @@ fn notes_in(dir: &Path) -> Vec<(String, PathBuf)> {
     found
 }
 
+/// How many notes `sent/` holds, over all of its month directories, counted
+/// from the files alone. The count stops at `limit`.
+pub fn sent_count(config: &Config, limit: usize) -> usize {
+    let Ok(months) = fs::read_dir(config.sent_dir()) else {
+        return 0;
+    };
+    let mut count = 0;
+    for month in months.flatten() {
+        count += notes_in(&month.path()).len();
+        if count >= limit {
+            return limit;
+        }
+    }
+    count
+}
+
 /// The headers in which `content/latest` reports this client: its platform,
 /// its installed content, and the notes waiting on it.
 pub fn report_headers(config: &Config) -> Vec<(&'static str, String)> {
@@ -427,15 +499,28 @@ pub fn read_push_state(config: &Config) -> Option<PushState> {
 pub struct Pushed {
     /// Where each note that the server holds now went, in the order sent.
     pub sent: Vec<PathBuf>,
-    /// Each note that moved to `rejected/`, with the reason.
-    pub rejected: Vec<(String, String)>,
+    /// Each note that moved to `rejected/`.
+    pub rejected: Vec<Rejected>,
     /// Notes left for the next run, because they changed in the last 60
     /// seconds.
     pub settling: usize,
     /// Why the run stopped with notes still waiting, when it did.
     pub stopped: Option<String>,
+    /// The cause of that stop as a word, for the diagnostic report.
+    pub failure: Option<Failure>,
     /// True when another run held the push lock, so this one did nothing.
     pub busy: bool,
+}
+
+/// One note that moved to `rejected/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejected {
+    pub name: String,
+    /// The reason as a person reads it. It can quote the note, so it stays on
+    /// this machine.
+    pub reason: String,
+    /// The rule that the note broke.
+    pub rule: Rule,
 }
 
 /// One note that passed every check here, ready to send.
@@ -452,8 +537,8 @@ enum Checked {
     Ready(Ready),
     /// Changed in the last 60 seconds.
     Settling,
-    /// Broke a rule, for this reason.
-    Refused(String),
+    /// Broke this rule, for this reason.
+    Refused(Rule, String),
     /// Went away after the listing, as a file that Claude renamed does.
     Gone,
 }
@@ -479,10 +564,10 @@ pub fn push(config: &Config, log: &dyn Fn(&str)) -> Result<Pushed> {
             Checked::Ready(note) => ready.push(note),
             Checked::Settling => pushed.settling += 1,
             Checked::Gone => {}
-            Checked::Refused(reason) => {
+            Checked::Refused(rule, reason) => {
                 reject(config, &path, &name, &reason)?;
                 log(&format!("Rejected {name}: {reason}"));
-                pushed.rejected.push((name, reason));
+                pushed.rejected.push(Rejected { name, reason, rule });
             }
         }
     }
@@ -499,10 +584,12 @@ pub fn push(config: &Config, log: &dyn Fn(&str)) -> Result<Pushed> {
                 ready.len(),
                 config.outbox_dir().display()
             ));
+            pushed.failure = Some(Failure::new(Cause::Scope));
             return Ok(pushed);
         }
         Err(error) => {
             pushed.stopped = Some(format!("cannot get a token to send the notes: {error:#}"));
+            pushed.failure = Some(cause::of(&error));
             return Ok(pushed);
         }
     };
@@ -517,6 +604,7 @@ pub fn push(config: &Config, log: &dyn Fn(&str)) -> Result<Pushed> {
                     "{error:#}; {} note(s) stay in the outbox",
                     total - index
                 ));
+                pushed.failure = Some(cause::of(&error));
                 break;
             }
         };
@@ -539,7 +627,11 @@ pub fn push(config: &Config, log: &dyn Fn(&str)) -> Result<Pushed> {
                 );
                 reject(config, &note.path, &note.name, &reason)?;
                 log(&format!("Rejected {}: {reason}", note.name));
-                pushed.rejected.push((note.name, reason));
+                pushed.rejected.push(Rejected {
+                    name: note.name,
+                    reason,
+                    rule: Rule::Server,
+                });
             }
             status => {
                 pushed.stopped = Some(format!(
@@ -547,6 +639,10 @@ pub fn push(config: &Config, log: &dyn Fn(&str)) -> Result<Pushed> {
                     refusal(status, &answer.body),
                     total - index
                 ));
+                pushed.failure = Some(Failure {
+                    cause: Cause::Http,
+                    status: Some(status),
+                });
                 break;
             }
         }
@@ -563,15 +659,21 @@ fn check(name: &str, path: &Path, now: SystemTime) -> Checked {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Checked::Gone,
-        Err(error) => return Checked::Refused(format!("cannot read the file: {error}")),
+        Err(error) => {
+            return Checked::Refused(Rule::Unreadable, format!("cannot read the file: {error}"));
+        }
     };
     if meta.file_type().is_symlink() {
         return Checked::Refused(
+            Rule::Symlink,
             "the entry is a symbolic link, and push sends regular files only".to_string(),
         );
     }
     if !meta.is_file() {
-        return Checked::Refused("the entry is not a regular file".to_string());
+        return Checked::Refused(
+            Rule::NotAFile,
+            "the entry is not a regular file".to_string(),
+        );
     }
     let modified = meta.modified().unwrap_or(now);
     // A time in the future also waits: its age is not known.
@@ -582,17 +684,18 @@ fn check(name: &str, path: &Path, now: SystemTime) -> Checked {
         return Checked::Settling;
     }
     if let Err(reason) = validate_name(name) {
-        return Checked::Refused(reason);
+        return Checked::Refused(Rule::Name, reason);
     }
     let bytes = match read_capped(path, &meta) {
         Ok(Capped::Bytes(bytes)) => bytes,
         Ok(Capped::TooLarge) => {
-            return Checked::Refused(format!(
-                "the note is larger than the limit of {MAX_NOTE_BYTES} bytes"
-            ));
+            return Checked::Refused(
+                Rule::Size,
+                format!("the note is larger than the limit of {MAX_NOTE_BYTES} bytes"),
+            );
         }
         Ok(Capped::Gone) => return Checked::Gone,
-        Err(reason) => return Checked::Refused(reason),
+        Err(reason) => return Checked::Refused(Rule::Unreadable, reason),
     };
     match check_note(&bytes) {
         Ok(note) => Checked::Ready(Ready {
@@ -602,7 +705,7 @@ fn check(name: &str, path: &Path, now: SystemTime) -> Checked {
             bytes,
             note,
         }),
-        Err(reason) => Checked::Refused(reason),
+        Err(broken) => Checked::Refused(broken.rule, broken.reason),
     }
 }
 
@@ -759,6 +862,12 @@ mod tests {
 
     fn note(frontmatter: &str) -> Result<Note, String> {
         check_note(format!("---\n{frontmatter}\n---\n\n# Body\n").as_bytes())
+            .map_err(|broken| broken.reason)
+    }
+
+    /// The rule that a body breaks.
+    fn rule_of(body: &[u8]) -> Rule {
+        check_note(body).unwrap_err().rule
     }
 
     // The vectors of the plan. Synapsis keeps the same ones in its outbox.rs.
@@ -789,7 +898,9 @@ mod tests {
         let error = note("kind: fact\nkind: decision\ndomain: damac").unwrap_err();
         assert!(error.contains("repeats the key kind"), "got {error}");
 
-        let error = check_note(b"---\nkind: fact\ndomain: damac\n\n# Body\n").unwrap_err();
+        let error = check_note(b"---\nkind: fact\ndomain: damac\n\n# Body\n")
+            .unwrap_err()
+            .reason;
         assert!(error.contains("closing"), "got {error}");
 
         let crlf = "---\r\nkind: fact\r\ndomain: damac\r\nauthor: gabriele\r\n---\r\n\r\nBody\r\n";
@@ -845,6 +956,43 @@ mod tests {
         assert!(check_note(b"---\nkind: fact\ndomain: d\n---\na\0b").is_err());
         assert!(check_note(b"# Title\n---\nkind: fact\ndomain: d\n---\n").is_err());
         check_note(b"---\nkind: fact\ndomain: d\n---").unwrap();
+    }
+
+    #[test]
+    fn each_broken_rule_has_its_word() {
+        assert_eq!(rule_of(b""), Rule::Text);
+        assert_eq!(rule_of(b"\xEF\xBB\xBF---\nkind: fact\n---\n"), Rule::Text);
+        assert_eq!(
+            rule_of(b"---\nkind: fact\ndomain: d\n---\n\xff"),
+            Rule::Text
+        );
+        assert_eq!(
+            rule_of(b"---\nkind: fact\ndomain: d\n---\na\0b"),
+            Rule::Text
+        );
+        assert_eq!(rule_of(b"# no frontmatter\n"), Rule::Frontmatter);
+        assert_eq!(rule_of(b"---\nkind: fact\ndomain: d\n"), Rule::Frontmatter);
+        assert_eq!(rule_of(b"---\njust words\n---\n"), Rule::Frontmatter);
+        assert_eq!(
+            rule_of(b"---\nkind: fact\nkind: fact\ndomain: d\n---\n"),
+            Rule::Frontmatter
+        );
+        assert_eq!(
+            rule_of(b"---\nkind: \"open\ndomain: d\n---\n"),
+            Rule::Frontmatter
+        );
+        assert_eq!(rule_of(b"---\ndomain: d\n---\n"), Rule::Kind);
+        assert_eq!(rule_of(b"---\nkind: lesson\ndomain: d\n---\n"), Rule::Kind);
+        assert_eq!(rule_of(b"---\nkind: fact\n---\n"), Rule::Domain);
+        assert_eq!(
+            rule_of(b"---\nkind: fact\ndomain: Not A Slug\n---\n"),
+            Rule::Domain
+        );
+        // The word is what a report carries.
+        assert_eq!(
+            serde_json::to_string(&Rule::NotAFile).unwrap(),
+            "\"not_a_file\""
+        );
     }
 
     // ------------------------------------------------------------ push ---
@@ -1065,7 +1213,8 @@ mod tests {
         let pushed = push(&config, &quiet).unwrap();
 
         assert_eq!(pushed.rejected.len(), 1);
-        assert!(pushed.rejected[0].1.contains("symbolic link"));
+        assert!(pushed.rejected[0].reason.contains("symbolic link"));
+        assert_eq!(pushed.rejected[0].rule, Rule::Symlink);
         assert!(server.received().is_empty(), "nothing was sent");
         let moved = config.rejected_dir().join("2026-09-30-link.md");
         assert!(

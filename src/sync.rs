@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::archive;
+use crate::cause::{self, Cause, Failure};
 use crate::config::{Config, validate_hash};
 use crate::lock;
 use crate::remote;
@@ -19,8 +20,13 @@ pub enum Outcome {
     /// The local content already matches the remote hash.
     UpToDate { hash: String },
     /// The server could not be reached, and the installed content stays in
-    /// place. `hash` is the installed one.
-    Unreachable { hash: String, error: String },
+    /// place. `hash` is the installed one. `failure` names the cause as a
+    /// word, for the diagnostic report.
+    Unreachable {
+        hash: String,
+        error: String,
+        failure: Failure,
+    },
     /// Another run holds the install lock, and the installed content stays in
     /// place. `hash` is the installed one.
     Busy { hash: String },
@@ -87,6 +93,7 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
                 Some(hash) if content_present && !force => Ok(Outcome::Unreachable {
                     hash,
                     error: format!("{error:#}"),
+                    failure: cause::of(&error),
                 }),
                 _ => Err(error),
             };
@@ -155,17 +162,23 @@ fn check_order(installed: Option<u64>, offered: Option<u64>) -> Result<()> {
     match (installed, offered) {
         (None, _) => Ok(()),
         (Some(held), Some(new)) if new > held => Ok(()),
-        (Some(held), Some(new)) => bail!(
+        (Some(held), Some(new)) => Err(not_newer(format!(
             "the server offers a content release with the sequence {new}, and the \
              installed one has the sequence {held}. brainmaker installs only a newer \
              release. If this rollback is intended, run sync --force"
-        ),
-        (Some(held), None) => bail!(
+        ))),
+        (Some(held), None) => Err(not_newer(format!(
             "the server offers a content release with no sequence, and the installed \
              one has the sequence {held}. Sign the release with a current \
              brainmaker-sign. If this rollback is intended, run sync --force"
-        ),
+        ))),
     }
+}
+
+/// An error for a release that the order rule refuses. It prints `text`, and
+/// a report names its cause as the order.
+fn not_newer(text: String) -> anyhow::Error {
+    cause::failed(Cause::Order, None, text)
 }
 
 /// Downloads one release and replaces `content/` with it.
@@ -665,7 +678,7 @@ mod tests {
         let outcome = sync(&offline, false, &quiet).unwrap();
 
         match outcome {
-            Outcome::Unreachable { hash, error } => {
+            Outcome::Unreachable { hash, error, .. } => {
                 assert_eq!(hash, "a1b2c3d4");
                 assert!(!error.is_empty(), "the outcome names no cause");
             }

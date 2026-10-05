@@ -28,6 +28,8 @@
 use anyhow::{Context, Result, bail};
 use ring::signature::{self, UnparsedPublicKey};
 
+use crate::cause::{self, Cause};
+
 /// Length of an Ed25519 public key, in bytes.
 const PUBLIC_KEY_LEN: usize = 32;
 
@@ -131,11 +133,11 @@ pub fn verify_content(payload: &[u8], signature: &str) -> Result<()> {
 /// value it reads is public, so the loop leaks nothing through its timing.
 fn verify_with(keys: &[&str], payload: &[u8], signature: &str) -> Result<()> {
     if keys.is_empty() {
-        bail!(
+        return Err(untrusted(
             "this build trusts no signing key for this document, so it cannot check it and \
              will install nothing. Add the public key to PUBLIC_KEYS or CONTENT_KEYS in \
-             src/signature.rs and build again."
-        );
+             src/signature.rs and build again.",
+        ));
     }
 
     let signature_bytes = decode_hex(signature.trim(), SIGNATURE_LEN)
@@ -152,10 +154,16 @@ fn verify_with(keys: &[&str], payload: &[u8], signature: &str) -> Result<()> {
         }
     }
 
-    bail!(
+    Err(untrusted(
         "it carries no signature from a key this binary trusts. \
-         Another key signed it, or something altered it after it was signed."
-    )
+         Another key signed it, or something altered it after it was signed.",
+    ))
+}
+
+/// An error for a document that no trusted key signed. It prints `text`, and a
+/// report names its cause as a signature.
+fn untrusted(text: &str) -> anyhow::Error {
+    cause::failed(Cause::Signature, None, text.to_string())
 }
 
 /// Decodes a hexadecimal string into exactly `expected` bytes.

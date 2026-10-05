@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The admin commands: collect the notes, read the fleet, and read the sync
-//! log of the fleet.
+//! The admin commands: collect the notes, read the fleet, read the sync log
+//! of the fleet, and read what each client reports about itself.
 //!
 //! # Who runs them
 //!
@@ -17,6 +17,13 @@
 //! machines of one operator apart, and `syncs --client` takes one. A client ID
 //! alone authenticates nothing. No command prints the credential of the
 //! machine it runs on.
+//!
+//! # Why a client sends no note
+//!
+//! `diagnose` answers that from the admin's machine. It joins what the server
+//! saw of a client with the report that the client sends about itself, and
+//! names the cause in a line that starts with `finding`. The client decides
+//! what it reports, and sends it with its sync: see [`crate::diagnostics`].
 //!
 //! # Times
 //!
@@ -37,10 +44,15 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
-use crate::config::Config;
+use crate::cause::{self, Cause};
+use crate::config::{Config, validate_hash};
+use crate::diagnostics::{Agent, Code, Command, word};
+use crate::link::Presence;
 use crate::lock;
-use crate::outbox;
+use crate::outbox::{self, Rule};
 use crate::remote;
+use crate::selfupdate;
+use crate::version;
 
 /// Notes that one page of `pull-outbox` asks for.
 const PAGE: u32 = 100;
@@ -894,6 +906,570 @@ pub fn sync_line(sync: &ClientSync) -> String {
     )
 }
 
+// ---------------------------------------------------------- diagnostics ---
+
+/// The first version of this program that has push. An older client syncs,
+/// and sends no note.
+const FIRST_VERSION_WITH_PUSH: &str = "0.1.8";
+
+/// How much older than the last sync a report may be, in seconds, before
+/// `diagnose` says that the state it shows can be old. A client reports at
+/// most twice an hour, so a day is far past any wait.
+const STALE_REPORT_SECS: i64 = 24 * 60 * 60;
+
+/// Body of `GET {base}/admin/clients/<client_id>/diagnostics`. Any other
+/// shape fails the command, as for the fleet view.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Diagnostics {
+    client_id: String,
+    report: Option<Report>,
+    events: Vec<LoggedEvent>,
+}
+
+/// The last report of one client, as the server stored it. The client wrote
+/// every value but `received_at`, and nothing verified them. A value is
+/// absent when the report held none, or when it broke its rule on the server.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Report {
+    /// When the server received the report.
+    pub received_at: String,
+    /// The clock of the client when it read its state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    pub content: ReportedContent,
+    pub link: ReportedLink,
+    pub outbox: ReportedOutbox,
+    /// Lines of that report that the server did not know, and dropped.
+    pub events_dropped: u64,
+}
+
+/// The content that a client says it holds.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportedContent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub present: Option<bool>,
+}
+
+/// What a client says `link` wrote on its machine.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportedLink {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hook: Option<Presence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block: Option<Presence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Agent>,
+}
+
+/// The notes that a client says it holds.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportedOutbox {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sent: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_push_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_push_notes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator: Option<bool>,
+}
+
+/// One line of the run log of a client, as the server stored it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggedEvent {
+    pub id: i64,
+    /// The clock of the client when it wrote the line.
+    pub at: String,
+    pub command: Command,
+    pub code: Code,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Cause>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<Rule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// What the admin reads of one client: what the server saw, what the client
+/// reported, why no note arrives, and the newest lines of the run log.
+#[derive(Debug, Serialize)]
+pub struct Diagnosis {
+    pub client_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
+    pub retired: bool,
+    /// The last sync that the server saw.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sync_at: Option<String>,
+    /// The version that the client named at that sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brainmaker_version: Option<String>,
+    /// The notes of this client that the server holds.
+    pub notes_stored: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<Report>,
+    /// Each cause that the server and the report show for a client that
+    /// sends no note, or that is not current.
+    pub findings: Vec<String>,
+    /// The run log, newest first.
+    pub events: Vec<LoggedEvent>,
+}
+
+/// Reads, for each selected client, the report and the newest `limit` lines
+/// of the run log, and names what they show.
+///
+/// The fleet view gives the clients of an operator, and what the server saw
+/// of each one. The client sent the rest itself: this command asks no client
+/// for anything.
+pub fn diagnose(config: &Config, selector: &Selector, limit: u32) -> Result<Vec<Diagnosis>> {
+    match selector {
+        Selector::Client(client_id) => check_client_id(client_id)?,
+        Selector::Operator(operator) => check_operator(operator)?,
+    }
+    let clients: Vec<Client> = fleet(config)?
+        .clients
+        .into_iter()
+        .filter(|client| match selector {
+            Selector::Client(client_id) => &client.client_id == client_id,
+            Selector::Operator(operator) => client.operator.as_deref() == Some(operator.as_str()),
+        })
+        .collect();
+    if clients.is_empty() {
+        match selector {
+            Selector::Client(client_id) => {
+                bail!("the server knows no client with the ID {client_id}")
+            }
+            Selector::Operator(operator) => bail!("the server registers no client to {operator}"),
+        }
+    }
+
+    clients
+        .into_iter()
+        .map(|client| {
+            let url = config.admin_diagnostics_url(&client.client_id, limit);
+            let body = remote::fetch_admin(config, &url, MAX_REPORT_BYTES)
+                .map_err(with_scope_hint)
+                .map_err(with_route_hint)?;
+            let found: Diagnostics = serde_json::from_str(&body)
+                .with_context(|| format!("{url} did not return the expected diagnostics"))?;
+            check_diagnostics(&found, &client.client_id)?;
+            Ok(Diagnosis {
+                findings: findings(&client, found.report.as_ref(), &found.events),
+                client_id: client.client_id,
+                operator: client.operator,
+                retired: client.retired,
+                last_sync_at: client.last_seen_at,
+                brainmaker_version: client.brainmaker_version,
+                notes_stored: client.notes_pushed_total,
+                report: found.report,
+                events: found.events,
+            })
+        })
+        .collect()
+}
+
+/// Says that a server older than the diagnostics route answers 404 too.
+fn with_route_hint(error: anyhow::Error) -> anyhow::Error {
+    if cause::of(&error).status == Some(404) {
+        return error.context(
+            "the server has no diagnostics for this client; a server older than the \
+             diagnostics route answers 404 too",
+        );
+    }
+    error
+}
+
+/// Checks every value of the diagnostics that is not a word of a fixed list:
+/// the client, each time, each version, and each content hash.
+fn check_diagnostics(found: &Diagnostics, client_id: &str) -> Result<()> {
+    if found.client_id != client_id {
+        bail!("the server answered with the diagnostics of another client than {client_id}");
+    }
+    let check_version = |value: &str| -> Result<()> {
+        if !version::validate(value) {
+            bail!(
+                "the server sent the version {:?}, which is not a version",
+                remote::printable(value)
+            );
+        }
+        Ok(())
+    };
+    if let Some(report) = &found.report {
+        check_time(&report.received_at, "received_at")?;
+        for (what, time) in [
+            ("at", &report.at),
+            ("content.installed_at", &report.content.installed_at),
+            ("outbox.last_push_at", &report.outbox.last_push_at),
+        ] {
+            if let Some(time) = time {
+                check_time(time, what)?;
+            }
+        }
+        if let Some(value) = &report.version {
+            check_version(value)?;
+        }
+        if let Some(platform) = &report.platform
+            && !platform
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_'))
+        {
+            bail!(
+                "the server sent the platform {:?}, which is not a platform key",
+                remote::printable(platform)
+            );
+        }
+        if let Some(hash) = &report.content.installed_hash {
+            validate_hash(hash)?;
+        }
+    }
+    for event in &found.events {
+        check_time(&event.at, "at")?;
+        if let Some(value) = &event.version {
+            check_version(value)?;
+        }
+        if let Some(hash) = &event.hash {
+            validate_hash(hash)?;
+        }
+    }
+    Ok(())
+}
+
+/// Names each cause that the server and the report show for a client that
+/// sends no note, or that is not current.
+///
+/// The four causes that the server alone cannot see come first to mind: the
+/// client is too old, `link` never connected Claude, every note broke a rule
+/// on the machine, or no note was written at all.
+fn findings(client: &Client, report: Option<&Report>, events: &[LoggedEvent]) -> Vec<String> {
+    let mut found = Vec::new();
+    if client.retired {
+        found.push(
+            "The registry marks this client as retired, so the server refuses its notes."
+                .to_string(),
+        );
+    } else if client.operator.is_none() {
+        found.push(
+            "The registry names no operator for this client, so the server refuses its notes. \
+             Register the client."
+                .to_string(),
+        );
+    }
+
+    let Some(report) = report else {
+        found.push(match (&client.last_seen_at, &client.brainmaker_version) {
+            (None, _) => "The server never saw this client sync.".to_string(),
+            (Some(_), Some(named)) if version::is_newer(FIRST_VERSION_WITH_PUSH, named) => format!(
+                "This client runs brainmaker {}. That version has no push, which came with \
+                 {FIRST_VERSION_WITH_PUSH}, so it sends no note and no report. Update it.",
+                remote::printable(named)
+            ),
+            (Some(_), named) => format!(
+                "The server holds no report from this client. Its last sync named {}, and a \
+                 version that sends reports sends one with its sync. So this client is too \
+                 old for reports, or its reports do not arrive. This brainmaker is {}.",
+                named
+                    .as_deref()
+                    .map(|named| format!("brainmaker {}", remote::printable(named)))
+                    .unwrap_or_else(|| "no version".to_string()),
+                selfupdate::CURRENT_VERSION
+            ),
+        });
+        return found;
+    };
+
+    // A report that the syncs left behind describes the machine as it was.
+    let behind = client
+        .last_seen_at
+        .as_deref()
+        .and_then(instant)
+        .zip(instant(&report.received_at))
+        .is_some_and(|(synced, received)| synced.saturating_sub(received) > STALE_REPORT_SECS);
+    if behind {
+        found.push(format!(
+            "The last report is from {}, and the client synced after it, at {}. Its newer \
+             reports did not arrive, so the state below can be old.",
+            report.received_at,
+            client.last_seen_at.as_deref().unwrap_or("-")
+        ));
+    }
+
+    match report.link.hook {
+        Some(Presence::Absent) => found.push(
+            "The SessionStart hook of brainmaker is not in the Claude settings of that \
+             machine. No session there reads the briefing or learns of the outbox, so Claude \
+             writes no note. Run link on that machine. The admin's own install has no hook \
+             on purpose."
+                .to_string(),
+        ),
+        Some(Presence::Unknown) => found.push(
+            "brainmaker could not read the Claude settings of that machine, so the report \
+             does not say whether the SessionStart hook is there."
+                .to_string(),
+        ),
+        Some(Presence::Present) | None => {}
+    }
+
+    let waiting = report.outbox.waiting.unwrap_or(0);
+    let rejected = report.outbox.rejected.unwrap_or(0);
+    let sent = report.outbox.sent.unwrap_or(0);
+    let none_arrived = sent == 0 && client.notes_pushed_total == 0;
+    if rejected > 0 {
+        let mut text = format!(
+            "{rejected} note(s) broke a rule on that machine and moved to rejected/{}.",
+            if none_arrived {
+                ", and none was sent"
+            } else {
+                ""
+            }
+        );
+        let rules = broken_rules(events);
+        if !rules.is_empty() {
+            text.push_str(&format!(
+                " The run log names the rule: {}.",
+                rules.join(", ")
+            ));
+        }
+        found.push(text);
+    }
+    if waiting > 0 {
+        let mut text = format!("{waiting} note(s) wait in the outbox of that machine.");
+        if let Some(reason) = last_push(events) {
+            text.push(' ');
+            text.push_str(&reason);
+        }
+        found.push(text);
+    }
+    if waiting == 0 && rejected == 0 && none_arrived && report.link.hook != Some(Presence::Absent) {
+        found.push(
+            "No note was ever written on that machine: its outbox holds none, none was \
+             rejected, and none was sent."
+                .to_string(),
+        );
+    }
+
+    if let Some(runs) = &report.version
+        && version::is_newer(selfupdate::CURRENT_VERSION, runs)
+    {
+        let mut text = format!(
+            "That machine runs brainmaker {}, and this one runs {}.",
+            remote::printable(runs),
+            selfupdate::CURRENT_VERSION
+        );
+        if matches!(report.link.agent, Some(Agent::Absent | Agent::None)) {
+            text.push_str(
+                " It has no hourly agent, so it updates only when someone runs self-update.",
+            );
+        }
+        found.push(text);
+    }
+    if report.events_dropped > 0 {
+        found.push(format!(
+            "The server did not know {} line(s) of the last report and dropped them. The \
+             server is older than that client.",
+            report.events_dropped
+        ));
+    }
+    found
+}
+
+/// Each rule that the run log names for a rejected note, with its count:
+/// `kind (2)`.
+fn broken_rules(events: &[LoggedEvent]) -> Vec<String> {
+    let mut by_rule: BTreeMap<Rule, u64> = BTreeMap::new();
+    for event in events {
+        if let (Code::PushRejected, Some(rule)) = (event.code, event.rule) {
+            let count = by_rule.entry(rule).or_default();
+            *count = count.saturating_add(event.count.unwrap_or(1));
+        }
+    }
+    by_rule
+        .into_iter()
+        .map(|(rule, count)| format!("{} ({count})", word(&rule)))
+        .collect()
+}
+
+/// What the newest push line of the run log says about notes that wait.
+fn last_push(events: &[LoggedEvent]) -> Option<String> {
+    let event = events.iter().find(|event| {
+        matches!(
+            event.code,
+            Code::PushStopped | Code::PushSettling | Code::PushSent | Code::PushFailed
+        )
+    })?;
+    match event.code {
+        Code::PushStopped => Some(format!(
+            "The last push stopped: {}.",
+            match (event.cause, event.status) {
+                (Some(Cause::Scope), _) =>
+                    "the issuer does not grant this client the scope outbox:write".to_string(),
+                (Some(Cause::Credentials), _) =>
+                    "the issuer refused the client credentials".to_string(),
+                (Some(Cause::Unreachable), _) =>
+                    "the server or the issuer did not answer".to_string(),
+                (Some(Cause::Http), Some(403)) =>
+                    "the server refused the note with HTTP 403, as it does for a client with no \
+                     operator and for a retired one"
+                        .to_string(),
+                (Some(Cause::Http), Some(404)) =>
+                    "the server answered HTTP 404, so it has no outbox route".to_string(),
+                (Some(Cause::Http), Some(429)) =>
+                    "the server limits the notes of this client (HTTP 429)".to_string(),
+                (Some(Cause::Http), Some(status)) => format!("the server answered HTTP {status}"),
+                _ => "the run log names no cause".to_string(),
+            }
+        )),
+        Code::PushSettling => Some(
+            "They changed less than a minute before the last run, so push left them for the \
+             next run."
+                .to_string(),
+        ),
+        Code::PushFailed => Some("The last push failed on that machine.".to_string()),
+        _ => None,
+    }
+}
+
+/// The lines that `diagnose` prints for one client. Every value from the
+/// server loses its control characters.
+pub fn diagnosis_lines(diagnosis: &Diagnosis) -> Vec<String> {
+    let value = |text: &Option<String>| {
+        text.as_deref()
+            .map(remote::printable)
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let number = |count: Option<u64>| {
+        count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    };
+    fn named<T: Serialize>(value: &Option<T>) -> String {
+        value.as_ref().map(word).unwrap_or_else(|| "-".to_string())
+    }
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "{}  {}{}",
+        diagnosis.operator.as_deref().unwrap_or("unregistered"),
+        diagnosis.client_id,
+        if diagnosis.retired { "  retired" } else { "" }
+    ));
+    lines.push(format!(
+        "  server    last sync {}  version {}  notes stored {}",
+        value(&diagnosis.last_sync_at),
+        value(&diagnosis.brainmaker_version),
+        diagnosis.notes_stored
+    ));
+    match &diagnosis.report {
+        None => lines.push("  report    none".to_string()),
+        Some(report) => {
+            lines.push(format!(
+                "  report    received {}  read on the client at {}",
+                report.received_at,
+                value(&report.at)
+            ));
+            lines.push(format!(
+                "  software  {}  {}",
+                value(&report.version),
+                value(&report.platform)
+            ));
+            lines.push(format!(
+                "  content   {}  installed {}  {}",
+                value(&report.content.installed_hash),
+                value(&report.content.installed_at),
+                match report.content.present {
+                    Some(true) => "present",
+                    Some(false) => "missing",
+                    None => "-",
+                }
+            ));
+            lines.push(format!(
+                "  link      hook {}  block {}  skills {}  agent {}",
+                named(&report.link.hook),
+                named(&report.link.block),
+                number(report.link.skills),
+                named(&report.link.agent)
+            ));
+            lines.push(format!(
+                "  outbox    waiting {}  rejected {}  sent {}  last push {}  operator {}",
+                number(report.outbox.waiting),
+                number(report.outbox.rejected),
+                number(report.outbox.sent),
+                value(&report.outbox.last_push_at),
+                match report.outbox.operator {
+                    Some(true) => "named",
+                    Some(false) => "not named",
+                    None => "-",
+                }
+            ));
+        }
+    }
+    if diagnosis.findings.is_empty() {
+        lines.push("  finding   none".to_string());
+    }
+    for finding in &diagnosis.findings {
+        lines.push(format!("  finding   {finding}"));
+    }
+    for event in &diagnosis.events {
+        lines.push(format!("  log       {}", event_line(event)));
+    }
+    lines
+}
+
+/// One line of the run log: the time, the command, what it did, and then each
+/// value that the line holds.
+fn event_line(event: &LoggedEvent) -> String {
+    let mut line = format!(
+        "{}  {}  {}",
+        event.at,
+        word(&event.command),
+        word(&event.code)
+    );
+    if let Some(cause) = &event.cause {
+        line.push_str(&format!("  {}", word(cause)));
+    }
+    if let Some(status) = event.status {
+        line.push_str(&format!("  HTTP {status}"));
+    }
+    if let Some(rule) = &event.rule {
+        line.push_str(&format!("  rule {}", word(rule)));
+    }
+    if let Some(count) = event.count {
+        line.push_str(&format!("  count {count}"));
+    }
+    if let Some(hash) = &event.hash {
+        line.push_str(&format!("  {}", remote::printable(hash)));
+    }
+    if let Some(version) = &event.version {
+        line.push_str(&format!("  {}", remote::printable(version)));
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,5 +2089,589 @@ mod tests {
             "{error:#}"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ------------------------------------------------------ diagnostics ---
+
+    use serde_json::json;
+
+    const GABRIELE: &str = "brainmaker-sync-gabriele";
+
+    /// The fleet row of one client of gabriele: the version that it named at
+    /// its last sync, and the notes of it that the server holds.
+    fn seen(version: Option<&str>, notes: u64) -> Client {
+        let mut row = client(
+            GABRIELE,
+            Some("gabriele"),
+            false,
+            Some("2026-10-05T10:00:03+02:00"),
+        );
+        row["brainmaker_version"] = json!(version);
+        row["notes_pushed_total"] = json!(notes);
+        serde_json::from_value(row).unwrap()
+    }
+
+    /// The report of a laptop that works, as the server answers it.
+    fn healthy() -> serde_json::Value {
+        json!({
+            "received_at": "2026-10-05T10:00:04+02:00",
+            "at": "2026-10-05T10:00:02+02:00",
+            "version": selfupdate::CURRENT_VERSION,
+            "platform": "darwin-arm64",
+            "content": {
+                "installed_hash": "a377aa94",
+                "installed_at": "2026-10-01T09:00:00+02:00",
+                "present": true
+            },
+            "link": { "hook": "present", "block": "present", "skills": 12, "agent": "present" },
+            "outbox": {
+                "waiting": 0, "rejected": 0, "sent": 3,
+                "last_push_at": "2026-10-04T18:12:40+02:00", "last_push_notes": 1,
+                "operator": true
+            },
+            "events_dropped": 0
+        })
+    }
+
+    /// A report whose outbox holds these counts.
+    fn with_notes(waiting: u64, rejected: u64, sent: u64) -> serde_json::Value {
+        let mut report = healthy();
+        report["outbox"]["waiting"] = json!(waiting);
+        report["outbox"]["rejected"] = json!(rejected);
+        report["outbox"]["sent"] = json!(sent);
+        report
+    }
+
+    /// One line of a run log, as the server answers it.
+    fn logged(id: i64, command: &str, code: &str) -> serde_json::Value {
+        json!({
+            "id": id, "at": "2026-10-05T10:00:02+02:00", "command": command, "code": code,
+            "cause": null, "status": null, "rule": null, "count": null, "hash": null,
+            "version": null
+        })
+    }
+
+    fn with(
+        mut value: serde_json::Value,
+        key: &str,
+        field: serde_json::Value,
+    ) -> serde_json::Value {
+        value[key] = field;
+        value
+    }
+
+    /// The findings for one client, its report, and its run log.
+    fn found(
+        client: &Client,
+        report: Option<serde_json::Value>,
+        events: Vec<serde_json::Value>,
+    ) -> Vec<String> {
+        let report: Option<Report> = report.map(|report| serde_json::from_value(report).unwrap());
+        let events: Vec<LoggedEvent> = events
+            .into_iter()
+            .map(|event| serde_json::from_value(event).unwrap())
+            .collect();
+        findings(client, report.as_ref(), &events)
+    }
+
+    // The four causes of the operators who synced and sent no note. Each one
+    // was local to the machine, and the admin could not see it.
+
+    #[test]
+    fn the_diagnosis_names_a_client_that_is_too_old_to_send_notes() {
+        // A client older than this report sends none, so the version comes
+        // from what the server saw at its last sync.
+        let named = found(&seen(Some("0.1.7"), 0), None, Vec::new());
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(named[0].contains("runs brainmaker 0.1.7"), "{named:?}");
+        assert!(named[0].contains("has no push"), "{named:?}");
+        assert!(named[0].contains("came with 0.1.8"), "{named:?}");
+
+        // 0.1.8 has push and no report: the finding says what is known.
+        let named = found(&seen(Some("0.1.8"), 0), None, Vec::new());
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(named[0].contains("holds no report"), "{named:?}");
+        assert!(named[0].contains("named brainmaker 0.1.8"), "{named:?}");
+        assert!(!named[0].contains("has no push"), "{named:?}");
+    }
+
+    #[test]
+    fn the_diagnosis_names_a_missing_link_to_claude() {
+        let mut report = with_notes(0, 0, 0);
+        report["link"] =
+            json!({ "hook": "absent", "block": "absent", "skills": 0, "agent": "present" });
+        let events = vec![logged(1, "sync", "content.up_to_date")];
+
+        let named = found(
+            &seen(Some(selfupdate::CURRENT_VERSION), 0),
+            Some(report),
+            events,
+        );
+
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(named[0].contains("SessionStart hook"), "{named:?}");
+        assert!(
+            named[0].contains("is not in the Claude settings"),
+            "{named:?}"
+        );
+        assert!(named[0].contains("Run link"), "{named:?}");
+    }
+
+    #[test]
+    fn the_diagnosis_says_when_the_report_is_older_than_the_syncs() {
+        // The client synced on 5 October, and its last report is of 1 October.
+        let mut old = healthy();
+        old["received_at"] = json!("2026-10-01T09:00:00+02:00");
+        let named = found(
+            &seen(Some(selfupdate::CURRENT_VERSION), 3),
+            Some(old),
+            Vec::new(),
+        );
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(
+            named[0].contains("is from 2026-10-01T09:00:00+02:00"),
+            "{named:?}"
+        );
+        assert!(named[0].contains("can be old"), "{named:?}");
+
+        // A report of the same day is not behind.
+        let mut fresh = healthy();
+        fresh["received_at"] = json!("2026-10-04T12:00:00+02:00");
+        let named = found(
+            &seen(Some(selfupdate::CURRENT_VERSION), 3),
+            Some(fresh),
+            Vec::new(),
+        );
+        assert!(named.is_empty(), "{named:?}");
+    }
+
+    #[test]
+    fn the_diagnosis_names_notes_that_all_broke_a_rule() {
+        let events = vec![
+            with(
+                with(logged(3, "sync", "push.rejected"), "rule", json!("kind")),
+                "count",
+                json!(1),
+            ),
+            logged(2, "sync", "content.up_to_date"),
+            with(
+                with(
+                    logged(1, "sync", "push.rejected"),
+                    "rule",
+                    json!("frontmatter"),
+                ),
+                "count",
+                json!(5),
+            ),
+            with(
+                with(logged(0, "push", "push.rejected"), "rule", json!("kind")),
+                "count",
+                json!(8),
+            ),
+        ];
+
+        let named = found(
+            &seen(Some(selfupdate::CURRENT_VERSION), 0),
+            Some(with_notes(0, 14, 0)),
+            events,
+        );
+
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(named[0].contains("14 note(s) broke a rule"), "{named:?}");
+        assert!(named[0].contains("moved to rejected/"), "{named:?}");
+        assert!(named[0].contains("none was sent"), "{named:?}");
+        assert!(named[0].contains("frontmatter (5), kind (9)"), "{named:?}");
+    }
+
+    #[test]
+    fn the_diagnosis_names_an_outbox_that_never_held_a_note() {
+        let named = found(
+            &seen(Some(selfupdate::CURRENT_VERSION), 0),
+            Some(with_notes(0, 0, 0)),
+            vec![logged(1, "sync", "content.up_to_date")],
+        );
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(named[0].contains("No note was ever written"), "{named:?}");
+    }
+
+    #[test]
+    fn a_client_whose_notes_arrive_has_no_finding() {
+        let named = found(
+            &seen(Some(selfupdate::CURRENT_VERSION), 3),
+            Some(healthy()),
+            Vec::new(),
+        );
+        assert!(named.is_empty(), "{named:?}");
+        // The server holds its notes, though the laptop keeps no sent copy.
+        let named = found(
+            &seen(Some(selfupdate::CURRENT_VERSION), 3),
+            Some(with_notes(0, 0, 0)),
+            Vec::new(),
+        );
+        assert!(named.is_empty(), "{named:?}");
+    }
+
+    #[test]
+    fn the_diagnosis_names_why_notes_wait() {
+        let stopped = |cause: &str, status: serde_json::Value| {
+            with(
+                with(logged(2, "sync", "push.stopped"), "cause", json!(cause)),
+                "status",
+                status,
+            )
+        };
+        for (event, needle) in [
+            (
+                stopped("scope", json!(null)),
+                "does not grant this client the scope outbox:write",
+            ),
+            (stopped("http", json!(403)), "HTTP 403"),
+            (stopped("http", json!(404)), "no outbox route"),
+            (stopped("http", json!(429)), "limits the notes"),
+            (stopped("http", json!(502)), "HTTP 502"),
+            (stopped("unreachable", json!(null)), "did not answer"),
+            (
+                stopped("credentials", json!(401)),
+                "refused the client credentials",
+            ),
+            (
+                with(logged(2, "sync", "push.settling"), "count", json!(2)),
+                "less than a minute",
+            ),
+            (logged(2, "push", "push.failed"), "failed on that machine"),
+        ] {
+            // An older line of another push does not hide the newest one.
+            let events = vec![event, stopped("http", json!(500))];
+            let named = found(
+                &seen(Some(selfupdate::CURRENT_VERSION), 3),
+                Some(with_notes(2, 0, 3)),
+                events,
+            );
+            assert_eq!(named.len(), 1, "{named:?}");
+            assert!(
+                named[0].starts_with("2 note(s) wait in the outbox"),
+                "{named:?}"
+            );
+            assert!(named[0].contains(needle), "{needle}: {named:?}");
+        }
+    }
+
+    #[test]
+    fn the_diagnosis_names_what_the_registry_and_the_versions_show() {
+        let mut unregistered = client(GABRIELE, None, false, Some("2026-10-05T10:00:03+02:00"));
+        unregistered["notes_pushed_total"] = json!(3);
+        let unregistered: Client = serde_json::from_value(unregistered).unwrap();
+        let named = found(&unregistered, Some(healthy()), Vec::new());
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(named[0].contains("names no operator"), "{named:?}");
+
+        let retired: Client =
+            serde_json::from_value(client(GABRIELE, Some("gabriele"), true, None)).unwrap();
+        let named = found(&retired, None, Vec::new());
+        assert!(named[0].contains("retired"), "{named:?}");
+        assert!(named[1].contains("never saw this client sync"), "{named:?}");
+
+        // A client that reports an older version, with no agent to update it.
+        let mut old = healthy();
+        old["version"] = json!("0.0.1");
+        old["link"]["agent"] = json!("none");
+        old["events_dropped"] = json!(2);
+        let named = found(&seen(Some("0.0.1"), 3), Some(old), Vec::new());
+        assert_eq!(named.len(), 2, "{named:?}");
+        assert!(named[0].contains("runs brainmaker 0.0.1"), "{named:?}");
+        assert!(named[0].contains("no hourly agent"), "{named:?}");
+        assert!(named[1].contains("did not know 2 line(s)"), "{named:?}");
+
+        let mut unreadable = healthy();
+        unreadable["link"]["hook"] = json!("unknown");
+        let named = found(&seen(None, 3), Some(unreadable), Vec::new());
+        assert!(
+            named[0].contains("could not read the Claude settings"),
+            "{named:?}"
+        );
+    }
+
+    fn diagnostics_body(
+        client_id: &str,
+        report: Option<serde_json::Value>,
+        events: Vec<serde_json::Value>,
+    ) -> String {
+        json!({ "client_id": client_id, "report": report, "events": events }).to_string()
+    }
+
+    #[test]
+    fn diagnose_reads_every_client_of_an_operator_and_prints_what_it_found() {
+        let mut absent = with_notes(0, 0, 0);
+        absent["link"] =
+            json!({ "hook": "absent", "block": "absent", "skills": 0, "agent": "present" });
+        let events = vec![
+            with(
+                logged(8, "sync", "content.up_to_date"),
+                "hash",
+                json!("a377aa94"),
+            ),
+            with(
+                with(
+                    logged(7, "sync", "content.unreachable"),
+                    "cause",
+                    json!("http"),
+                ),
+                "status",
+                json!(503),
+            ),
+            with(
+                logged(6, "self-update", "update.installed"),
+                "version",
+                json!("0.1.9"),
+            ),
+            with(
+                with(logged(5, "push", "push.rejected"), "rule", json!("kind")),
+                "count",
+                json!(2),
+            ),
+        ];
+        let mut first = client(
+            "brainmaker-sync-a",
+            Some("gabriele"),
+            false,
+            Some("2026-10-05T10:00:03+02:00"),
+        );
+        first["brainmaker_version"] = json!(selfupdate::CURRENT_VERSION);
+        first["notes_pushed_total"] = json!(0);
+        let mut second = client(
+            "brainmaker-sync-b",
+            Some("gabriele"),
+            true,
+            Some("2026-09-01T10:00:03+02:00"),
+        );
+        second["brainmaker_version"] = json!("0.1.7");
+        let server = Server::start(vec![
+            Route::token("outbox:read", r#"{"access_token":"read-token"}"#),
+            Route::get(
+                "/admin/clients",
+                fleet_body(&[
+                    first,
+                    second,
+                    client("brainmaker-sync-c", Some("anna"), false, None),
+                ]),
+            ),
+            Route::get(
+                "/admin/clients/brainmaker-sync-a/diagnostics?limit=20",
+                diagnostics_body("brainmaker-sync-a", Some(absent), events),
+            ),
+            Route::get(
+                "/admin/clients/brainmaker-sync-b/diagnostics?limit=20",
+                diagnostics_body("brainmaker-sync-b", None, Vec::new()),
+            ),
+        ]);
+        let dir = temp_dir("admin-diagnose");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let diagnoses = diagnose(&config, &Selector::Operator("gabriele".into()), 20).unwrap();
+
+        assert_eq!(diagnoses.len(), 2);
+        let received = server.received();
+        assert_eq!(received[0].form("scope").as_deref(), Some("outbox:read"));
+        assert!(
+            received[1..]
+                .iter()
+                .all(|request| request.header("authorization") == Some("Bearer read-token"))
+        );
+        let version = selfupdate::CURRENT_VERSION;
+        assert_eq!(
+            diagnosis_lines(&diagnoses[0]),
+            [
+                "gabriele  brainmaker-sync-a".to_string(),
+                format!(
+                    "  server    last sync 2026-10-05T10:00:03+02:00  version {version}  notes \
+                     stored 0"
+                ),
+                "  report    received 2026-10-05T10:00:04+02:00  read on the client at \
+                 2026-10-05T10:00:02+02:00"
+                    .to_string(),
+                format!("  software  {version}  darwin-arm64"),
+                "  content   a377aa94  installed 2026-10-01T09:00:00+02:00  present".to_string(),
+                "  link      hook absent  block absent  skills 0  agent present".to_string(),
+                "  outbox    waiting 0  rejected 0  sent 0  last push 2026-10-04T18:12:40+02:00  \
+                 operator named"
+                    .to_string(),
+                "  finding   The SessionStart hook of brainmaker is not in the Claude settings \
+                 of that machine. No session there reads the briefing or learns of the outbox, \
+                 so Claude writes no note. Run link on that machine. The admin's own install \
+                 has no hook on purpose."
+                    .to_string(),
+                "  log       2026-10-05T10:00:02+02:00  sync  content.up_to_date  a377aa94"
+                    .to_string(),
+                "  log       2026-10-05T10:00:02+02:00  sync  content.unreachable  http  HTTP 503"
+                    .to_string(),
+                "  log       2026-10-05T10:00:02+02:00  self-update  update.installed  0.1.9"
+                    .to_string(),
+                "  log       2026-10-05T10:00:02+02:00  push  push.rejected  rule kind  count 2"
+                    .to_string(),
+            ]
+        );
+        let lines = diagnosis_lines(&diagnoses[1]);
+        assert_eq!(lines[0], "gabriele  brainmaker-sync-b  retired");
+        assert_eq!(
+            lines[1],
+            "  server    last sync 2026-09-01T10:00:03+02:00  version 0.1.7  notes stored 2"
+        );
+        assert_eq!(lines[2], "  report    none");
+        assert!(
+            lines[3].starts_with("  finding   The registry marks"),
+            "{lines:?}"
+        );
+        assert!(lines[4].contains("has no push"), "{lines:?}");
+        assert_eq!(lines.len(), 5);
+
+        // The JSON form: a key without a value is left out.
+        let json = serde_json::to_value(&diagnoses).unwrap();
+        assert_eq!(json[0]["client_id"], "brainmaker-sync-a");
+        assert_eq!(json[0]["report"]["link"]["hook"], "absent");
+        assert_eq!(json[0]["findings"].as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["events"][1]["status"], 503);
+        assert!(json[0]["events"][0].get("cause").is_none());
+        assert!(json[1].get("report").is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diagnose_of_one_client_reads_that_client_alone() {
+        let server = Server::start(vec![
+            Route::token("outbox:read", r#"{"access_token":"r"}"#),
+            Route::get(
+                "/admin/clients",
+                fleet_body(&[
+                    client("brainmaker-sync-a", Some("gabriele"), false, None),
+                    client("brainmaker-sync-old", None, false, None),
+                ]),
+            ),
+            Route::get(
+                "/admin/clients/brainmaker-sync-old/diagnostics?limit=5",
+                diagnostics_body("brainmaker-sync-old", Some(healthy()), Vec::new()),
+            ),
+        ]);
+        let dir = temp_dir("admin-diagnose-client");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let diagnoses =
+            diagnose(&config, &Selector::Client("brainmaker-sync-old".into()), 5).unwrap();
+
+        assert_eq!(diagnoses.len(), 1);
+        assert_eq!(
+            diagnosis_lines(&diagnoses[0])[0],
+            "unregistered  brainmaker-sync-old"
+        );
+        let asked: Vec<String> = server.received().into_iter().map(|r| r.path).collect();
+        assert_eq!(
+            asked,
+            [
+                "/oauth2/token",
+                "/admin/clients",
+                "/admin/clients/brainmaker-sync-old/diagnostics?limit=5"
+            ]
+        );
+        // A client that the fleet does not list, and an ID that is none.
+        let error =
+            diagnose(&config, &Selector::Client("brainmaker-sync-x".into()), 5).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("knows no client with the ID brainmaker-sync-x"),
+            "{error:#}"
+        );
+        assert!(diagnose(&config, &Selector::Client("../admin".into()), 5).is_err());
+        let error = diagnose(&config, &Selector::Operator("nobody".into()), 5).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no client to nobody"),
+            "{error:#}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_server_without_the_diagnostics_route_gets_a_clear_error() {
+        // The test server answers 404 for a route that it does not have, as a
+        // server older than this route does.
+        let server = fleet_server(fleet_body(&[client(
+            "brainmaker-sync-a",
+            Some("gabriele"),
+            false,
+            None,
+        )]));
+        let dir = temp_dir("admin-diagnose-old-server");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let error = diagnose(&config, &Selector::Operator("gabriele".into()), 20).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("older than the diagnostics route"), "{text}");
+        assert!(text.contains("HTTP 404"), "{text}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn diagnostics_of_another_shape_are_refused() {
+        let mut extra = healthy();
+        extra["error_text"] = json!("cannot read the URL");
+        let mut bad_time = healthy();
+        bad_time["received_at"] = json!("yesterday");
+        let mut bad_hash = healthy();
+        bad_hash["content"]["installed_hash"] = json!("../../etc");
+        let mut bad_version = healthy();
+        bad_version["version"] = json!("0.1.9\u{1b}[2J");
+        let mut bad_word = healthy();
+        bad_word["link"]["hook"] = json!("maybe");
+        let mut bad_platform = healthy();
+        bad_platform["platform"] = json!("darwin arm64\u{7}");
+        let a = "brainmaker-sync-a";
+        for body in [
+            diagnostics_body(a, Some(extra), Vec::new()),
+            diagnostics_body(a, Some(bad_time), Vec::new()),
+            diagnostics_body(a, Some(bad_hash), Vec::new()),
+            diagnostics_body(a, Some(bad_version), Vec::new()),
+            diagnostics_body(a, Some(bad_word), Vec::new()),
+            diagnostics_body(a, Some(bad_platform), Vec::new()),
+            // A line with a word that this program does not know.
+            diagnostics_body(a, None, vec![logged(1, "sync", "content.replaced")]),
+            diagnostics_body(a, None, vec![logged(1, "rm -rf", "content.updated")]),
+            diagnostics_body(
+                a,
+                None,
+                vec![with(
+                    logged(1, "sync", "content.updated"),
+                    "at",
+                    json!("now"),
+                )],
+            ),
+            diagnostics_body(
+                a,
+                None,
+                vec![with(
+                    logged(1, "sync", "content.updated"),
+                    "text",
+                    json!("x"),
+                )],
+            ),
+            // The diagnostics of another client than the one that was asked.
+            diagnostics_body("brainmaker-sync-b", None, Vec::new()),
+        ] {
+            let server = Server::start(vec![
+                Route::token("outbox:read", r#"{"access_token":"r"}"#),
+                Route::get(
+                    "/admin/clients",
+                    fleet_body(&[client(a, Some("gabriele"), false, None)]),
+                ),
+                Route::get(
+                    "/admin/clients/brainmaker-sync-a/diagnostics?limit=20",
+                    body.clone(),
+                ),
+            ]);
+            let dir = temp_dir("admin-diagnose-shape");
+            let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+            assert!(
+                diagnose(&config, &Selector::Client(a.into()), 20).is_err(),
+                "accepted {body}"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }
