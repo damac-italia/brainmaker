@@ -1,6 +1,6 @@
 [package]
 name = "brainmaker"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 # File::try_lock, which the run lock uses, is stable since this version.
 rust-version = "1.89"

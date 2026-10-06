@@ -12,8 +12,8 @@ exist, and how to report a vulnerability.
 | The holder of the content signing key | Which archive lands in `content/`, and so what runs at every session start |
 | The administrator who issues the provisioning file | The endpoints and the client credentials |
 | The employee who runs the binary | Nothing beyond their own account; they already hold the binary |
-| The server | Which operator a credential belongs to, and so the name on each note. The client never names it. |
-| The admin's copy | Collecting the notes. It is an install like every other, in `~/.brainmaker`, and its issuer client holds `sync` and `outbox:read`, never `publish`. `link` connects nothing to Claude for a credential that reads the outbox and cannot send notes. The admin commands grant nothing by themselves: the server decides what the token may read. |
+| The server | Which operator a credential belongs to, and so the name on each note. The client never names it. The server also receives and stores the diagnostic report. It is not trusted to ask for one: no answer of the server makes the client send, read, or run anything. |
+| The admin's copy | Collecting the notes, and reading what each client reports about itself. It is an install like every other, in `~/.brainmaker`, and its issuer client holds `sync` and `outbox:read`, never `publish`. `link` connects nothing to Claude for a credential that reads the outbox and cannot send notes. The admin commands grant nothing by themselves: the server decides what the token may read. |
 
 The two paths have different anchors.
 
@@ -78,13 +78,16 @@ token already issued stays valid for the rest of its lifetime, which the server 
 | Content API to disk | The zip archive | Path containment, symbolic-link rejection, permission stripping, size caps |
 | Software API to the binary | The manifest | Ed25519 signature over the served bytes, checked before the parse; then version character set and length, platform key lookup, checksum format. The manifest names no URL, so it cannot direct a download. |
 | Software API to the binary | The replacement binary | SHA-256 match, then a `--version` run whose output must be exactly `brainmaker <version>`, before the swap |
-| Provisioning file to the store | `KEY=VALUE` text | Size cap, key character set, TLS rule on both URLs, all-or-none credential check, character rule on both credential values, route rule on all nine routes. All run before the store is written, so a file that fails leaves the previous store and the file in place. |
-| Disk to the network | The notes in `outbox/` | A regular file only, read with `symlink_metadata`, never through a symbolic link, and the opened file must be the file that was checked; the note-name rule; 64 KiB at most; UTF-8 with no NUL and no byte-order mark; the frontmatter rules; 60 seconds with no change; one run at a time under `.outbox.lock`. A file that fails moves to `rejected/`, and nothing about it is sent. |
+| Provisioning file to the store | `KEY=VALUE` text | Size cap, key character set, TLS rule on both URLs, all-or-none credential check, character rule on both credential values, route rule on all ten routes. All run before the store is written, so a file that fails leaves the previous store and the file in place. |
+| Disk to the network | The notes in `outbox/` | A regular file only, read with `symlink_metadata`, never through a symbolic link, and the opened file must be the file that was checked; the note-name rule; 64 KiB at most; UTF-8 with no NUL and no byte-order mark; the frontmatter rules; 60 seconds with no change; one run at a time under `.outbox.lock`. A file that fails moves to `rejected/`, and nothing of its name or of its text is sent. The diagnostic report counts it, and names the rule that it broke as one word. |
+| Disk to the network | The run log and the state of the machine, in the diagnostic report | The log must be a regular file and no symbolic link. Each line is parsed into a typed event, and a line of another shape, or of more than 512 bytes, is skipped. Every word must be in its fixed list, and every number, content hash, version, and time must pass its rule. The report is written from the values that passed, never from the bytes of a file. At most 200 lines and 64 KiB for each report, one report in 30 minutes, one run at a time under `.diagnostics.lock`. |
 | Content API to disk | The operator name from `whoami` | Written only when it matches `^[a-z0-9][a-z0-9-]{0,31}$`, as the name and one line feed |
 | Content API to disk | The answer to a note | The month for `sent/` must read `YYYY-MM`, or the note goes to `sent/unknown/`. The reason for `rejected/` loses every control character. |
 | Server text to the terminal | An error message | Collapsed onto one line, cut at 200 characters, and stripped of every control character and every character that changes the direction of the text |
 | Content API to disk | A note that `admin pull-outbox` writes | The operator, the client ID, the note name, `received_at`, the kind, the domain, and each flag are checked again, and the text must match its size and its SHA-256. The file name is built from checked values alone. A hard link from a flushed temporary file never replaces a file. `author` and `review_flags` are always written from the server's values. |
 | Content API to the terminal and the dashboard | The fleet view and the sync log | Typed parse that refuses a field it does not know; the client ID rule, the operator rule, and the time shape; control characters removed from every value the lines print |
+| Content API to the terminal and the dashboard | The diagnostics of a client, for `admin diagnose` | Typed parse that refuses a field or a word it does not know; the client ID must be the one that was asked for; the time shape, the version rule, and the content hash rule; control characters removed from every value the lines print |
+| Content API to the client | The answer to a diagnostic report | The client reads the status and no field of the body. Nothing in the answer changes what the client sends, when it sends, or what it runs. |
 | Token endpoint to a header | The access token | Length cap, printable-ASCII rule, and a `token_type` that must read `Bearer` when the response carries one |
 | Token endpoint to the clock | `expires_in` | Cut to one hour before it is added to a clock reading; a sum that the clock cannot hold caches nothing |
 | Store to the process | `config.enc` | AES-256-GCM authenticates the header and the ciphertext before any byte is used |
@@ -94,8 +97,9 @@ token already issued stays valid for the rest of its lifetime, which the server 
 `brainmaker` holds a client identifier and a client secret, and exchanges them for an access token
 at `POST {SWETSI_JWT_ENDPOINT}/oauth2/token`, with HTTP Basic and the `client_credentials` grant. It
 names one scope in each request, so a client that the server grants more than one scope still
-requests only the scope that the next request needs: `sync` for every read, and `outbox:write` to
-send a note, asked for only when a note is ready, and `outbox:read` for the admin commands. It keeps
+requests only the scope that the next request needs: `sync` for every read and for the diagnostic
+report, and `outbox:write` to send a note, asked for only when a note is ready, and `outbox:read`
+for the admin commands. It keeps
 one token per scope for the run, so a sync token never carries the right to write. It then sends
 `Authorization: Bearer <token>` on every request under the base URL. With no credential configured
 it sends no header. It performs no authorization of its own: the server decides what the token may
@@ -139,6 +143,10 @@ command prints the client identifier or the secret of the machine it runs on. Th
 `config::tests::the_credentials_debug_output_never_shows_the_secret`, and
 `auth::tests::the_cache_debug_output_never_shows_the_token` enforce that.
 
+The diagnostic report and the run log hold no credential either. No field of them holds text, so
+nothing can carry one: see [The diagnostic report](#the-diagnostic-report). The test
+`diagnostics::tests::a_report_holds_no_credential_no_path_and_nothing_of_a_note` enforces that.
+
 HTTP 401 and HTTP 403 produce a message that names the credential variables and nothing else.
 
 ## Endpoint confidentiality
@@ -149,7 +157,7 @@ any route of a deployment.
 | Place | Why it holds no endpoint |
 |---|---|
 | The binary | Only `BRAINMAKER_CONFIG_KEY` and `CARGO_PKG_VERSION` are read at compile time. Two unit tests, `config::tests::no_endpoint_is_compiled_into_this_module` and `auth::tests::no_endpoint_is_compiled_into_this_module`, fail the build if a URL with a host enters either module. `cli::tests::the_help_text_names_no_endpoint` does the same for the help text. |
-| The repository | Every document uses `api.example.test`. The nine route keys let a deployment replace every default route name, so even the route layout need not appear here. |
+| The repository | Every document uses `api.example.test`. The ten route keys let a deployment replace every default route name, so even the route layout need not appear here. |
 | The workflow logs | The release workflow takes no URL as input. It builds, checksums, and signs. |
 | The release notes and assets | The manifest carries a version and one SHA-256 per platform. `selfupdate::tests::the_manifest_type_carries_no_url` fails the build if a `url` field returns to the manifest type. GitHub writes the notes from merged pull request titles, so a title must name no endpoint. |
 
@@ -157,7 +165,7 @@ The base URL, the OAuth2 endpoint, and any custom routes reach a machine only in
 file, and that file is sealed on first use and then deleted. A public release therefore discloses
 which versions exist, and nothing about where they are served.
 
-The nine routes are checked before use. A route that holds `://` would move a request to another
+The ten routes are checked before use. A route that holds `://` would move a request to another
 host, and a `..` segment would climb out of the base path; `config::check_route` refuses both, along
 with a space or any other character that cannot go into a URL.
 
@@ -391,13 +399,65 @@ A note that the server stores, or already holds, moves to `sent/`. Nothing else 
 for the network, and a note that fails a check here never leaves the machine. `uninstall` keeps the
 outbox, because a note that was never sent exists nowhere else.
 
+### The diagnostic report
+
+The report is the second path from the disk to the network. It exists so that an admin can see
+why a client sends no note, without a visit to the machine. These properties bound it.
+
+**The client decides.** The server has no way to ask for a report, to choose what one holds, or to
+make the client run anything. The client sends a report from `sync`, at an interval that is a
+constant of this binary. It reads the status of the answer and nothing else, so a server that
+answers with any body changes nothing.
+
+**No field holds text.** A report holds the state of the machine and lines of the run log. Every
+value is one of these:
+
+| Kind of value | Examples |
+|---|---|
+| A word from a fixed list | `sync`, `push.rejected`, `unreachable`, `kind`, `present` |
+| A bounded number | a count from 0 to 100000, an HTTP status from 100 to 599, a time within the years 2000 to 2099 |
+| A content hash | 8 lowercase hexadecimal characters |
+| A version | two to four groups of digits joined by dots, and a suffix of 16 characters at most |
+| An event id | 16 hexadecimal characters, drawn at random |
+
+So a report cannot hold the client identifier, the client secret, an access token, a URL, a path,
+the name or the text of a note, the reason beside a rejected note, or an error message. An error
+message can name a URL and can quote a server, and a reason can quote a note, so neither is ever
+written to the run log: a failure is logged as a `Cause`, and a refused note as a `Rule`. The
+version rule is narrower than the one for a manifest, which takes any 64 letters and digits, a
+shape that a token has too.
+
+**The file is not trusted.** The run log is a file under the root, and any program of the user can
+write it. Before it sends, the client refuses a symbolic link, reads at most 512 KiB, parses each
+line into a typed event, and checks every value again. The report is written from those values. A
+line that holds anything else is skipped, so a file that someone put in place of the log sends
+nothing of its content. The same checks run on the server, which stores no value that fails one.
+
+**It reads `~/.claude`, and sends three facts about it.** To say whether `link` connected Claude,
+the client reads `settings.json` and `CLAUDE.md` there, and the links under `skills/`. It sends
+whether its own hook entry and its own block are there, and how many links name the content. It
+sends no other part of those files.
+
+**Only the admin reads it.** The server gives a report to a token with the scope `outbox:read`.
+No route gives a client a report, its own included.
+
+**It cannot break the real work.** The report runs after the content step and the outbox steps.
+It prints nothing when it fails and changes no exit code. A run that received no `sync` token
+makes no request for it, and a request has 10 seconds in all.
+
+What the server keeps, and for how long, is the server's rule: see the documents of the server.
+
 ### Size caps
 
 | Input | Cap |
 |---|---|
 | Provisioning file | 64 KiB |
 | One note in the outbox | 64 KiB |
-| The answer to a note, and the answer of `whoami` | 64 KiB |
+| The answer to a note, the answer of `whoami`, and the answer to a diagnostic report | 64 KiB |
+| One diagnostic report | 64 KiB, and 200 lines of the run log |
+| The run log on the disk | 256 KiB. Past that size it is cut to its newest 128 KiB. |
+| One line of the run log | 512 bytes. A longer line is skipped. |
+| The diagnostics of one client, for `admin diagnose` | 4 MiB |
 | One page of notes for `admin pull-outbox` | 8 MiB |
 | The fleet view, and one client's sync log | 4 MiB |
 | Content manifest and software manifest | 1 MiB |

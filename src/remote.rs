@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::auth;
+use crate::cause::{self, Cause};
 use crate::config::{Config, MAX_ARCHIVE_BYTES, validate_hash};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,6 +31,11 @@ const MAX_MESSAGE_CHARS: usize = 200;
 
 /// Largest answer to a note or to `whoami` that this client reads.
 const MAX_ANSWER_BYTES: u64 = 64 * 1024;
+
+/// How long the diagnostic report may take in all. It is shorter than
+/// [`TEXT_TIMEOUT`], because the report shares the time of the `SessionStart`
+/// hook with the sync, and nothing waits for its answer.
+const REPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Body that both APIs return on a failure.
 ///
@@ -338,6 +344,37 @@ pub fn whoami(config: &Config) -> Result<Option<String>> {
     Ok(parsed.operator)
 }
 
+/// Sends the diagnostic report, and returns the server's answer, whatever its
+/// status.
+///
+/// `token` is a `sync` token, or `None` when no credential is configured. A
+/// failure to reach the server is an error; every status is an answer. The
+/// caller reads the status alone: nothing in the answer changes what this
+/// client does.
+pub fn post_diagnostics(config: &Config, report: &str, token: Option<&str>) -> Result<Answer> {
+    let url = config.diagnostics_url();
+    let agent = build_agent(REPORT_TIMEOUT);
+    let mut request = agent
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json");
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let mut response = request
+        .send(report)
+        .map_err(describe)
+        .with_context(|| format!("cannot send the diagnostic report to {url}"))?;
+    let status = response.status().as_u16();
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(MAX_ANSWER_BYTES)
+        .read_to_string()
+        .unwrap_or_default();
+    Ok(Answer { status, body })
+}
+
 /// Removes every control character from text that the server sent, and every
 /// character that changes the direction of the text around it.
 ///
@@ -400,10 +437,11 @@ fn check_status(response: &mut ureq::http::Response<ureq::Body>, scope: &str) ->
         _ => format!("the server returned HTTP {code}"),
     };
 
-    match server_message(response) {
-        Some(message) => bail!("{headline}: {message}"),
-        None => bail!("{headline}"),
-    }
+    let text = match server_message(response) {
+        Some(message) => format!("{headline}: {message}"),
+        None => headline,
+    };
+    Err(cause::failed(Cause::Http, Some(code), text))
 }
 
 /// Reads the message a failed response carries, if it carries one.
@@ -453,10 +491,15 @@ pub fn message_from_body(body: &str) -> Option<String> {
 fn describe(error: ureq::Error) -> anyhow::Error {
     match error {
         ureq::Error::StatusCode(code) => anyhow::anyhow!("the server returned HTTP {code}"),
-        ureq::Error::Timeout(_) => anyhow::anyhow!("the request timed out"),
-        ureq::Error::HostNotFound => anyhow::anyhow!("cannot resolve the host name"),
+        ureq::Error::Timeout(_) => unanswered("the request timed out"),
+        ureq::Error::HostNotFound => unanswered("cannot resolve the host name"),
         other => anyhow::anyhow!(other),
     }
+}
+
+/// An error for a request that got no answer. It prints `text`.
+pub fn unanswered(text: &str) -> anyhow::Error {
+    cause::failed(Cause::Unreachable, None, text.to_string())
 }
 
 #[cfg(test)]

@@ -5,8 +5,8 @@ system, and no local database. The same binary carries the admin commands, which
 an install like everyone else's. One invocation loads settings, gets one access token for each scope
 that it needs, makes a bounded number of further HTTP requests, writes the filesystem, and exits.
 A `sync` makes at most three requests for the content and the software, one for the operator name,
-and one for each note that is ready in the outbox. `uninstall` is the exception: it loads no
-settings and opens no socket.
+one for each note that is ready in the outbox, and one for the diagnostic report, at most once in
+30 minutes. `uninstall` is the exception: it loads no settings and opens no socket.
 
 A second binary, `brainmaker-sign`, lives in [`tools/sign.rs`](../tools/sign.rs). It builds only
 under the `sign` feature and never ships.
@@ -18,21 +18,23 @@ under the `sign` feature and never ships.
 | [`src/main.rs`](../src/main.rs) | Entry point, command dispatch, all `stdout` output | every module |
 | [`src/cli.rs`](../src/cli.rs) | Argument parsing, the check that each option applies to the command, and the help text | none |
 | [`src/config.rs`](../src/config.rs) | Settings load, the import check, the root and every path under it (`Layout`), route and URL building, credential checks, size limits, hash validation | `auth`, `provision`, `secretstore`, `url` |
-| [`src/auth.rs`](../src/auth.rs) | The OAuth2 client-credentials exchange, the bound on the token lifetime, the access token cache with one token per scope, and the `invalid_scope` error | `config`, `remote`, `ureq` |
+| [`src/auth.rs`](../src/auth.rs) | The OAuth2 client-credentials exchange, the bound on the token lifetime, the access token cache with one token per scope, and the `invalid_scope` error | `cause`, `config`, `remote`, `ureq` |
 | [`src/url.rs`](../src/url.rs) | URL origin parsing, and the rule that a base URL must use TLS | none |
 | [`src/provision.rs`](../src/provision.rs) | Provisioning file discovery, parsing, validation | `url` |
 | [`src/secretstore.rs`](../src/secretstore.rs) | Seal and open the stored settings, report what binds them to the machine, restrict file modes | `ring` |
-| [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, the signed content release, the note upload, `whoami`, and the removal of control characters from server text | `auth`, `config`, `digest`, `signature`, `ureq` |
-| [`src/outbox.rs`](../src/outbox.rs) | The note rules, the checks of the upload path, push, the moves to `sent/` and `rejected/`, the counts, the report headers, and the operator file | `auth`, `config`, `lock`, `remote`, `selfupdate`, `state` |
-| [`src/admin.rs`](../src/admin.rs) | The admin commands: `pull-outbox` with its frontmatter stamp and its no-replace write, the fleet view and the admin's shape of it, and the merged sync log | `auth`, `config`, `lock`, `outbox`, `remote` |
-| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `config`, `digest`, `lock`, `outbox`, `remote`, `state` |
+| [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, the signed content release, the note upload, `whoami`, the upload of the diagnostic report, and the removal of control characters from server text | `auth`, `cause`, `config`, `digest`, `signature`, `ureq` |
+| [`src/outbox.rs`](../src/outbox.rs) | The note rules and the word for each one, the checks of the upload path, push, the moves to `sent/` and `rejected/`, the counts, the report headers, and the operator file | `auth`, `cause`, `config`, `lock`, `remote`, `selfupdate`, `state` |
+| [`src/diagnostics.rs`](../src/diagnostics.rs) | The run log, the state of the machine, the words that a report may hold, the checks of the upload path, and the send with its interval and its record | `auth`, `cause`, `config`, `link`, `lock`, `outbox`, `remote`, `schedule`, `selfupdate`, `state`, `sync` |
+| [`src/cause.rs`](../src/cause.rs) | The cause of a failure as one word from a fixed list, carried by an error whose text does not change | `auth`, `ureq` |
+| [`src/admin.rs`](../src/admin.rs) | The admin commands: `pull-outbox` with its frontmatter stamp and its no-replace write, the fleet view and the admin's shape of it, the merged sync log, and `diagnose` with its findings | `auth`, `cause`, `config`, `diagnostics`, `link`, `lock`, `outbox`, `remote`, `selfupdate`, `version` |
+| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `cause`, `config`, `digest`, `lock`, `outbox`, `remote`, `state` |
 | [`src/archive.rs`](../src/archive.rs) | Zip extraction and its safety checks | `config`, `zip` |
 | [`src/state.rs`](../src/state.rs) | `state.json` read and atomic write | `serde_json` |
 | [`src/lock.rs`](../src/lock.rs) | The install lock and the update lock, which keep two runs out of one root | none |
 | [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `link`, `lock`, `remote`, `signature`, `version` |
-| [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `ring` |
+| [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `cause`, `ring` |
 | [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `ring` |
-| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the outbox directory, the session context, the shell quoting of the hook command, the binary copy under the root, and the role check that leaves the admin's Claude unconnected | `auth`, `config`, `outbox`, `schedule`, `serde_json` |
+| [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the outbox directory, the session context, the shell quoting of the hook command, the binary copy under the root, the role check that leaves the admin's Claude unconnected, and the read of which pieces of the bridge are there | `auth`, `config`, `outbox`, `schedule`, `serde_json` |
 | [`src/schedule.rs`](../src/schedule.rs) | Write, load, unload, and remove the hourly macOS LaunchAgent | none |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
 | [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root. The outbox stays. | `config`, `link`, `outbox`, `schedule`, `secretstore`, `state` |
@@ -55,9 +57,24 @@ graph LR
     main --> uninstall
     main --> outbox
     main --> admin
+    main --> diagnostics
     admin --> remote
     admin --> lock
     admin --> outbox
+    admin --> diagnostics
+    diagnostics --> auth
+    diagnostics --> cause
+    diagnostics --> link
+    diagnostics --> lock
+    diagnostics --> outbox
+    diagnostics --> remote
+    diagnostics --> state
+    diagnostics --> sync
+    remote --> cause
+    auth --> cause
+    sync --> cause
+    signature --> cause
+    outbox --> cause
     config --> auth
     config --> provision
     config --> secretstore
@@ -92,7 +109,7 @@ graph LR
 
 ## Boundaries
 
-Six boundaries separate the trusted code from data it does not control.
+These boundaries separate the trusted code from data it does not control.
 
 | Boundary | Crossed by | Enforced in |
 |---|---|---|
@@ -100,6 +117,8 @@ Six boundaries separate the trusted code from data it does not control.
 | Network to disk | The operator name, and the month and the reason in the answer to a note | `outbox::update_operator`, which writes only a name that matches the operator rule; `received_month`, which gives `unknown` for any other shape; `remote::printable` |
 | Disk to network | The notes in the outbox | `outbox::check` and `read_capped`: a regular file and no symbolic link, the name rule, the 64 KiB cap, UTF-8, the frontmatter rules, and 60 seconds with no change |
 | Network to disk | The notes that `admin pull-outbox` writes | `admin::place`, which checks every value again and the SHA-256 of the text; `admin::stamp`; `admin::write_new`, which never replaces a file |
+| Disk to network | The run log and the state of the machine, in the diagnostic report | `diagnostics::read_log`: a regular file and no symbolic link, each line parsed into an `Event` whose words come from fixed lists, and `Event::is_valid` on every value. `diagnostics::state` builds the state from typed values. No byte of a file goes into the report as it stands. |
+| Network to the terminal | The diagnostics that `admin diagnose` prints | A typed parse that refuses a field or a word it does not know, and `admin::check_diagnostics` on the client ID, each time, each version, and each content hash |
 | Network to a header | The access token | `auth::check_token`, which refuses a token that holds a control character |
 | Provisioning file to store | The endpoints and the client credentials | `provision::parse`, `Settings::validate`, `provision::check_credential_set`, `url::check_base_url`, `Credentials::new` |
 | Store to process | The sealed settings | `secretstore::open`, which authenticates the file before it returns bytes |
@@ -122,12 +141,15 @@ the injected `log` closure.
 ├── confidential/       0700
 │   └── config.enc      0600, the sealed endpoints, routes, and credentials
 ├── content/            the extracted content
+├── diagnostics.json    {"last_attempt_at_unix": ..., "last_report_at_unix": ..., "sent_through": ...}
+├── diagnostics.jsonl   the run log: one line for each thing that a run did
 ├── operator            the operator name that whoami gave, and one line feed
 ├── outbox/             0700, where Claude writes the end-of-session notes
 │   ├── rejected/       each note that broke a rule, beside <name>.reason.txt
 │   └── sent/<YYYY-MM>/ each note that the server holds, by the month it received it
 ├── push.json           {"last_push_at_unix": ..., "last_push_notes": ...}
 ├── .admin.lock         the lock that an admin command holds
+├── .diagnostics.lock   the lock that sync holds while it sends the diagnostic report
 ├── .lock               the install lock that sync holds
 ├── .outbox.lock        the push lock that sync and push hold
 ├── .update.lock        the update lock that self-update holds
@@ -147,6 +169,10 @@ program. Both files stay in the root between runs, and `uninstall` removes them.
 `operator` and `push.json` are written through a temporary file, `operator.tmp` and `push.json.tmp`,
 and a rename. `push.json` is the only file that push writes besides the notes it moves: push never
 writes `state.json`, whose only writer is `sync` under `.lock`.
+
+`diagnostics.json` is written the same way, through `diagnostics.json.tmp`. `diagnostics.jsonl`
+grows by one append for each run, and a cut writes its newest part through `diagnostics.jsonl.tmp`
+and a rename.
 
 `self-update` writes `.brainmaker-probe-<pid>`, `.brainmaker-update-<pid>`, and `.brainmaker-old`
 beside the binary, and removes them before it exits. On Windows the last two carry the `.exe`
@@ -175,6 +201,36 @@ an error: the reinstall repairs the state.
 A missing or corrupt file reads as no push. `status` prints the age of the push on its `pushed`
 line.
 
+### `diagnostics.jsonl`
+
+The run log. Each line is one JSON object: one thing that one run of `sync`, `push`, `self-update`,
+`link`, or `unlink` did.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | 16 hexadecimal characters, drawn at random. The server stores a line once. |
+| `at_unix` | integer | Seconds since the Unix epoch when the line was written |
+| `command` | word | The command that ran |
+| `code` | word | What it did, such as `content.updated` or `push.rejected` |
+| `cause`, `rule` | word | Left out unless the line names the cause of a failure, or the rule that a note broke |
+| `status`, `count` | integer | Left out unless the line names an HTTP status, or a number of notes |
+| `hash`, `version` | string | Left out unless the line names a content hash, or a version of the program |
+
+[API.md](API.md#the-diagnostic-report) lists every word. The file stays under 256 KiB: a run that
+takes it past that size cuts it to its newest 128 KiB. A line that is not of this shape is never
+sent.
+
+### `diagnostics.json`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `last_attempt_at_unix` | integer | Seconds since the Unix epoch at the last try to send a report. A `link` or an `unlink` that worked moves it back, so that the next report is due 90 seconds later. |
+| `last_report_at_unix` | integer | The same for the last report that the server stored. The file leaves it out until one is stored. |
+| `sent_through` | string | The `id` of the newest line of the run log that the server holds |
+
+A missing or corrupt file reads as no report, so the next `sync` sends one. `status` prints the age
+of the last stored report on its `reported` line.
+
 ### `config.enc`
 
 | Offset | Bytes | Content |
@@ -193,7 +249,7 @@ line.
 | `Stored` | The sealed store held the settings |
 | `Environment` | The environment supplied the base URL, and no store was needed |
 
-The seven routes live in the same store, and the environment overrides one route at a time.
+The ten routes live in the same store, and the environment overrides one route at a time.
 
 ## Decisions and tradeoffs
 
@@ -271,8 +327,8 @@ first HTTP 401.
 
 ### The admin commands live in the same binary
 
-`brainmaker admin pull-outbox`, `admin status`, and `admin syncs` are commands of this binary, not of
-a second one. The crate has no library target, so a second binary would have to include `config`,
+`brainmaker admin pull-outbox`, `admin status`, `admin syncs`, and `admin diagnose` are commands of
+this binary, not of a second one. The crate has no library target, so a second binary would have to include `config`,
 `auth`, `remote`, and more by path. The server enforces what a token may read, so the commands grant
 nothing by themselves. The admin's credential holds `sync` and `outbox:read`: `sync` lets it run
 `self-update`, and `outbox:read` lets it read the notes and the fleet.
@@ -341,6 +397,76 @@ leaves half written.
 A file that fails a check moves to `rejected/` with its reason, and a name that is taken there gets a
 number. A link moves as a link, and the file it names stays where it is.
 
+### The client reports its own state, and the server asks for nothing
+
+Two operators synced on every run and sent no note, and the server could not say why. Each cause
+was on the machine: the program was too old, `link` never connected Claude, every note broke a
+rule, or no note was written. The admin had to ask each operator for the output of `status` and
+`push`.
+
+So the client sends a diagnostic report: its state, and the new lines of a run log that it keeps
+under the root. It rides on `sync`, as push does, for the same reason: a linked machine never runs
+`link` again, and code inside `sync` reaches it with the next `self-update`.
+
+The client decides what the report holds. The server has no route that asks for one, and nothing
+in its answer changes what this program does: the client reads the status of the answer and no
+field of its body. The interval, the size, and the content are constants of this binary. A server
+that could ask a client for data, or name what a client runs, would be a way to run commands on
+every laptop, and this design has none.
+
+The report goes with the `sync` token that the run already holds. A scope of its own would need a
+change at the issuer for every client, and the client that an admin most needs to see is the one
+whose issuer settings are wrong. The cost is small: a `sync` token can now write a bounded report
+about its own client, which the admin alone reads.
+
+`sync` sends the report after the outbox steps, at most once in 30 minutes, and only when the run
+received a `sync` token. A report that fails prints nothing and changes no exit code. It takes
+`.diagnostics.lock` without waiting, and it has 10 seconds in all, because it shares the 60 seconds
+of the `SessionStart` hook.
+
+The installer runs `sync` and then `link`, so the first report of a machine says that the hook is
+absent. A `link` or an `unlink` that worked therefore cuts the wait for the next report to 90
+seconds. The wait is not zero: on macOS, `link` loads the hourly agent, which runs `sync` at once,
+and the server refuses a second report of one client inside a minute.
+
+The tradeoffs: the admin sees a machine as it was at its last report, not as it is now, and a
+client older than the report sends none. `admin diagnose` then falls back on what the server saw:
+the version in the `User-Agent` of the last sync.
+
+### A report holds words and numbers, and never text
+
+A log line is the natural home of an error message, and an error message of this program can name
+a URL, a path, and words that a server chose. The reason beside a rejected note quotes the note.
+None of that may leave the machine.
+
+So no field of a report holds free text. A value is a word from a fixed list, a bounded number, a
+content hash of 8 hexadecimal characters, or a version of digits and dots. A step that failed is
+named by a `Code` and a `Cause`, and a note that was refused by a `Rule`. The types make it so: an
+`Event` holds enums, and its two strings pass a rule before they enter it.
+
+The few places that know the cause of a failure say it twice. [`src/cause.rs`](../src/cause.rs)
+gives them an error that prints the same text as before and carries the word, and `cause::of`
+reads the word back through any context. An error that no place marked reads as `other`.
+
+The run log is a file, and a file can be replaced, as a note can. The report never sends its
+bytes. `diagnostics::read_log` refuses a symbolic link, parses each line into an `Event`, and
+checks every value, and the report is written from the events that passed. A line that someone
+else wrote into the file, with whatever text, is not sent.
+
+The tradeoff: the admin reads `content.unreachable  http  HTTP 503`, and not the sentence that the
+operator would see. The words were chosen to tell the causes apart, and a new cause needs a new
+word on both sides.
+
+### `diagnose` names the cause
+
+`admin diagnose` joins two sources: the fleet view, which holds what the server saw of a client,
+and the diagnostics that the client sent. `admin::findings` turns them into sentences: the hook is
+absent, every note broke a rule, no note was written, the client is too old. The command prints
+the values too, so the admin can check each sentence against them.
+
+The diagnostics have a route of their own. The fleet view and the sync log keep their shape,
+because the admin commands of an earlier version refuse a field that they do not know.
+
 ### The server names the operator
 
 The name on a note comes from the server, from the credential that sent it: nothing in the note, its
@@ -365,7 +491,7 @@ The tradeoff: `brainmaker` carries a small URL parser rather than a dependency. 
 The binary compiles in no endpoint, and the release publishes none. The manifest carries a version
 and one SHA-256 per platform, and the client derives the download address from its own base URL and
 `BRAINMAKER_SOFTWARE_BINARY_PATH`. The route names are configurable too, so a deployment that sets
-all seven route keys keeps its whole URL layout out of this repository, out of the workflow logs, out
+all ten route keys keeps its whole URL layout out of this repository, out of the workflow logs, out
 of the release notes, and out of the release assets.
 
 This also removes a check rather than adding one. An earlier design put a `url` in each manifest
@@ -620,8 +746,9 @@ reports that content as up to date.
 `sync` therefore takes an exclusive lock on `.lock` before it downloads, and holds it until the
 install ends. `self-update` takes a second lock, on `.update.lock`, while it replaces the program.
 The two are separate files, so a long content download does not delay a software update, and the
-reverse. Push takes a third, `.outbox.lock`, and does not wait for it. The operating system drops a lock when its process ends, including when the process is
-killed, so no stale lock remains.
+reverse. Push takes a third, `.outbox.lock`, and does not wait for it. The diagnostic report takes
+a fourth, `.diagnostics.lock`, in the same way. The operating system drops a lock when its process
+ends, including when the process is killed, so no stale lock remains.
 
 A run that finds the lock held waits up to 30 seconds. When the holder installed the release in that
 time, `sync` reads `state.json` again and reports the content as up to date. When the lock is still

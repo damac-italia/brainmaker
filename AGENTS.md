@@ -37,6 +37,13 @@ A plain `cargo test` skips `tools/sign.rs`. The script does not skip it.
   that a person or a log can read. The admin commands are the one exception: they print the client
   IDs that the server reports, because the admin needs them to tell two machines apart, and a client
   ID alone authenticates nothing. No command prints the credential of the machine it runs on.
+- The diagnostic report and the run log hold words from fixed lists, bounded numbers, content
+  hashes, and versions, and nothing else. Never add a field that holds free text: no error
+  message, no path, no URL, no name and no text of a note. A failure enters the run log as a
+  `Cause` from `src/cause.rs`, and a refused note as a `Rule` from `src/outbox.rs`. A new word
+  needs the same word in the server, which stores no word that it does not know.
+- The server never tells the client what to send or what to run. Nothing that a command does may
+  depend on the body of the answer to a diagnostic report.
 - Check a value from the network before it enters a URL, a path, or a header.
 - `PUBLIC_KEYS` and `CONTENT_KEYS` in `src/signature.rs` keep one key per line. No key may be in
   both lists. The release workflow reads each list with `sed` and `grep`.
@@ -72,6 +79,12 @@ these helpers.
 The server records the headers and the body of each request. A route can send response headers,
 give its replies in order, and, for the token route, answer only the scope that the form names.
 Build a token route with `Route::token`, so that a test states which scope it expects.
+
+The server answers 404 for a route that it does not have, as a server older than that route does.
+A test of a new request must also pass against a server with no route for it.
+
+The diagnostic report reads `~/.claude` to say whether `link` connected Claude. In a test it reads
+no directory outside the root, unless the test names one with `diagnostics::look_in_this_test`.
 
 ## Documents
 
