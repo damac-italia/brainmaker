@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! HTTP access to the content API and to the software API, and the two
-//! requests of the outbox: one note sent, and the operator asked for.
+//! HTTP access to the content API and to the software API, the two requests
+//! of the outbox, which are one note sent and the operator asked for, and the
+//! two reports: the diagnostic report and the removal report.
 //!
 //! Text that the server sends can reach the terminal, a file under the root,
 //! or Claude's context. [`printable`] removes its control characters first.
@@ -17,6 +18,7 @@ use serde::Deserialize;
 use crate::auth;
 use crate::cause::{self, Cause};
 use crate::config::{Config, MAX_ARCHIVE_BYTES, validate_hash};
+use crate::removal;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const TEXT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -55,9 +57,19 @@ struct ErrorBody {
 /// this client ignores it and takes the hash from the signed payload, so a
 /// server cannot point it at one archive while signing another.
 #[derive(Debug, Deserialize)]
-struct Latest {
+struct LatestBody {
     payload: Option<String>,
     signature: Option<String>,
+}
+
+/// What `{base}/content/latest` holds for this client.
+#[derive(Debug, Clone)]
+pub enum Latest {
+    /// The release to install.
+    Release(ContentRelease),
+    /// No release. The server answered `410 Gone` with a removal order that
+    /// a trusted key signed for this client. See [`crate::removal`].
+    Removal(removal::Order),
 }
 
 /// The signed description of one content release.
@@ -93,11 +105,44 @@ pub struct ContentRelease {
 /// `reported` holds the headers in which the client reports itself: its
 /// platform, its installed content, and the notes waiting. The server records
 /// them as reported, and nothing it serves depends on them.
-pub fn latest_release(config: &Config, reported: &[(&str, String)]) -> Result<ContentRelease> {
+///
+/// A `410 Gone` answer can hold a removal order in place of a release. The
+/// function returns [`Latest::Removal`] only for an order that
+/// [`removal::read`] accepts. An order that it refuses is an error, and so is
+/// a 410 with no order in it.
+pub fn latest_release(config: &Config, reported: &[(&str, String)]) -> Result<Latest> {
     let url = config.latest_url();
-    let body = fetch_text_with(config, &url, crate::config::MAX_MANIFEST_BYTES, reported)?;
+    let mut response = get(config, &url, reported, auth::SCOPE_SYNC)?;
 
-    let latest: Latest = serde_json::from_str(&body)
+    if response.status().as_u16() == removal::GONE {
+        // The body is read once here: it holds the order, or the server's
+        // own message.
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_ANSWER_BYTES)
+            .read_to_string()
+            .unwrap_or_default();
+        let read = match removal::envelope_in(&body) {
+            Some(envelope) => removal::read(config, &envelope).map(Latest::Removal),
+            None => Err(status_error(
+                removal::GONE,
+                auth::SCOPE_SYNC,
+                message_from_body(&body),
+            )),
+        };
+        return read.with_context(|| format!("cannot read {url}"));
+    }
+
+    check_status(&mut response, auth::SCOPE_SYNC).with_context(|| format!("cannot read {url}"))?;
+    let body = response
+        .body_mut()
+        .with_config()
+        .limit(crate::config::MAX_MANIFEST_BYTES)
+        .read_to_string()
+        .with_context(|| format!("cannot read the response body from {url}"))?;
+
+    let latest: LatestBody = serde_json::from_str(&body)
         .with_context(|| format!("{url} did not return a JSON object"))?;
 
     let (Some(payload), Some(signature)) = (latest.payload, latest.signature) else {
@@ -126,7 +171,7 @@ pub fn latest_release(config: &Config, reported: &[(&str, String)]) -> Result<Co
         );
     }
 
-    Ok(release)
+    Ok(Latest::Release(release))
 }
 
 /// Downloads the archive for `hash` to `dest`.
@@ -143,17 +188,7 @@ pub fn download_archive(config: &Config, hash: &str, dest: &Path) -> Result<u64>
 ///
 /// The response stops at `limit` bytes.
 pub fn fetch_text(config: &Config, url: &str, limit: u64) -> Result<String> {
-    fetch_text_with(config, url, limit, &[])
-}
-
-/// Reads a URL as text, with a `sync` token and the extra `headers`.
-fn fetch_text_with(
-    config: &Config,
-    url: &str,
-    limit: u64,
-    headers: &[(&str, String)],
-) -> Result<String> {
-    get_text(config, url, limit, headers, auth::SCOPE_SYNC)
+    get_text(config, url, limit, &[], auth::SCOPE_SYNC)
 }
 
 /// Reads a URL as text, with an `outbox:read` token. The admin commands read
@@ -165,9 +200,25 @@ pub fn fetch_admin(config: &Config, url: &str, limit: u64) -> Result<String> {
 /// Posts a JSON body with an `outbox:read` token, and returns the answer as
 /// text. A status outside 2xx is an error.
 pub fn post_admin(config: &Config, url: &str, body: &str, limit: u64) -> Result<String> {
+    send_admin(config, false, url, body, limit)
+}
+
+/// Puts a JSON body with an `outbox:read` token, and returns the answer as
+/// text. A status outside 2xx is an error. `admin retire` stores a removal
+/// order through this.
+pub fn put_admin(config: &Config, url: &str, body: &str, limit: u64) -> Result<String> {
+    send_admin(config, true, url, body, limit)
+}
+
+/// Sends a JSON body with an `outbox:read` token, as a `PUT` when `put` is
+/// true and as a `POST` otherwise.
+fn send_admin(config: &Config, put: bool, url: &str, body: &str, limit: u64) -> Result<String> {
     let agent = build_agent(TEXT_TIMEOUT);
-    let mut request = agent
-        .post(url)
+    let (request, verb) = match put {
+        true => (agent.put(url), "put to"),
+        false => (agent.post(url), "post to"),
+    };
+    let mut request = request
         .header("Content-Type", "application/json")
         .header("Accept", "application/json");
     if let Some(token) = auth::bearer(config, auth::SCOPE_OUTBOX_READ)? {
@@ -176,15 +227,39 @@ pub fn post_admin(config: &Config, url: &str, body: &str, limit: u64) -> Result<
     let mut response = request
         .send(body)
         .map_err(describe)
-        .with_context(|| format!("cannot post to {url}"))?;
+        .with_context(|| format!("cannot {verb} {url}"))?;
     check_status(&mut response, auth::SCOPE_OUTBOX_READ)
-        .with_context(|| format!("cannot post to {url}"))?;
+        .with_context(|| format!("cannot {verb} {url}"))?;
     response
         .body_mut()
         .with_config()
         .limit(limit)
         .read_to_string()
         .with_context(|| format!("cannot read the response body from {url}"))
+}
+
+/// Sends a `GET` with a token for `scope` and the extra `headers`, and returns
+/// the response, whatever its status. A failure to reach the server is an
+/// error.
+fn get(
+    config: &Config,
+    url: &str,
+    headers: &[(&str, String)],
+    scope: &str,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let agent = build_agent(TEXT_TIMEOUT);
+    let mut request = agent.get(url);
+    if let Some(token) = auth::bearer(config, scope)? {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    for (name, value) in headers {
+        request = request.header(*name, value);
+    }
+
+    request
+        .call()
+        .map_err(describe)
+        .with_context(|| format!("cannot read {url}"))
 }
 
 /// Reads a URL as text with a token for `scope`, and the extra `headers`.
@@ -195,19 +270,7 @@ fn get_text(
     headers: &[(&str, String)],
     scope: &str,
 ) -> Result<String> {
-    let agent = build_agent(TEXT_TIMEOUT);
-    let mut request = agent.get(url);
-    if let Some(token) = auth::bearer(config, scope)? {
-        request = request.header("Authorization", format!("Bearer {token}"));
-    }
-    for (name, value) in headers {
-        request = request.header(*name, value);
-    }
-
-    let mut response = request
-        .call()
-        .map_err(describe)
-        .with_context(|| format!("cannot read {url}"))?;
+    let mut response = get(config, url, headers, scope)?;
 
     check_status(&mut response, scope).with_context(|| format!("cannot read {url}"))?;
 
@@ -352,10 +415,25 @@ pub fn whoami(config: &Config) -> Result<Option<String>> {
 /// caller reads the status alone: nothing in the answer changes what this
 /// client does.
 pub fn post_diagnostics(config: &Config, report: &str, token: Option<&str>) -> Result<Answer> {
-    let url = config.diagnostics_url();
+    post_report(&config.diagnostics_url(), report, token)
+        .context("cannot send the diagnostic report")
+}
+
+/// Sends the removal report, and returns the server's answer, whatever its
+/// status.
+///
+/// `token` is the `sync` token of the run. The caller reads nothing of the
+/// answer: brainmaker is removed by then, whatever the server says.
+pub fn post_removal_report(config: &Config, report: &str, token: Option<&str>) -> Result<Answer> {
+    post_report(&config.removal_report_url(), report, token)
+        .context("cannot send the removal report")
+}
+
+/// Posts one report as JSON to `url`, inside [`REPORT_TIMEOUT`].
+fn post_report(url: &str, report: &str, token: Option<&str>) -> Result<Answer> {
     let agent = build_agent(REPORT_TIMEOUT);
     let mut request = agent
-        .post(&url)
+        .post(url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json");
     if let Some(token) = token {
@@ -364,7 +442,7 @@ pub fn post_diagnostics(config: &Config, report: &str, token: Option<&str>) -> R
     let mut response = request
         .send(report)
         .map_err(describe)
-        .with_context(|| format!("cannot send the diagnostic report to {url}"))?;
+        .with_context(|| format!("cannot post to {url}"))?;
     let status = response.status().as_u16();
     let body = response
         .body_mut()
@@ -426,7 +504,16 @@ fn check_status(response: &mut ureq::http::Response<ureq::Body>, scope: &str) ->
         return Ok(());
     }
 
-    let code = status.as_u16();
+    Err(status_error(
+        status.as_u16(),
+        scope,
+        server_message(response),
+    ))
+}
+
+/// The error for an answer with the status `code`, which is not a success.
+/// `message` is the server's own explanation, when it sent one.
+fn status_error(code: u16, scope: &str, message: Option<String>) -> anyhow::Error {
     let headline = match code {
         401 | 403 => format!(
             "the server rejected the request with HTTP {code}; check that {} is configured, and \
@@ -437,11 +524,11 @@ fn check_status(response: &mut ureq::http::Response<ureq::Body>, scope: &str) ->
         _ => format!("the server returned HTTP {code}"),
     };
 
-    let text = match server_message(response) {
+    let text = match message {
         Some(message) => format!("{headline}: {message}"),
         None => headline,
     };
-    Err(cause::failed(Cause::Http, Some(code), text))
+    cause::failed(Cause::Http, Some(code), text)
 }
 
 /// Reads the message a failed response carries, if it carries one.
@@ -531,13 +618,13 @@ mod tests {
 
     #[test]
     fn the_latest_body_needs_both_envelope_fields() {
-        let both: Latest =
+        let both: LatestBody =
             serde_json::from_str(r#"{"hash":"25c60772","payload":"{}","signature":"ab"}"#).unwrap();
         assert!(both.payload.is_some() && both.signature.is_some());
 
         // The shape an older server returns. Both fields are absent, and
         // `latest_release` refuses it rather than installing unsigned content.
-        let old: Latest = serde_json::from_str(r#"{"hash":"25c60772"}"#).unwrap();
+        let old: LatestBody = serde_json::from_str(r#"{"hash":"25c60772"}"#).unwrap();
         assert!(old.payload.is_none() && old.signature.is_none());
     }
 
@@ -616,10 +703,96 @@ mod tests {
 
         let read = latest_release(&Config::for_test(&dir, &server.base()), &[]).unwrap();
 
+        let Latest::Release(read) = read else {
+            panic!("the server offers a release, got {read:?}");
+        };
         assert_eq!(read.hash, "25c60772");
         assert_eq!(read.sha256, "a".repeat(64));
         assert_eq!(read.size_bytes, 1152003);
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The body of a `410 Gone` answer that carries `envelope`.
+    fn gone_with(envelope: &str) -> String {
+        format!(r#"{{"error":"this client is retired","removal":{envelope}}}"#)
+    }
+
+    /// The payload of a removal order for the client of the test credentials.
+    fn removal_order() -> String {
+        r#"{"order":"remove","client_id":"the-client-id","outbox":"keep","issued_at":1791300000}"#
+            .to_string()
+    }
+
+    #[test]
+    fn reads_a_removal_order_from_a_gone_answer() {
+        let signer = Signer::new();
+        signer.trust_for_removal();
+        let server = Server::start(vec![
+            Route::token("sync", r#"{"access_token":"s"}"#),
+            Route::get(
+                "/content/latest",
+                gone_with(&signer.envelope(&removal_order())),
+            )
+            .status(410),
+        ]);
+        let dir = temp_dir("remote-removal");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let read = latest_release(&config, &[]).unwrap();
+
+        let Latest::Removal(order) = read else {
+            panic!("the server sent a removal order, got {read:?}");
+        };
+        assert_eq!(order.outbox, removal::Outbox::Keep);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_removal_order_that_no_removal_key_signed() {
+        // The key signs content and software in this thread, and no removal
+        // order: a server that holds the content key cannot remove a client.
+        let signer = Signer::new();
+        signer.trust();
+        crate::signature::trust_for_removal_in_this_test(&[]);
+        let server = Server::start(vec![
+            Route::token("sync", r#"{"access_token":"s"}"#),
+            Route::get(
+                "/content/latest",
+                gone_with(&signer.envelope(&removal_order())),
+            )
+            .status(410),
+        ]);
+        let dir = temp_dir("remote-removal-untrusted");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let error = latest_release(&config, &[]).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(text.contains("does not obey it"), "got {text}");
+        let failure = cause::of(&error);
+        assert_eq!(failure.cause, Cause::Signature);
+        assert_eq!(failure.status, Some(410));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_gone_answer_with_no_order_is_a_failed_check() {
+        let server = Server::start(vec![
+            Route::get("/content/latest", r#"{"error":"this client is retired"}"#).status(410),
+        ]);
+        let dir = temp_dir("remote-gone");
+
+        let error = latest_release(&Config::for_test(&dir, &server.base()), &[]).unwrap_err();
+
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("the server returned HTTP 410: this client is retired"),
+            "got {text}"
+        );
+        let failure = cause::of(&error);
+        assert_eq!(failure.cause, Cause::Http);
+        assert_eq!(failure.status, Some(410));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

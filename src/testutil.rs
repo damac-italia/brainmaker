@@ -102,9 +102,16 @@ impl Signer {
 
     /// Makes the client trust this signer's key, in the calling thread only.
     ///
-    /// The key replaces both compiled-in key lists for that thread.
+    /// The key replaces the software list and the content list for that
+    /// thread. It signs no removal order.
     pub fn trust(&self) {
         crate::signature::trust_in_this_test(&[self.public_hex()]);
+    }
+
+    /// Makes the client trust this signer's key for a removal order, in the
+    /// calling thread only.
+    pub fn trust_for_removal(&self) {
+        crate::signature::trust_for_removal_in_this_test(&[self.public_hex()]);
     }
 }
 
@@ -209,6 +216,14 @@ impl Route {
     pub fn post(path: &str, body: impl Into<Vec<u8>>) -> Self {
         Self {
             method: "POST",
+            ..Self::get(path, body)
+        }
+    }
+
+    /// A `PUT` route that answers 200 with `body`.
+    pub fn put(path: &str, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            method: "PUT",
             ..Self::get(path, body)
         }
     }

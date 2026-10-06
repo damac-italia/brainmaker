@@ -152,6 +152,14 @@ impl Credentials {
         let pair = format!("{}:{}", self.client_id, self.client_secret);
         format!("Basic {}", auth::base64(pair.as_bytes()))
     }
+
+    /// True when `client_id` is the identifier of this client.
+    ///
+    /// A removal order names one client. The comparison stays here, so the
+    /// identifier itself never leaves this struct.
+    pub fn is_client(&self, client_id: &str) -> bool {
+        self.client_id == client_id
+    }
 }
 
 /// The ten routes this client asks for, each relative to a base URL.
@@ -407,6 +415,13 @@ impl Layout {
     pub fn report_lock_file(&self) -> PathBuf {
         self.root.join(".diagnostics.lock")
     }
+
+    /// File that holds the removal key of the admin, when `--key` names no
+    /// other one. Only the admin's machine has it, and no command writes it:
+    /// `uninstall` therefore leaves it, with the root that holds it.
+    pub fn removal_key_file(&self) -> PathBuf {
+        self.root.join("removal-signing.key")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -599,6 +614,12 @@ impl Config {
         &self.source
     }
 
+    /// The root and every path under it, for the code that works without the
+    /// settings, as `uninstall` does.
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
     /// Root directory that holds the content, the state file, and the
     /// temporary directories.
     pub fn root(&self) -> &Path {
@@ -691,6 +712,11 @@ impl Config {
         self.layout.report_lock_file()
     }
 
+    /// File that holds the removal key of the admin.
+    pub fn removal_key_file(&self) -> PathBuf {
+        self.layout.removal_key_file()
+    }
+
     /// URL that returns the latest content hash as JSON.
     pub fn latest_url(&self) -> String {
         join(&self.base_url, &self.routes.content_latest)
@@ -738,6 +764,26 @@ impl Config {
     /// URL that receives the diagnostic report of this client.
     pub fn diagnostics_url(&self) -> String {
         join(&self.base_url, &self.routes.diagnostics)
+    }
+
+    /// URL that receives the removal report of this client: `/removal` under
+    /// the diagnostics route. It is the last report of a machine, so it takes
+    /// no route key of its own.
+    pub fn removal_report_url(&self) -> String {
+        join(
+            &self.base_url,
+            &format!("{}/removal", self.routes.diagnostics),
+        )
+    }
+
+    /// URL of the removal of one client: `admin retire` puts a signed order
+    /// there, and `admin diagnose` reads what came of it. Check the client ID
+    /// first: it becomes a path segment.
+    pub fn admin_removal_url(&self, client_id: &str) -> String {
+        join(
+            &self.base_url,
+            &format!("{}/{client_id}/removal", self.routes.admin_clients),
+        )
     }
 
     /// URL of one page of the notes that wait for the admin, at most `limit`.

@@ -21,6 +21,9 @@
 //! run says how many were never sent. The root then stays too, because the
 //! outbox is in it.
 //!
+//! A removal that the administrator ordered can take the outbox too: the
+//! order says which, and [`Notes`] carries the choice. See [`crate::removal`].
+//!
 //! Everything it did not write. The root goes entry by entry, never as a
 //! whole, so a file of yours inside it survives, and so does the directory
 //! that holds it. A root reached through a symbolic link loses the link, and
@@ -76,6 +79,19 @@ pub struct Report {
     /// True when the root exists but carries no mark of brainmaker, so
     /// nothing under it was touched.
     pub unrecognised: bool,
+    /// Notes that were never sent: the ones that waited, and the ones that
+    /// were rejected. They stay with the outbox, or go with it.
+    pub unsent: usize,
+}
+
+/// What a run does with the outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notes {
+    /// The outbox stays, with every note in it. `uninstall` always keeps it.
+    Keep,
+    /// The outbox goes, with every note in it, sent or not. Only a removal
+    /// order can ask for this.
+    Remove,
 }
 
 /// The question `uninstall` asks before it removes anything.
@@ -112,10 +128,13 @@ pub fn is_yes(answer: &str) -> bool {
 /// Removes the bridge in `claude` and the agent in `agents`, then what
 /// brainmaker wrote under the root of `layout`, then the root when it is
 /// empty. Changes nothing when the root exists but is not recognised.
+///
+/// `notes` says whether the outbox stays.
 pub fn uninstall(
     layout: &Layout,
     claude: &Path,
     agents: Option<&Agents>,
+    notes: Notes,
     log: &dyn Fn(&str),
 ) -> Result<Report> {
     let root = layout.root();
@@ -146,7 +165,7 @@ pub fn uninstall(
         link::describe(&report.bridge, false, log);
     }
     if root_exists {
-        remove_root(layout, program.as_deref(), &mut report, log)?;
+        remove_root(layout, program.as_deref(), notes, &mut report, log)?;
     }
 
     if !report.bridge.changed() && report.removed.is_empty() {
@@ -178,6 +197,7 @@ fn is_recognised(layout: &Layout) -> bool {
 fn remove_root(
     layout: &Layout,
     program: Option<&Path>,
+    notes: Notes,
     report: &mut Report,
     log: &dyn Fn(&str),
 ) -> Result<()> {
@@ -197,6 +217,11 @@ fn remove_root(
     let push_state = layout.push_state_file();
     let run_log = layout.run_log_file();
     let report_record = layout.report_record_file();
+
+    // Counted before anything goes, because the outbox can go too.
+    let unsent = outbox::counts_in(&layout.outbox_dir(), &layout.rejected_dir());
+    report.unsent = unsent.waiting + unsent.rejected;
+
     let mut paths = vec![
         layout.content_dir(),
         layout.staging_dir(),
@@ -217,6 +242,9 @@ fn remove_root(
         outbox::temporary_path(&report_record),
         report_record,
     ];
+    if notes == Notes::Remove {
+        paths.push(layout.outbox_dir());
+    }
     paths.extend(program_files(bin, &installed)?);
     paths.extend([
         state::temporary_path(&state),
@@ -244,16 +272,22 @@ fn remove_root(
         }
     }
 
-    // The outbox stays, with every note in it.
-    let unsent = outbox::counts_in(&layout.outbox_dir(), &layout.rejected_dir());
-    if unsent.waiting + unsent.rejected > 0 {
-        log(&format!(
-            "Left {} note(s) that were never sent in {}: {} waiting, {} rejected.",
-            unsent.waiting + unsent.rejected,
-            layout.outbox_dir().display(),
-            unsent.waiting,
-            unsent.rejected
-        ));
+    if report.unsent > 0 {
+        match notes {
+            // The outbox stays, with every note in it.
+            Notes::Keep => log(&format!(
+                "Left {} note(s) that were never sent in {}: {} waiting, {} rejected.",
+                report.unsent,
+                layout.outbox_dir().display(),
+                unsent.waiting,
+                unsent.rejected
+            )),
+            Notes::Remove => log(&format!(
+                "Removed {} note(s) that were never sent, with the outbox: {} waiting, {} \
+                 rejected.",
+                report.unsent, unsent.waiting, unsent.rejected
+            )),
+        }
     }
 
     remove_if_empty(bin)?;
@@ -319,15 +353,20 @@ fn remove(path: &Path) -> Result<bool> {
             return Err(error).with_context(|| format!("cannot read {}", path.display()));
         }
     };
-    if meta.is_symlink() {
+    let removed = if meta.is_symlink() {
         link::remove_link(path)
     } else if meta.is_dir() {
         fs::remove_dir_all(path)
     } else {
         fs::remove_file(path)
+    };
+    match removed {
+        Ok(()) => Ok(true),
+        // Another run removed it between the look and the removal. Two runs
+        // can obey one removal order at the same time.
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("cannot remove {}", path.display())),
     }
-    .with_context(|| format!("cannot remove {}", path.display()))?;
-    Ok(true)
 }
 
 /// Removes the directory `path` when it is empty. Returns the names it still
@@ -447,7 +486,7 @@ mod tests {
 
         let lines = RefCell::new(Vec::new());
         let log = |line: &str| lines.borrow_mut().push(line.to_string());
-        let report = uninstall(&layout, &claude, None, &log).unwrap();
+        let report = uninstall(&layout, &claude, None, Notes::Keep, &log).unwrap();
 
         assert!(report.root_removed, "left {:?}", report.left);
         assert!(!root.exists());
@@ -486,7 +525,7 @@ mod tests {
         );
         let layout = Layout::resolve(Some(&root)).unwrap();
 
-        let report = uninstall(&layout, &claude, None, &quiet).unwrap();
+        let report = uninstall(&layout, &claude, None, Notes::Keep, &quiet).unwrap();
 
         assert!(report.unrecognised);
         assert!(report.removed.is_empty());
@@ -514,7 +553,7 @@ mod tests {
         write(&claude.join("CLAUDE.md"), briefing);
         let layout = Layout::resolve(Some(&root)).unwrap();
 
-        let report = uninstall(&layout, &claude, None, &quiet).unwrap();
+        let report = uninstall(&layout, &claude, None, Notes::Keep, &quiet).unwrap();
 
         assert!(report.unrecognised);
         assert!(!report.bridge.changed(), "{:?}", report.bridge);
@@ -536,7 +575,7 @@ mod tests {
 
         let lines = RefCell::new(Vec::new());
         let log = |line: &str| lines.borrow_mut().push(line.to_string());
-        let report = uninstall(&layout, &base.join("claude"), None, &log).unwrap();
+        let report = uninstall(&layout, &base.join("claude"), None, Notes::Keep, &log).unwrap();
 
         assert!(report.root_removed, "left {:?}", report.left);
         assert!(fs::symlink_metadata(&root).is_err(), "the link is gone");
@@ -562,7 +601,7 @@ mod tests {
         write(&root.join("bin").join("other-tool"), b"mine\n");
         write(&root.join("confidential").join("other.key"), b"mine\n");
 
-        let report = uninstall(&layout, &base.join("claude"), None, &quiet).unwrap();
+        let report = uninstall(&layout, &base.join("claude"), None, Notes::Keep, &quiet).unwrap();
 
         assert!(!report.root_removed);
         assert_eq!(report.left, vec!["bin", "confidential", "notes.md"]);
@@ -612,7 +651,7 @@ mod tests {
             write(&root.join("bin").join(name), b"\n");
         }
 
-        let report = uninstall(&layout, &base.join("claude"), None, &quiet).unwrap();
+        let report = uninstall(&layout, &base.join("claude"), None, Notes::Keep, &quiet).unwrap();
 
         assert!(report.root_removed, "left {:?}", report.left);
         assert!(!root.join(".lock").exists());
@@ -639,7 +678,7 @@ mod tests {
 
         let lines = RefCell::new(Vec::new());
         let log = |line: &str| lines.borrow_mut().push(line.to_string());
-        let report = uninstall(&layout, &base.join("claude"), None, &log).unwrap();
+        let report = uninstall(&layout, &base.join("claude"), None, Notes::Keep, &log).unwrap();
 
         assert!(!report.root_removed);
         assert_eq!(report.left, vec!["outbox".to_string()]);
@@ -651,6 +690,39 @@ mod tests {
         assert!(
             lines.borrow().iter().any(|line| line
                 .starts_with("Left 2 note(s) that were never sent")
+                && line.ends_with("1 waiting, 1 rejected.")),
+            "{:?}",
+            lines.borrow()
+        );
+        assert_eq!(report.unsent, 2);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn removes_the_outbox_when_the_run_is_told_to() {
+        // Only a removal order asks for this. See crate::removal.
+        let base = temp_dir("outbox-removed");
+        let root = base.join("root");
+        let layout = installed(&root);
+        write(&layout.outbox_dir().join("2026-09-30-a.md"), b"waiting\n");
+        write(&layout.rejected_dir().join("2026-09-29-b.md"), b"refused\n");
+        write(
+            &layout.sent_dir().join("2026-09").join("2026-09-28-c.md"),
+            b"sent\n",
+        );
+        // An entry that push never reads as a note goes with the outbox too.
+        write(&layout.outbox_dir().join("drafts").join("idea.txt"), b"x\n");
+
+        let lines = RefCell::new(Vec::new());
+        let log = |line: &str| lines.borrow_mut().push(line.to_string());
+        let report = uninstall(&layout, &base.join("claude"), None, Notes::Remove, &log).unwrap();
+
+        assert!(report.root_removed, "left {:?}", report.left);
+        assert_eq!(report.unsent, 2);
+        assert!(!root.exists());
+        assert!(
+            lines.borrow().iter().any(|line| line
+                .starts_with("Removed 2 note(s) that were never sent, with the outbox")
                 && line.ends_with("1 waiting, 1 rejected.")),
             "{:?}",
             lines.borrow()
@@ -668,7 +740,7 @@ mod tests {
 
         let lines = RefCell::new(Vec::new());
         let log = |line: &str| lines.borrow_mut().push(line.to_string());
-        let report = uninstall(&layout, &base.join("claude"), None, &log).unwrap();
+        let report = uninstall(&layout, &base.join("claude"), None, Notes::Keep, &log).unwrap();
 
         assert!(report.root_removed);
         assert_eq!(report.removed, vec![layout.store_path()]);
@@ -691,11 +763,11 @@ mod tests {
         let root = base.join("root");
         let claude = base.join("claude");
         let layout = installed(&root);
-        uninstall(&layout, &claude, None, &quiet).unwrap();
+        uninstall(&layout, &claude, None, Notes::Keep, &quiet).unwrap();
 
         let lines = RefCell::new(Vec::new());
         let log = |line: &str| lines.borrow_mut().push(line.to_string());
-        let second = uninstall(&layout, &claude, None, &log).unwrap();
+        let second = uninstall(&layout, &claude, None, Notes::Keep, &log).unwrap();
 
         assert!(!second.bridge.changed());
         assert!(second.removed.is_empty());
@@ -722,7 +794,7 @@ mod tests {
         fs::remove_dir_all(layout.content_dir()).unwrap();
         std::os::unix::fs::symlink(&vault, layout.content_dir()).unwrap();
 
-        uninstall(&layout, &base.join("claude"), None, &quiet).unwrap();
+        uninstall(&layout, &base.join("claude"), None, Notes::Keep, &quiet).unwrap();
 
         assert!(!root.exists());
         assert_eq!(fs::read_to_string(vault.join("note.md")).unwrap(), "mine\n");
@@ -784,7 +856,14 @@ mod tests {
             b"Mon Sep 28 17:00:00 CEST 2026\n",
         );
 
-        let report = uninstall(&layout, &base.join("claude"), Some(&agents), &quiet).unwrap();
+        let report = uninstall(
+            &layout,
+            &base.join("claude"),
+            Some(&agents),
+            Notes::Keep,
+            &quiet,
+        )
+        .unwrap();
 
         assert!(report.bridge.agent_changed);
         assert!(!agents.plist().exists());
@@ -809,7 +888,14 @@ mod tests {
         )
         .unwrap();
 
-        let report = uninstall(&layout, &base.join("claude"), Some(&agents), &quiet).unwrap();
+        let report = uninstall(
+            &layout,
+            &base.join("claude"),
+            Some(&agents),
+            Notes::Keep,
+            &quiet,
+        )
+        .unwrap();
 
         assert!(report.unrecognised);
         assert!(agents.plist().is_file());

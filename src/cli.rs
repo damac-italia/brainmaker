@@ -17,14 +17,16 @@ COMMANDS:
                    (default). It also reports a newer brainmaker, but it
                    never installs one. Then it asks the server for the
                    operator name, sends the notes in the outbox, and sends
-                   the diagnostic report when one is due.
-    status         Print the installed hash, the latest hash, both software
+                   the diagnostic report when one is due. When the server
+                   answers with a removal order for this client, it removes
+                   brainmaker from this machine instead; see REMOVAL ORDER.
+    status        Print the installed hash, the latest hash, both software
                    versions, the operator, and the notes in the outbox. It
                    changes nothing.
     push           Send the notes in the outbox now
-    admin          Collect the notes, read the fleet and its sync log, and
-                   see why a client sends no note. For the admin;
-                   run brainmaker admin --help
+    admin          Collect the notes, read the fleet and its sync log, see
+                   why a client sends no note, and retire the clients of a
+                   person who left. For the admin; run brainmaker admin --help
     self-update    Replace this binary with the newest build for this platform
     link           Wire the synced content into ~/.claude, so its skills and
                    its session context load in every project, not only in the
@@ -47,7 +49,8 @@ OPTIONS:
     --check              With self-update, report the newer version and install
                          nothing
     --no-update-check    With sync, skip the software version check
-    -y, --yes            With uninstall, remove without asking first
+    -y, --yes            With uninstall and admin retire, do it without asking
+                         first
     --config <PATH>      Import the provisioning file at PATH
     --keep-config        Do not remove the provisioning file after the import
     --dir <PATH>         Use PATH as the root instead of ~/.brainmaker
@@ -112,6 +115,17 @@ DIAGNOSTICS:
     name or the text of a note. Only the admin reads it, and the server never
     asks for it. A report that fails changes nothing else.
 
+REMOVAL ORDER:
+    The administrator can order the removal of brainmaker from this machine,
+    for example when a person leaves the team, with admin retire. The order
+    is a document that names this client, signed with a key that this binary
+    trusts for nothing else. The server carries it, and cannot write one. When
+    sync receives the order, it removes what uninstall removes, without a
+    question, and prints what it did even with --quiet. The order says whether
+    the outbox stays. Then sync tells the server that the removal ran. A
+    binary that trusts no removal key obeys no order; status prints the count
+    on its signing line.
+
 EXIT CODES:
     0    The content is up to date, or the update succeeded. A failure to
          send a note is a notice, and sync still exits 0.
@@ -120,10 +134,13 @@ EXIT CODES:
 ";
 
 pub const ADMIN_HELP: &str = "\
-brainmaker admin — collect the notes, read the fleet and its sync log, and
-see why a client sends no note
+brainmaker admin — collect the notes, read the fleet and its sync log, see
+why a client sends no note, and retire the clients of a person who left
 
 USAGE:
+    brainmaker admin retire <OPERATOR> [--remove-outbox] [--key PATH] [--yes]
+    brainmaker admin retire --client <CLIENT-ID> [--remove-outbox]
+                            [--key PATH] [--yes]
     brainmaker admin pull-outbox <DIR> [OPTIONS]
     brainmaker admin status [--json] [OPTIONS]
     brainmaker admin syncs <OPERATOR> [--limit N] [--json] [OPTIONS]
@@ -138,6 +155,19 @@ credential that reads the outbox and sends no notes, and wires nothing into
 ~/.claude.
 
 COMMANDS:
+    retire <OPERATOR>
+                   Take brainmaker off the machines of OPERATOR, a person who
+                   left the team. It signs one removal order for each client
+                   of OPERATOR, with the removal key of this machine, and
+                   stores it on the server. The server retires each client and
+                   gives it no content from then on. At its next sync, each
+                   client removes the content, the sealed settings, the
+                   program copy, and what link wrote into ~/.claude, and
+                   reports it. It asks first, unless --yes is given. A client
+                   that received an order is never restored: a person who
+                   comes back gets a new client. Read where the removal
+                   stands with diagnose, and revoke the client at the issuer
+                   only after it reported the removal.
     pull-outbox <DIR>
                    Write each note that waits on the server into DIR, as
                    <YYYY-MM-DD>-<operator>-<name>, where the date is the day
@@ -160,7 +190,11 @@ COMMANDS:
                    finding names why no note arrives: the client is too old,
                    link never connected Claude, every note broke a rule, or
                    no note was written. The client sends that report itself,
-                   with its sync: the server asks for nothing.
+                   with its sync: the server asks for nothing. For a retired
+                   client with a removal order, a line that starts with
+                   removal says where the removal stands: when the order was
+                   stored, when the client received it, and what the client
+                   reported.
 
 OPTIONS:
     --json               With status, syncs, and diagnose, print JSON instead
@@ -168,8 +202,14 @@ OPTIONS:
     --limit <N>          With syncs, print at most N rows, from 1 to 1000.
                          Default: 50. With diagnose, print at most N lines of
                          the run log of each client. Default: 20.
-    --client <CLIENT-ID> With syncs and diagnose, name one client instead of
-                         an operator
+    --client <CLIENT-ID> With syncs, diagnose, and retire, name one client
+                         instead of an operator
+    --remove-outbox      With retire, the order also removes the outbox on
+                         that machine, with every note in it, sent or not.
+                         Without it, the outbox stays there.
+    --key <PATH>         With retire, sign with the removal key at PATH
+                         instead of ~/.brainmaker/removal-signing.key
+    -y, --yes            With retire, do it without asking first
     --dir, --config, --keep-config, --url, and --quiet work as they do for
     every other command.
 
@@ -196,6 +236,7 @@ pub enum Command {
     AdminStatus,
     AdminSyncs,
     AdminDiagnose,
+    AdminRetire,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,8 +289,12 @@ pub struct Args {
     /// With `admin syncs` and `admin diagnose`, the one client to read.
     pub client: Option<String>,
     /// The value after an admin command: the directory of `pull-outbox`, or
-    /// the operator of `syncs` and of `diagnose`.
+    /// the operator of `syncs`, of `diagnose`, and of `retire`.
     pub target: Option<String>,
+    /// With `admin retire`, the removal key to sign with.
+    pub key: Option<PathBuf>,
+    /// With `admin retire`, the order also removes the outbox.
+    pub remove_outbox: bool,
 }
 
 impl Default for Args {
@@ -271,6 +316,8 @@ impl Default for Args {
             limit: None,
             client: None,
             target: None,
+            key: None,
+            remove_outbox: false,
         }
     }
 }
@@ -356,6 +403,11 @@ where
                 args.url = Some(value);
             }
             "--json" => args.json = true,
+            "--remove-outbox" => args.remove_outbox = true,
+            "--key" => {
+                let value = value_of("--key", "a path", args.key.is_some(), &mut iter)?;
+                args.key = Some(PathBuf::from(value));
+            }
             "--limit" => {
                 let value = value_of("--limit", "a number", args.limit.is_some(), &mut iter)?;
                 match value.parse::<u32>() {
@@ -392,14 +444,21 @@ where
                 args.command = Command::AdminDiagnose;
                 admin_pending = false;
             }
+            "retire" if admin_pending => {
+                args.command = Command::AdminRetire;
+                admin_pending = false;
+            }
             other if admin_pending => bail!(
-                "admin takes pull-outbox, status, syncs, or diagnose, not {other:?}; run \
+                "admin takes pull-outbox, status, syncs, diagnose, or retire, not {other:?}; run \
                  brainmaker admin --help"
             ),
             other
                 if matches!(
                     args.command,
-                    Command::AdminPullOutbox | Command::AdminSyncs | Command::AdminDiagnose
+                    Command::AdminPullOutbox
+                        | Command::AdminSyncs
+                        | Command::AdminDiagnose
+                        | Command::AdminRetire
                 ) && args.target.is_none()
                     && !other.starts_with('-') =>
             {
@@ -442,7 +501,10 @@ where
     }
 
     if admin_pending {
-        bail!("admin needs pull-outbox, status, syncs, or diagnose; run brainmaker admin --help");
+        bail!(
+            "admin needs pull-outbox, status, syncs, diagnose, or retire; run brainmaker admin \
+             --help"
+        );
     }
     check_admin_target(&args)?;
     check_options(&args)?;
@@ -461,6 +523,9 @@ fn check_admin_target(args: &Args) -> Result<()> {
         }
         Command::AdminDiagnose if args.target.is_some() == args.client.is_some() => {
             bail!("admin diagnose needs an operator, or --client <CLIENT-ID>, and not both")
+        }
+        Command::AdminRetire if args.target.is_some() == args.client.is_some() => {
+            bail!("admin retire needs an operator, or --client <CLIENT-ID>, and not both")
         }
         _ => Ok(()),
     }
@@ -488,9 +553,10 @@ fn check_options(args: &Args) -> Result<()> {
         AdminStatus,
         AdminSyncs,
         AdminDiagnose,
+        AdminRetire,
     ];
 
-    let given: [(&str, bool, &[Command]); 12] = [
+    let given: [(&str, bool, &[Command]); 14] = [
         (
             "--json",
             args.json,
@@ -504,12 +570,14 @@ fn check_options(args: &Args) -> Result<()> {
         (
             "--client",
             args.client.is_some(),
-            &[AdminSyncs, AdminDiagnose],
+            &[AdminSyncs, AdminDiagnose, AdminRetire],
         ),
+        ("--key", args.key.is_some(), &[AdminRetire]),
+        ("--remove-outbox", args.remove_outbox, &[AdminRetire]),
         ("--force", args.force, &[Sync, SelfUpdate]),
         ("--check", args.check_only, &[SelfUpdate]),
         ("--no-update-check", args.no_update_check, &[Sync]),
-        ("--yes", args.yes, &[Uninstall]),
+        ("--yes", args.yes, &[Uninstall, AdminRetire]),
         ("--config", args.config.is_some(), all_but_uninstall),
         ("--keep-config", args.keep_config, all_but_uninstall),
         ("--url", args.url.is_some(), all_but_uninstall),
@@ -554,6 +622,7 @@ fn name_of(command: Command) -> &'static str {
         Command::AdminStatus => "admin status",
         Command::AdminSyncs => "admin syncs",
         Command::AdminDiagnose => "admin diagnose",
+        Command::AdminRetire => "admin retire",
     }
 }
 
@@ -700,11 +769,67 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_retire_command_with_an_operator_or_a_client() {
+        let args = run(&["admin", "retire", "gabriele"]);
+        assert_eq!(args.command, Command::AdminRetire);
+        assert_eq!(args.target.as_deref(), Some("gabriele"));
+        assert!(!args.remove_outbox && !args.yes);
+        assert_eq!(args.key, None);
+
+        let args = run(&[
+            "admin",
+            "retire",
+            "--client",
+            "brainmaker-sync-old",
+            "--remove-outbox",
+            "--key",
+            "keys/removal.key",
+            "--yes",
+        ]);
+        assert_eq!(args.command, Command::AdminRetire);
+        assert_eq!(args.client.as_deref(), Some("brainmaker-sync-old"));
+        assert_eq!(args.target, None);
+        assert!(args.remove_outbox && args.yes);
+        assert_eq!(args.key, Some(PathBuf::from("keys/removal.key")));
+
+        for (items, needle) in [
+            (&["admin", "retire"][..], "needs an operator"),
+            (
+                &["admin", "retire", "gabriele", "--client", "c1c"][..],
+                "and not both",
+            ),
+            (&["admin", "retire", "a", "b"][..], "unknown argument"),
+            (
+                &["admin", "retire", "g", "--json"][..],
+                "--json has no effect with admin retire",
+            ),
+            (&["admin", "retire", "g", "--key"][..], "--key needs a path"),
+            (&["retire", "gabriele"][..], "unknown argument"),
+            // The two options of retire belong to no other command.
+            (
+                &["admin", "diagnose", "g", "--remove-outbox"][..],
+                "--remove-outbox has no effect with admin diagnose",
+            ),
+            (&["sync", "--key", "k"][..], "--key has no effect with sync"),
+            (
+                &["admin", "status", "--yes"][..],
+                "--yes has no effect with admin status",
+            ),
+        ] {
+            let error = parse(items.iter().copied()).unwrap_err().to_string();
+            assert!(error.contains(needle), "{items:?}: {error}");
+        }
+        assert!(ADMIN_HELP.contains("retire <OPERATOR>"));
+        assert!(ADMIN_HELP.contains("--remove-outbox"));
+        assert!(ADMIN_HELP.contains("removal-signing.key"));
+    }
+
+    #[test]
     fn an_admin_command_needs_its_value_and_no_extra() {
         for (items, needle) in [
             (
                 &["admin"][..],
-                "needs pull-outbox, status, syncs, or diagnose",
+                "needs pull-outbox, status, syncs, diagnose, or retire",
             ),
             (&["admin", "stats"][..], "not \"stats\""),
             (&["admin", "pull-outbox"][..], "needs the directory"),
@@ -798,6 +923,18 @@ mod tests {
         assert!(HELP.contains("diagnostics.jsonl"));
         assert!(HELP.contains("never holds a credential"));
         assert!(HELP.contains("Only the admin reads it"));
+    }
+
+    #[test]
+    fn the_help_says_that_the_administrator_can_order_a_removal() {
+        // The help ships to every employee, and a removal order removes
+        // files from their machine, so the help says that it exists, who can
+        // give one, and that the run says what it did.
+        assert!(HELP.contains("\nREMOVAL ORDER:\n"));
+        assert!(HELP.contains("The server carries it, and cannot write one"));
+        assert!(HELP.contains("even with --quiet"));
+        assert!(HELP.contains("see REMOVAL ORDER"));
+        assert!(ADMIN_HELP.contains("a removal order"));
     }
 
     #[test]
