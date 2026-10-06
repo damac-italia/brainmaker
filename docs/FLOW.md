@@ -683,11 +683,11 @@ Steps of `admin diagnose`:
    [`admin.rs:1113`](../src/admin.rs)
    then checks that the answer is for the client that was asked for, and checks each time, each
    version, and each content hash.
-5. [`admin.rs:1172`](../src/admin.rs)
+5. [`admin.rs:1182`](../src/admin.rs)
    names each cause that the two sources show: a client too old for push, a missing hook, notes
    that broke a rule, notes that wait, entries in the outbox that are not notes, and an outbox
    that never held a note.
-6. [`admin.rs:1375`](../src/admin.rs)
+6. [`admin.rs:1383`](../src/admin.rs)
    builds the lines that `main.rs` prints. With `--json`, `main.rs` prints the same values as
    JSON.
 

@@ -1163,6 +1163,16 @@ fn check_diagnostics(found: &Diagnostics, client_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// What to check for an operator who works in Cowork.
+///
+/// `link` connects Claude through a `SessionStart` hook, and Cowork runs no
+/// such hook. The report says nothing of a Cowork project, so the two
+/// findings that a silent Cowork session leads to end with this sentence.
+const COWORK_HINT: &str = "Cowork does not run the SessionStart hook. For an operator who works \
+     in Cowork, check that the project links the folder ~/.brainmaker, that the instructions of \
+     the project tell Claude to read the briefing and to write the note in the outbox, and that \
+     the operator starts the work in that project.";
+
 /// Names each cause that the server and the report show for a client that
 /// sends no note, or that is not current.
 ///
@@ -1223,13 +1233,12 @@ fn findings(client: &Client, report: Option<&Report>, events: &[LoggedEvent]) ->
     }
 
     match report.link.hook {
-        Some(Presence::Absent) => found.push(
+        Some(Presence::Absent) => found.push(format!(
             "The SessionStart hook of brainmaker is not in the Claude settings of that \
-             machine. No session there reads the briefing or learns of the outbox, so Claude \
-             writes no note. Run link on that machine. The admin's own install has no hook \
-             on purpose."
-                .to_string(),
-        ),
+             machine. No Claude Code session there reads the briefing or learns of the outbox, \
+             so Claude writes no note. Run link on that machine. The admin's own install has \
+             no hook on purpose. {COWORK_HINT}"
+        )),
         Some(Presence::Unknown) => found.push(
             "brainmaker could not read the Claude settings of that machine, so the report \
              does not say whether the SessionStart hook is there."
@@ -1282,11 +1291,10 @@ fn findings(client: &Client, report: Option<&Report>, events: &[LoggedEvent]) ->
         && none_arrived
         && report.link.hook != Some(Presence::Absent)
     {
-        found.push(
+        found.push(format!(
             "No note was ever written on that machine: its outbox holds none, none was \
-             rejected, and none was sent."
-                .to_string(),
-        );
+             rejected, and none was sent. {COWORK_HINT}"
+        ));
     }
 
     if let Some(runs) = &report.version
@@ -2232,6 +2240,8 @@ mod tests {
             "{named:?}"
         );
         assert!(named[0].contains("Run link"), "{named:?}");
+        // Cowork runs no hook, so the finding says what to check there.
+        assert!(named[0].ends_with(COWORK_HINT), "{named:?}");
     }
 
     #[test]
@@ -2309,6 +2319,13 @@ mod tests {
         );
         assert_eq!(named.len(), 1, "{named:?}");
         assert!(named[0].contains("No note was ever written"), "{named:?}");
+        // The hook is there, and still no note: the finding names Cowork,
+        // where the hook does not run and the project must carry the rule.
+        assert!(named[0].ends_with(COWORK_HINT), "{named:?}");
+        assert!(
+            named[0].contains("instructions of the project"),
+            "{named:?}"
+        );
     }
 
     #[test]
@@ -2544,9 +2561,13 @@ mod tests {
                  2026-10-04T18:12:40+02:00  operator named"
                     .to_string(),
                 "  finding   The SessionStart hook of brainmaker is not in the Claude settings \
-                 of that machine. No session there reads the briefing or learns of the outbox, \
-                 so Claude writes no note. Run link on that machine. The admin's own install \
-                 has no hook on purpose."
+                 of that machine. No Claude Code session there reads the briefing or learns of \
+                 the outbox, so Claude writes no note. Run link on that machine. The admin's \
+                 own install has no hook on purpose. Cowork does not run the SessionStart hook. \
+                 For an operator who works in Cowork, check that the project links the folder \
+                 ~/.brainmaker, that the instructions of the project tell Claude to read the \
+                 briefing and to write the note in the outbox, and that the operator starts the \
+                 work in that project."
                     .to_string(),
                 "  log       2026-10-05T10:00:02+02:00  sync  content.up_to_date  a377aa94"
                     .to_string(),

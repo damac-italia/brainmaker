@@ -291,6 +291,13 @@ run wrote. It copies the binary, and writes an agent that runs `self-update` alo
 credential gets the list above, one with both scopes included, and so does a run with no
 credential. When the issuer gives no clear answer, `link` stops and changes nothing.
 
+Claude Code runs that hook. Cowork does not run it, so `link` alone does not connect a Cowork
+session. In Cowork, link the folder `~/.brainmaker` to a project, and write in the instructions of
+that project that Claude must read `content/CLAUDE.md` first and must write the end-of-session note
+in `outbox/`. In a Cowork session the home directory is not the home directory of the computer, so
+Claude finds the content and the outbox only through the linked folder. The instructions apply only
+to work that starts in that project.
+
 `session-context` prints the JSON that hook returns: the shared briefing and the working notes, each
 file capped so one growing file cannot crowd out the rest, then the operator name, the outbox path,
 and the count of notes that wait and that were rejected. It reads local files only. It is

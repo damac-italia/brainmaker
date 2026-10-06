@@ -410,7 +410,7 @@ gabriele  brainmaker-sync-gabriele
   content   a377aa94  installed 2026-10-01T09:00:00+02:00  present
   link      hook absent  block absent  skills 0  agent present
   outbox    waiting 0  rejected 0  sent 0  ignored 0  last push -  operator named
-  finding   The SessionStart hook of brainmaker is not in the Claude settings of that machine. No session there reads the briefing or learns of the outbox, so Claude writes no note. Run link on that machine. The admin's own install has no hook on purpose.
+  finding   The SessionStart hook of brainmaker is not in the Claude settings of that machine. No Claude Code session there reads the briefing or learns of the outbox, so Claude writes no note. Run link on that machine. The admin's own install has no hook on purpose. Cowork does not run the SessionStart hook. For an operator who works in Cowork, check that the project links the folder ~/.brainmaker, that the instructions of the project tell Claude to read the briefing and to write the note in the outbox, and that the operator starts the work in that project.
   log       2026-10-05T10:00:02+02:00  sync  content.up_to_date  a377aa94
   log       2026-10-05T09:00:01+02:00  self-update  update.current  0.2.0
 ```
@@ -432,14 +432,22 @@ The command names these causes:
 | The server holds no report | The server holds no report, and the last sync named another version, or none |
 | The server never saw this client sync | The fleet view holds no last sync |
 | The report is older than the syncs | The last sync is more than a day after the last report. The state can then be old. |
-| The `SessionStart` hook is absent | `link.hook` is `absent`. `link` never ran, or `unlink` ran. The admin's own install has no hook on purpose. |
+| The `SessionStart` hook is absent | `link.hook` is `absent`. `link` never ran, or `unlink` ran. The admin's own install has no hook on purpose. The finding also says what to check for an operator who works in Cowork. |
 | Notes broke a rule | `outbox.rejected` is above 0. The finding names each rule that the run log holds, with its count. |
 | Notes wait | `outbox.waiting` is above 0. The finding names what the newest push line of the run log says. |
 | Entries in the outbox are not notes | `outbox.ignored` is above 0. Something wrote a file with another ending than `.md`, or wrote into a folder. `push` never sends such an entry and never rejects it. |
-| No note was ever written | The hook is not absent, no note waits, none was rejected, none was sent, no entry is ignored, and the server holds none |
+| No note was ever written | The hook is not absent, no note waits, none was rejected, none was sent, no entry is ignored, and the server holds none. The finding also says what to check for an operator who works in Cowork. |
 | The registry names no operator, or the client is retired | The fleet view says so. The server refuses the notes of such a client. |
 | That machine runs an older version | The reported version is older than the version of this program |
 | The server dropped lines | `events_dropped` is above 0 |
+
+Cowork does not run the `SessionStart` hook, so `link` does not connect a Cowork session to the
+content, and the report says nothing of a Cowork project. There, the project must link the folder
+`~/.brainmaker`, and the instructions of the project must tell Claude to read `content/CLAUDE.md`
+and to write the end-of-session note in `outbox/`. A client whose operator works in Cowork with no
+such instructions syncs, holds the hook, and sends no note: the report then reads as an outbox that
+never held a note. So that finding, and the finding for an absent hook, end with what to check in
+Cowork.
 
 With `--json`, the command prints an array with one object for each client. It holds `client_id`,
 `operator`, `retired`, `last_sync_at`, `brainmaker_version`, `notes_stored`, `report`, `findings`,
