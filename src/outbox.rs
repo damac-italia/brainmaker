@@ -393,6 +393,44 @@ fn notes_in(dir: &Path) -> Vec<(String, PathBuf)> {
     found
 }
 
+/// How many entries directly in the outbox push does not read as a note: a
+/// file with a name that does not end in `.md`, or a directory other than
+/// `sent/` and `rejected/`. The count stops at `limit`.
+///
+/// Push never sends such an entry and never rejects it, so nothing else says
+/// that it is there. A note in a directory is never sent either, and the
+/// directory counts as one entry. An entry with a name that starts with a dot
+/// does not count, because the system writes such files beside the notes.
+pub fn ignored_count(config: &Config, limit: usize) -> usize {
+    let Ok(entries) = fs::read_dir(config.outbox_dir()) else {
+        return 0;
+    };
+    let own = [config.sent_dir(), config.rejected_dir()];
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_str();
+        if name.is_some_and(|name| name.starts_with('.')) {
+            continue;
+        }
+        // symlink_metadata, as in notes_in: a link is not followed, and a
+        // link with a note name is a note that push refuses.
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let ours = meta.is_dir() && own.contains(&entry.path());
+        let note = !meta.is_dir() && name.is_some_and(|name| name.ends_with(".md"));
+        if ours || note {
+            continue;
+        }
+        count += 1;
+        if count >= limit {
+            return limit;
+        }
+    }
+    count
+}
+
 /// How many notes `sent/` holds, over all of its month directories, counted
 /// from the files alone. The count stops at `limit`.
 pub fn sent_count(config: &Config, limit: usize) -> usize {
@@ -1373,6 +1411,44 @@ mod tests {
         assert_eq!(received_month(&stored("../../etc")), "unknown");
         assert_eq!(received_month(&stored("2026/09")), "unknown");
         assert_eq!(received_month("not json"), "unknown");
+    }
+
+    #[test]
+    fn an_entry_that_push_does_not_read_as_a_note_is_counted_as_ignored() {
+        let dir = temp_dir("outbox-ignored");
+        let config = Config::for_test(&dir, "http://127.0.0.1:9");
+        // No outbox at all holds nothing.
+        assert_eq!(ignored_count(&config, 100), 0);
+
+        // What push reads, or writes, is not ignored: a note, a note that it
+        // will reject for its name, and its own two directories.
+        write_note(&config, "2026-09-30-a.md", NOTE.as_bytes(), old());
+        write_note(&config, "Not A Note Name.md", NOTE.as_bytes(), old());
+        fs::create_dir_all(config.sent_dir().join("2026-09")).unwrap();
+        fs::create_dir_all(config.rejected_dir()).unwrap();
+        fs::write(config.rejected_dir().join("x.md.reason.txt"), "why").unwrap();
+        // Nor is a file that the system writes beside the notes.
+        write_note(&config, ".DS_Store", b"\0", old());
+        assert_eq!(ignored_count(&config, 100), 0);
+        assert_eq!(counts(&config).waiting, 2);
+
+        // Push reads none of these, and rejects none of them.
+        write_note(&config, "2026-09-30-b.txt", NOTE.as_bytes(), old());
+        write_note(&config, "2026-09-30-c.MD", NOTE.as_bytes(), old());
+        write_note(&config, "2026-09-30-d.md.tmp", NOTE.as_bytes(), old());
+        let folder = config.outbox_dir().join("2026-09");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("2026-09-30-e.md"), NOTE).unwrap();
+        fs::write(folder.join("2026-09-30-f.md"), NOTE).unwrap();
+        // A directory with a note name is a directory.
+        fs::create_dir_all(config.outbox_dir().join("2026-09-30-g.md")).unwrap();
+        assert_eq!(ignored_count(&config, 100), 5);
+        // The notes that wait are the same two.
+        assert_eq!(counts(&config).waiting, 2);
+        // The count stops at its limit.
+        assert_eq!(ignored_count(&config, 3), 3);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     // -------------------------------------------------------- operator ---

@@ -361,6 +361,7 @@ the start of a line.
 | `link.skills` | How many links under `~/.claude/skills` name the content directory |
 | `link.agent` | `present` or `absent` for the file of the hourly agent, or `none` on a system that has no agent |
 | `outbox.waiting`, `outbox.rejected`, `outbox.sent` | The notes in `outbox/`, in `outbox/rejected/`, and under `outbox/sent/`, counted from the files |
+| `outbox.ignored` | The entries directly in `outbox/` that `push` does not read as a note: a file with a name that does not end in `.md`, or a directory other than `sent/` and `rejected/`. A note in a directory is not read, and the directory counts as one entry. A name that starts with a dot does not count. `push` never sends such an entry and never rejects it, so nothing else shows it. |
 | `outbox.last_push_at_unix`, `outbox.last_push_notes` | The values in `push.json` |
 | `outbox.operator` | `true` when the `operator` file holds a name |
 
@@ -408,7 +409,7 @@ gabriele  brainmaker-sync-gabriele
   software  0.2.0  darwin-arm64
   content   a377aa94  installed 2026-10-01T09:00:00+02:00  present
   link      hook absent  block absent  skills 0  agent present
-  outbox    waiting 0  rejected 0  sent 0  last push -  operator named
+  outbox    waiting 0  rejected 0  sent 0  ignored 0  last push -  operator named
   finding   The SessionStart hook of brainmaker is not in the Claude settings of that machine. No session there reads the briefing or learns of the outbox, so Claude writes no note. Run link on that machine. The admin's own install has no hook on purpose.
   log       2026-10-05T10:00:02+02:00  sync  content.up_to_date  a377aa94
   log       2026-10-05T09:00:01+02:00  self-update  update.current  0.2.0
@@ -434,7 +435,8 @@ The command names these causes:
 | The `SessionStart` hook is absent | `link.hook` is `absent`. `link` never ran, or `unlink` ran. The admin's own install has no hook on purpose. |
 | Notes broke a rule | `outbox.rejected` is above 0. The finding names each rule that the run log holds, with its count. |
 | Notes wait | `outbox.waiting` is above 0. The finding names what the newest push line of the run log says. |
-| No note was ever written | The hook is not absent, no note waits, none was rejected, none was sent, and the server holds none |
+| Entries in the outbox are not notes | `outbox.ignored` is above 0. Something wrote a file with another ending than `.md`, or wrote into a folder. `push` never sends such an entry and never rejects it. |
+| No note was ever written | The hook is not absent, no note waits, none was rejected, none was sent, no entry is ignored, and the server holds none |
 | The registry names no operator, or the client is retired | The fleet view says so. The server refuses the notes of such a client. |
 | That machine runs an older version | The reported version is older than the version of this program |
 | The server dropped lines | `events_dropped` is above 0 |
@@ -776,7 +778,7 @@ is JSON, with `Content-Type: application/json`, of at most 64 KiB:
     "content": { "installed_hash": "a377aa94", "installed_at_unix": 1790500000, "present": true },
     "link": { "hook": "present", "block": "present", "skills": 12, "agent": "present" },
     "outbox": {
-      "waiting": 0, "rejected": 4, "sent": 0,
+      "waiting": 0, "rejected": 4, "sent": 0, "ignored": 0,
       "last_push_at_unix": null, "last_push_notes": null, "operator": true
     }
   },
@@ -840,7 +842,7 @@ the body up to 4 MiB.
     "version": "0.2.0", "platform": "darwin-arm64",
     "content": { "installed_hash": "a377aa94", "installed_at": "2026-10-01T09:00:00+02:00", "present": true },
     "link": { "hook": "present", "block": "present", "skills": 12, "agent": "present" },
-    "outbox": { "waiting": 0, "rejected": 4, "sent": 0, "last_push_at": null, "last_push_notes": null, "operator": true },
+    "outbox": { "waiting": 0, "rejected": 4, "sent": 0, "ignored": 0, "last_push_at": null, "last_push_notes": null, "operator": true },
     "events_dropped": 0
   },
   "events": [

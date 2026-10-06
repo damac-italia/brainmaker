@@ -655,6 +655,9 @@ pub struct Outbox {
     pub waiting: u64,
     pub rejected: u64,
     pub sent: u64,
+    /// Entries in the outbox that push does not read as a note: a file with
+    /// a name that does not end in `.md`, or a directory.
+    pub ignored: u64,
     /// The end of the last push that sent a note, from `push.json`.
     pub last_push_at_unix: Option<u64>,
     pub last_push_notes: Option<u64>,
@@ -745,6 +748,7 @@ pub fn state(config: &Config) -> State {
             waiting: bounded(counts.waiting),
             rejected: bounded(counts.rejected),
             sent: bounded(outbox::sent_count(config, MAX_COUNT as usize)),
+            ignored: bounded(outbox::ignored_count(config, MAX_COUNT as usize)),
             last_push_at_unix: pushed
                 .map(|push| push.last_push_at_unix)
                 .filter(|at| is_time(*at)),
@@ -1305,6 +1309,7 @@ mod tests {
                 waiting: 0,
                 rejected: 0,
                 sent: 0,
+                ignored: 0,
                 last_push_at_unix: None,
                 last_push_notes: None,
                 operator: false
@@ -1335,6 +1340,12 @@ mod tests {
         )
         .unwrap();
         fs::write(config.operator_file(), "gabriele\n").unwrap();
+        // A note with the wrong ending, and a note in a folder: push reads
+        // neither, and the state counts both.
+        fs::write(config.outbox_dir().join("2026-09-30-g.txt"), NOTE).unwrap();
+        let folder = config.outbox_dir().join("2026-09");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("2026-09-30-h.md"), NOTE).unwrap();
         let claude = dir.join("claude");
         fs::create_dir_all(&claude).unwrap();
         fs::write(
@@ -1365,6 +1376,7 @@ mod tests {
                 waiting: 1,
                 rejected: 2,
                 sent: 3,
+                ignored: 2,
                 last_push_at_unix: Some(1_790_500_000),
                 last_push_notes: Some(2),
                 operator: true
@@ -1680,6 +1692,12 @@ mod tests {
             "---\nkind: parola-segreta\ndomain: damac\n---\nTesto riservato.\n",
         );
         fs::write(config.operator_file(), "gabriele\n").unwrap();
+        // A file that push does not read as a note: only its count may leave.
+        fs::write(
+            config.outbox_dir().join("preventivo-cliente-nascosto.txt"),
+            "Testo riservato.\n",
+        )
+        .unwrap();
         let mut run = Run::new(Command::Sync);
         run.content(&Err(anyhow::anyhow!(
             "cannot read {}/content/latest with the-client-secret",
@@ -1710,6 +1728,8 @@ mod tests {
             "Mario Rossi",
             "gabriele",
             "Testo",
+            "preventivo",
+            "nascosto",
             root.as_str(),
             base.as_str(),
             "127.0.0.1",
@@ -1732,6 +1752,7 @@ mod tests {
             .collect();
         assert_eq!(rules, ["kind", "server"]);
         assert_eq!(json["state"]["outbox"]["rejected"], 2);
+        assert_eq!(json["state"]["outbox"]["ignored"], 1);
         assert_eq!(json["state"]["outbox"]["operator"], true);
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -203,7 +203,7 @@ gabriele  brainmaker-sync-gabriele
   software  0.2.0  darwin-arm64
   content   a377aa94  installed 2026-10-01T09:00:00+02:00  present
   link      hook present  block present  skills 12  agent present
-  outbox    waiting 0  rejected 4  sent 0  last push -  operator named
+  outbox    waiting 0  rejected 4  sent 0  ignored 0  last push -  operator named
   finding   4 note(s) broke a rule on that machine and moved to rejected/, and none was sent. The run log names the rule: frontmatter (1), kind (3).
   log       2026-10-05T10:00:02+02:00  sync  push.rejected  rule kind  count 3
   log       2026-10-05T10:00:02+02:00  sync  push.rejected  rule frontmatter  count 1
@@ -231,6 +231,7 @@ report soon says what the command changed.
 | Whether the `SessionStart` hook and the `CLAUDE.md` block are there, and how many skills are linked | `~/.claude` |
 | Whether the hourly agent has its file | `~/Library/LaunchAgents` |
 | How many notes wait, were rejected, and were sent, and when the last push sent a note | `outbox/`, `push.json` |
+| How many entries in the outbox are not notes: a file with a name that does not end in `.md`, or a folder | `outbox/` |
 | Whether the server named an operator | `operator` |
 | The new lines of the run log: the command, what it did, and a cause, an HTTP status, a rule, a count, a content hash, or a version | `diagnostics.jsonl` |
 

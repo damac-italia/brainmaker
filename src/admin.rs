@@ -985,6 +985,9 @@ pub struct ReportedOutbox {
     pub rejected: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sent: Option<u64>,
+    /// Entries in the outbox that push does not read as a note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_push_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1265,7 +1268,20 @@ fn findings(client: &Client, report: Option<&Report>, events: &[LoggedEvent]) ->
         }
         found.push(text);
     }
-    if waiting == 0 && rejected == 0 && none_arrived && report.link.hook != Some(Presence::Absent) {
+    let ignored = report.outbox.ignored.unwrap_or(0);
+    if ignored > 0 {
+        found.push(format!(
+            "{ignored} entr(ies) in the outbox of that machine are not notes for brainmaker, so \
+             it never sends them and never rejects them. A note is a file with a name that ends \
+             in .md, directly in the outbox and not in a folder."
+        ));
+    }
+    if waiting == 0
+        && rejected == 0
+        && ignored == 0
+        && none_arrived
+        && report.link.hook != Some(Presence::Absent)
+    {
         found.push(
             "No note was ever written on that machine: its outbox holds none, none was \
              rejected, and none was sent."
@@ -1415,10 +1431,11 @@ pub fn diagnosis_lines(diagnosis: &Diagnosis) -> Vec<String> {
                 named(&report.link.agent)
             ));
             lines.push(format!(
-                "  outbox    waiting {}  rejected {}  sent {}  last push {}  operator {}",
+                "  outbox    waiting {}  rejected {}  sent {}  ignored {}  last push {}  operator {}",
                 number(report.outbox.waiting),
                 number(report.outbox.rejected),
                 number(report.outbox.sent),
+                number(report.outbox.ignored),
                 value(&report.outbox.last_push_at),
                 match report.outbox.operator {
                     Some(true) => "named",
@@ -2125,7 +2142,7 @@ mod tests {
             },
             "link": { "hook": "present", "block": "present", "skills": 12, "agent": "present" },
             "outbox": {
-                "waiting": 0, "rejected": 0, "sent": 3,
+                "waiting": 0, "rejected": 0, "sent": 3, "ignored": 0,
                 "last_push_at": "2026-10-04T18:12:40+02:00", "last_push_notes": 1,
                 "operator": true
             },
@@ -2289,6 +2306,37 @@ mod tests {
             &seen(Some(selfupdate::CURRENT_VERSION), 0),
             Some(with_notes(0, 0, 0)),
             vec![logged(1, "sync", "content.up_to_date")],
+        );
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(named[0].contains("No note was ever written"), "{named:?}");
+    }
+
+    #[test]
+    fn the_diagnosis_names_entries_in_the_outbox_that_are_not_notes() {
+        // Nothing waits, nothing was rejected, nothing was sent: but two
+        // entries are there, so "no note was ever written" would be wrong.
+        let mut report = with_notes(0, 0, 0);
+        report["outbox"]["ignored"] = json!(2);
+        let named = found(
+            &seen(Some(selfupdate::CURRENT_VERSION), 0),
+            Some(report),
+            vec![logged(1, "sync", "content.up_to_date")],
+        );
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert!(
+            named[0].starts_with("2 entr(ies) in the outbox of that machine are not notes"),
+            "{named:?}"
+        );
+        assert!(named[0].contains("ends in .md"), "{named:?}");
+
+        // A report from before the count, or a count that the server did not
+        // store, reads as no entry.
+        let mut report = with_notes(0, 0, 0);
+        report["outbox"].as_object_mut().unwrap().remove("ignored");
+        let named = found(
+            &seen(Some(selfupdate::CURRENT_VERSION), 0),
+            Some(report),
+            Vec::new(),
         );
         assert_eq!(named.len(), 1, "{named:?}");
         assert!(named[0].contains("No note was ever written"), "{named:?}");
@@ -2492,8 +2540,8 @@ mod tests {
                 format!("  software  {version}  darwin-arm64"),
                 "  content   a377aa94  installed 2026-10-01T09:00:00+02:00  present".to_string(),
                 "  link      hook absent  block absent  skills 0  agent present".to_string(),
-                "  outbox    waiting 0  rejected 0  sent 0  last push 2026-10-04T18:12:40+02:00  \
-                 operator named"
+                "  outbox    waiting 0  rejected 0  sent 0  ignored 0  last push \
+                 2026-10-04T18:12:40+02:00  operator named"
                     .to_string(),
                 "  finding   The SessionStart hook of brainmaker is not in the Claude settings \
                  of that machine. No session there reads the briefing or learns of the outbox, \

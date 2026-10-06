@@ -178,7 +178,7 @@ Steps:
    [`sync.rs:284`](../src/sync.rs). It acts only when `content/` is missing, `.trash/` is a
    directory, and the install lock is free at once.
 3. [`sync.rs:89`](../src/sync.rs) reads the signed content release, with the three headers that
-   [`outbox.rs:414`](../src/outbox.rs) builds: the platform, the installed hash or `none`, and the
+   [`outbox.rs:452`](../src/outbox.rs) builds: the platform, the installed hash or `none`, and the
    count of notes that wait. `remote::latest_release` checks
    the Ed25519 signature against `signature::CONTENT_KEYS`, and runs `config::validate_hash` on the
    hash from the signed payload, so an out-of-range value fails before it reaches a URL or a path.
@@ -291,34 +291,34 @@ Steps:
 2. [`main.rs:288`](../src/main.rs) stops the steps when this run received no `sync` token. The
    issuer then did not answer, and a further request would only wait.
 3. [`main.rs:291`](../src/main.rs) asks `whoami`.
-   [`outbox.rs:442`](../src/outbox.rs) writes a name
+   [`outbox.rs:480`](../src/outbox.rs) writes a name
    that matches the operator rule to `operator`, and deletes the file on `null`. A failure prints a
    notice and leaves the file.
 4. [`main.rs:298`](../src/main.rs) runs the push.
-   [`outbox.rs:555`](../src/outbox.rs) takes
+   [`outbox.rs:593`](../src/outbox.rs) takes
    `.outbox.lock` without waiting, and a run that finds it held sends nothing.
-5. [`outbox.rs:562`](../src/outbox.rs) checks each `.md` entry through
-   [`outbox.rs:658`](../src/outbox.rs). A symbolic link, and anything that is not a regular file,
-   is refused at [`outbox.rs:666`](../src/outbox.rs). A file that changed in the last 60 seconds
-   waits, at [`outbox.rs:680`](../src/outbox.rs). Then the name rule, the 64 KiB cap, and the
-   frontmatter rules apply, and [`outbox.rs:732`](../src/outbox.rs) refuses a file that is not the
+5. [`outbox.rs:600`](../src/outbox.rs) checks each `.md` entry through
+   [`outbox.rs:696`](../src/outbox.rs). A symbolic link, and anything that is not a regular file,
+   is refused at [`outbox.rs:704`](../src/outbox.rs). A file that changed in the last 60 seconds
+   waits, at [`outbox.rs:718`](../src/outbox.rs). Then the name rule, the 64 KiB cap, and the
+   frontmatter rules apply, and [`outbox.rs:770`](../src/outbox.rs) refuses a file that is not the
    file that was checked. A refused file moves to `rejected/` through
-   [`outbox.rs:798`](../src/outbox.rs), beside its reason. Each refusal also names its rule as one
+   [`outbox.rs:836`](../src/outbox.rs), beside its reason. Each refusal also names its rule as one
    word of [`outbox.rs:82`](../src/outbox.rs), which is all that the run log keeps
    of it.
-6. [`outbox.rs:574`](../src/outbox.rs) returns when no note is ready, before any request.
-7. [`outbox.rs:578`](../src/outbox.rs) asks for an `outbox:write` token. `InvalidScope` stops the
+6. [`outbox.rs:612`](../src/outbox.rs) returns when no note is ready, before any request.
+7. [`outbox.rs:616`](../src/outbox.rs) asks for an `outbox:write` token. `InvalidScope` stops the
    run with a notice, and every note stays.
-8. [`outbox.rs:597`](../src/outbox.rs) orders the notes oldest first, and
-   [`outbox.rs:600`](../src/outbox.rs) sends each one through
+8. [`outbox.rs:635`](../src/outbox.rs) orders the notes oldest first, and
+   [`outbox.rs:638`](../src/outbox.rs) sends each one through
    [`remote.rs:303`](../src/remote.rs).
-9. A `201` or a `200` moves the note to `sent/<YYYY-MM>/` at [`outbox.rs:612`](../src/outbox.rs).
-   The month comes from `received_at`, and [`outbox.rs:760`](../src/outbox.rs) gives `unknown` for
+9. A `201` or a `200` moves the note to `sent/<YYYY-MM>/` at [`outbox.rs:650`](../src/outbox.rs).
+   The month comes from `received_at`, and [`outbox.rs:798`](../src/outbox.rs) gives `unknown` for
    any other shape. A `400` or a `413` moves it to `rejected/` at
-   [`outbox.rs:621`](../src/outbox.rs). Every other answer, and a failure to reach the server,
-   keeps it and stops the run at [`outbox.rs:636`](../src/outbox.rs).
-10. [`outbox.rs:814`](../src/outbox.rs) adds `-2`, `-3`, and so on to a name that is taken.
-11. [`outbox.rs:652`](../src/outbox.rs) writes `push.json` when the run sent a note. The lock is
+   [`outbox.rs:659`](../src/outbox.rs). Every other answer, and a failure to reach the server,
+   keeps it and stops the run at [`outbox.rs:674`](../src/outbox.rs).
+10. [`outbox.rs:852`](../src/outbox.rs) adds `-2`, `-3`, and so on to a name that is taken.
+11. [`outbox.rs:690`](../src/outbox.rs) writes `push.json` when the run sent a note. The lock is
     released when `push` returns.
 
 Under `sync`, each failure of these steps prints one `notice:` line, which `--quiet` hides, and the
@@ -368,13 +368,13 @@ Steps:
    log that is not a regular file, and appends the lines in one write.
    [`diagnostics.rs:538`](../src/diagnostics.rs) cuts a log of more than 256 KiB
    to its newest 128 KiB, at the start of a line.
-3. [`diagnostics.rs:861`](../src/diagnostics.rs) stops
+3. [`diagnostics.rs:865`](../src/diagnostics.rs) stops
    when this run received no `sync` token: the issuer did not answer, so no request is made.
-4. [`diagnostics.rs:865`](../src/diagnostics.rs)
+4. [`diagnostics.rs:869`](../src/diagnostics.rs)
    stops when the last try is younger than 30 minutes. A `link` or an `unlink` that worked cuts
-   that wait to 90 seconds through [`diagnostics.rs:800`](../src/diagnostics.rs),
+   that wait to 90 seconds through [`diagnostics.rs:804`](../src/diagnostics.rs),
    so a `sync` soon after it reports what it changed.
-5. [`diagnostics.rs:868`](../src/diagnostics.rs)
+5. [`diagnostics.rs:872`](../src/diagnostics.rs)
    takes `.diagnostics.lock` without waiting. A run that finds it held sends nothing.
 6. [`diagnostics.rs:567`](../src/diagnostics.rs) reads the
    run log. [`diagnostics.rs:568`](../src/diagnostics.rs)
@@ -385,18 +385,20 @@ Steps:
    of it.
 7. [`diagnostics.rs:601`](../src/diagnostics.rs)
    takes the lines after the last one that the server holds, the oldest first, and 200 at most.
-8. [`diagnostics.rs:707`](../src/diagnostics.rs) reads the
+8. [`diagnostics.rs:710`](../src/diagnostics.rs) reads the
    state from local files. [`link.rs:937`](../src/link.rs)
    reads which pieces of the bridge are in `~/.claude`, and changes nothing there.
-9. [`diagnostics.rs:821`](../src/diagnostics.rs) writes
+   [`outbox.rs:404`](../src/outbox.rs) counts the entries in the outbox that
+   push does not read as a note, such as a file with another ending than `.md`, or a folder.
+9. [`diagnostics.rs:825`](../src/diagnostics.rs) writes
    the report from those values, and takes fewer lines until it fits in 64 KiB.
-10. [`diagnostics.rs:886`](../src/diagnostics.rs)
+10. [`diagnostics.rs:890`](../src/diagnostics.rs)
     sends it through [`remote.rs:354`](../src/remote.rs), with the `sync`
     token of the run and 10 seconds in all.
-11. On a `2xx` answer, [`diagnostics.rs:891`](../src/diagnostics.rs)
+11. On a `2xx` answer, [`diagnostics.rs:895`](../src/diagnostics.rs)
     records the newest line that the server holds. On every other answer, and on no answer, the
     lines stay for the next report.
-    [`diagnostics.rs:894`](../src/diagnostics.rs) writes
+    [`diagnostics.rs:898`](../src/diagnostics.rs) writes
     `diagnostics.json` in both cases, so the next try waits 30 minutes too.
 
 No step here prints a failure or returns one. `sync` prints one line when the server stored the
@@ -669,22 +671,23 @@ Steps of `admin diagnose`:
 1. [`main.rs:225`](../src/main.rs) runs the command with the operator, or with
    the client of `--client`, and with 20 lines of the run log unless `--limit` names another
    number.
-2. [`admin.rs:1050`](../src/admin.rs)
+2. [`admin.rs:1053`](../src/admin.rs)
    reads the fleet view, and keeps the clients of the operator, or the one client. The view gives
    what the server saw of each one: the last sync, the version in its `User-Agent`, and the notes
    that the server holds.
-3. [`admin.rs:1075`](../src/admin.rs)
+3. [`admin.rs:1078`](../src/admin.rs)
    reads the diagnostics of each client. A `404` gets the hint of
-   [`admin.rs:1098`](../src/admin.rs): a
+   [`admin.rs:1101`](../src/admin.rs): a
    server older than this route answers `404` too.
 4. The body parses into types that refuse a field or a word they do not know.
-   [`admin.rs:1110`](../src/admin.rs)
+   [`admin.rs:1113`](../src/admin.rs)
    then checks that the answer is for the client that was asked for, and checks each time, each
    version, and each content hash.
-5. [`admin.rs:1169`](../src/admin.rs)
+5. [`admin.rs:1172`](../src/admin.rs)
    names each cause that the two sources show: a client too old for push, a missing hook, notes
-   that broke a rule, notes that wait, and an outbox that never held a note.
-6. [`admin.rs:1359`](../src/admin.rs)
+   that broke a rule, notes that wait, entries in the outbox that are not notes, and an outbox
+   that never held a note.
+6. [`admin.rs:1375`](../src/admin.rs)
    builds the lines that `main.rs` prints. With `--json`, `main.rs` prints the same values as
    JSON.
 
