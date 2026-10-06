@@ -10,7 +10,7 @@ writes nothing, an endpoint it cannot reach becomes a value it prints rather tha
 ## Settings load
 
 Every command but `uninstall` starts here. `Config::load` runs before the dispatch in
-[`src/main.rs:102`](../src/main.rs).
+[`main.rs:114`](../src/main.rs).
 
 ```mermaid
 sequenceDiagram
@@ -33,8 +33,9 @@ sequenceDiagram
         secretstore-->>config: KEY=VALUE text
     end
     config->>config: apply the environment, then --url
-    config->>url: check_base_url(base), then check_base_url(jwt endpoint)
+    config->>url: check_base_url(base)
     config->>provision: check_credential_set(the merged keys)
+    config->>url: check_base_url(jwt endpoint)
     config-->>main: Config
 ```
 
@@ -79,8 +80,9 @@ carries a key under its old name, such as `SWETSI_API_BASE`.
 
 ## Access token
 
-`remote.rs` and `outbox.rs` call [`auth::bearer`](../src/auth.rs) before each request, with the
-scope that the request needs: `sync` for every read, and `outbox:write` for a note. `diagnostics.rs`
+`remote.rs` calls [`auth::bearer`](../src/auth.rs) before each request, with the scope that the
+request needs: `sync` for every read. `outbox.rs` calls it one time for a push, with
+`outbox:write`, and sends every note of that push with the token that it gets. `diagnostics.rs`
 calls it with `sync` for the diagnostic report, and reads the token that the run already holds.
 The first call
 for a scope fetches, and every later call for it in the same run reads the cache. `link` calls
@@ -328,7 +330,7 @@ exit code stays as the content step decided. `push` alone exits 1 at
 ## Diagnostic report
 
 `sync` runs these steps after the outbox steps. `push`, `self-update`, `link`, and `unlink` run
-step 1 alone: they write their lines, and send nothing.
+steps 1 and 2 alone: they write their lines, and send nothing.
 
 ```mermaid
 sequenceDiagram
@@ -363,7 +365,7 @@ Steps:
    the notes that wait, and one for a stop. A failure enters a line as the word that
    [`cause.rs:91`](../src/cause.rs) reads from the
    error, never as its text.
-2. [`main.rs:318`](../src/main.rs) saves the run.
+2. [`main.rs:319`](../src/main.rs) saves the run.
    [`diagnostics.rs:515`](../src/diagnostics.rs) refuses a
    log that is not a regular file, and appends the lines in one write.
    [`diagnostics.rs:538`](../src/diagnostics.rs) cuts a log of more than 256 KiB
@@ -595,11 +597,11 @@ Steps:
    `agent.log`, `operator`, `push.json`, `diagnostics.jsonl`, and `diagnostics.json` with their
    temporary files, the program copy and every
    `bin/.brainmaker*` file, then the two temporary files and the two marks, in that order.
-   `outbox/` is not in the list, and [`uninstall.rs:248`](../src/uninstall.rs) counts the notes in
-   it that were never sent, and says how many.
+   `outbox/` is not in the list.
 7. [`uninstall.rs:228`](../src/uninstall.rs) removes each path that exists. A symbolic link goes
    without its target. On Windows, a program copy that is running now yields a `notice:` line
-   instead of an error.
+   instead of an error. Then [`uninstall.rs:248`](../src/uninstall.rs) counts the notes in
+   `outbox/` that were never sent, and says how many.
 8. [`uninstall.rs:259`](../src/uninstall.rs) removes `bin/`, `confidential/`, and the root when
    each one is empty, and names what the root still holds otherwise.
 9. [`uninstall.rs:155`](../src/uninstall.rs) prints the path of the program that ran, unless it
@@ -647,7 +649,7 @@ Steps of `admin pull-outbox`:
    `this credential cannot read the outbox` at [`admin.rs:192`](../src/admin.rs).
 5. [`admin.rs:352`](../src/admin.rs) checks the operator, the client ID, the name, `received_at`,
    the kind, the domain, the flags, and the size again, and
-   [`admin.rs:375`](../src/admin.rs) compares the SHA-256 of the text with the one the server
+   [`admin.rs:376`](../src/admin.rs) compares the SHA-256 of the text with the one the server
    stored.
 6. [`admin.rs:382`](../src/admin.rs) takes the date from `received_at`, and
    [`admin.rs:384`](../src/admin.rs) sets `author` and `review_flags` through
@@ -660,7 +662,8 @@ Steps of `admin pull-outbox`:
 9. A note that could not be written stays unacknowledged, and the command exits 1.
 
 `admin status` reads the fleet view through [`admin.rs:594`](../src/admin.rs), which refuses any
-other shape at [`admin.rs:603`](../src/admin.rs), and builds the admin's shape at
+other shape at [`admin.rs:597`](../src/admin.rs) and [`admin.rs:603`](../src/admin.rs), and builds
+the admin's shape at
 [`admin.rs:691`](../src/admin.rs). `admin syncs` resolves an operator to its clients through the
 same view, reads each client's log, and merges the rows newest first at
 [`admin.rs:878`](../src/admin.rs), by the instant that each time names
@@ -675,7 +678,7 @@ Steps of `admin diagnose`:
    reads the fleet view, and keeps the clients of the operator, or the one client. The view gives
    what the server saw of each one: the last sync, the version in its `User-Agent`, and the notes
    that the server holds.
-3. [`admin.rs:1078`](../src/admin.rs)
+3. [`admin.rs:1079`](../src/admin.rs)
    reads the diagnostics of each client. A `404` gets the hint of
    [`admin.rs:1101`](../src/admin.rs): a
    server older than this route answers `404` too.
