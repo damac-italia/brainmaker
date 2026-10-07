@@ -434,6 +434,9 @@ impl Run {
                 .hash(hash)
                 .failure(*failure),
             Ok(sync::Outcome::Busy { hash }) => self.add(Code::ContentBusy).hash(hash),
+            // The run log goes with the removal, so the order leaves no line.
+            // The removal report says what happened.
+            Ok(sync::Outcome::Removal(_)) => return,
             Err(error) => self.add(Code::ContentFailed).failure(cause::of(error)),
         };
     }
@@ -665,17 +668,18 @@ pub struct Outbox {
     pub operator: bool,
 }
 
-/// Where the state looks for what `link` wrote outside the root.
+/// Where the state looks for what `link` wrote outside the root. A removal
+/// order removes what `link` wrote from the same places.
 #[derive(Debug, Clone, Default)]
-struct Places {
+pub struct Places {
     /// The Claude configuration directory, when the home directory is known.
-    claude: Option<PathBuf>,
+    pub claude: Option<PathBuf>,
     /// The location of the hourly agent, on a system that has one.
-    agents: Option<Agents>,
+    pub agents: Option<Agents>,
 }
 
 #[cfg(not(test))]
-fn places() -> Places {
+pub fn places() -> Places {
     Places {
         claude: link::claude_dir().ok(),
         agents: Agents::resolve(None, false).ok().flatten(),
@@ -690,12 +694,13 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn places() -> Places {
+pub fn places() -> Places {
     TEST_PLACES.with(|places| places.borrow().clone())
 }
 
 /// Makes the state of this thread read `claude` as the Claude configuration
-/// directory, and `agents` as the location of the hourly agent.
+/// directory, and `agents` as the location of the hourly agent. A removal
+/// order that this thread obeys acts on the same two places.
 #[cfg(test)]
 pub fn look_in_this_test(claude: &Path, agents: Option<Agents>) {
     TEST_PLACES.with(|places| {

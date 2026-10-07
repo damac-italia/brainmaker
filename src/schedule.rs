@@ -155,6 +155,33 @@ pub fn remove(agents: &Agents) -> Result<bool> {
     Ok(true)
 }
 
+/// Removes the agent from inside a run that the agent itself may have
+/// started. Returns true when the property list was there.
+///
+/// [`remove`] unloads the agent first and deletes the list after it. A
+/// removal order cannot work in that order. On a Mac the hourly agent is the
+/// usual caller of the `sync` that obeys the order, and launchd stops the
+/// processes of a job when it unloads the job. So the list goes first, and no
+/// later login loads the agent again, and the unload comes last. The caller
+/// does everything else before it calls this, because the unload can end the
+/// run.
+pub fn remove_from_within(agents: &Agents) -> Result<bool> {
+    let path = agents.plist();
+    if fs::symlink_metadata(&path).is_err() {
+        return Ok(false);
+    }
+    // Read before the file goes: the unload names the account that owns it.
+    let owner = owner_of(&path);
+    fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+    if let (true, Some(uid)) = (agents.load, owner) {
+        // By label, because the list is gone. A failure changes nothing
+        // here: the list is removed, and the loaded copy ends with the login
+        // session.
+        let _ = bootout_by_label(uid);
+    }
+    Ok(true)
+}
+
 /// The property list for an agent that runs `prefix` hourly and writes to
 /// `log`.
 ///
@@ -431,9 +458,63 @@ fn launchctl(_plist: &Path, _verb: &str) -> Result<()> {
     anyhow::bail!("launchctl exists only on macOS")
 }
 
+/// The account that owns `path`, on a system that has such accounts.
+#[cfg(unix)]
+fn owner_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    fs::metadata(path).ok().map(|meta| meta.uid())
+}
+
+#[cfg(not(unix))]
+fn owner_of(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Runs `launchctl bootout gui/<uid>/<LABEL>`, which unloads the agent by its
+/// label, with no property list to read. Only a location that loads its agent
+/// reaches this, and only macOS has one.
+fn bootout_by_label(uid: u32) -> Result<()> {
+    let output = std::process::Command::new("/bin/launchctl")
+        .arg("bootout")
+        .arg(format!("gui/{uid}/{LABEL}"))
+        .output()
+        .context("cannot run /bin/launchctl")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "launchctl bootout exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_from_within_deletes_the_list_and_says_when_none_was_there() {
+        let base = temp_dir("from-within");
+        // A location that loads nothing, as every test location is: the
+        // unload itself runs on a Mac alone.
+        let agents = Agents::unloaded(&base);
+        assert!(!remove_from_within(&agents).unwrap());
+
+        install(
+            &agents,
+            "\"/x/bin/brainmaker\"",
+            &base,
+            Runs::UpdateAndSync,
+            &|_| {},
+        )
+        .unwrap();
+        assert!(agents.plist().is_file());
+        assert!(remove_from_within(&agents).unwrap());
+        assert!(!agents.plist().exists());
+        fs::remove_dir_all(&base).ok();
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(

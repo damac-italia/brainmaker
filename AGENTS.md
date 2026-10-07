@@ -21,7 +21,9 @@ A plain `cargo test` skips `tools/sign.rs`. The script does not skip it.
 
 ## Files that you must never open, print, or commit
 
-- `signing.key` and `content-signing.key`, in the repository root, are private signing keys.
+- `signing.key`, `content-signing.key`, and `removal-signing.key`, in the repository root, are
+  private signing keys. So is `removal-signing.key` under the root of an install, which
+  `admin retire` signs with.
 - `brainmaker.env`, `.brainmaker.env`, and any `*.env` file hold a client secret.
 
 `.gitignore` excludes all of these files. It excludes `dist/` too.
@@ -43,10 +45,20 @@ A plain `cargo test` skips `tools/sign.rs`. The script does not skip it.
   `Cause` from `src/cause.rs`, and a refused note as a `Rule` from `src/outbox.rs`. A new word
   needs the same word in the server, which stores no word that it does not know.
 - The server never tells the client what to send or what to run. Nothing that a command does may
-  depend on the body of the answer to a diagnostic report.
+  depend on the body of the answer to a diagnostic report, or to a removal report.
+- The removal order is the one thing that a client does on the word of another. It is not the word
+  of the server: `sync` obeys an order only when a key in `REMOVAL_KEYS` signed it and its payload
+  names this client, and `src/removal.rs` is the one place that decides. An order makes the client
+  run `uninstall`, and it can do nothing else. Never add a second order, a field that widens what
+  an order removes, or a way to obey without the signature check. A change to this rule needs the
+  maintainer's word. See "The removal order" in [`docs/SECURITY.md`](docs/SECURITY.md).
+- `removal::Signer` is the one place that reads a private key from outside the sealed store, for
+  `admin retire`. Never print, log, send, or write that key, and never sign anything with it but a
+  removal order and the probe that checks the key.
 - Check a value from the network before it enters a URL, a path, or a header.
-- `PUBLIC_KEYS` and `CONTENT_KEYS` in `src/signature.rs` keep one key per line. No key may be in
-  both lists. The release workflow reads each list with `sed` and `grep`.
+- `PUBLIC_KEYS`, `CONTENT_KEYS`, and `REMOVAL_KEYS` in `src/signature.rs` keep one key per line. No
+  key may be in two lists. The release workflow reads the first two lists with `sed` and `grep`.
+  `REMOVAL_KEYS` may be empty: such a build obeys no removal order.
 - The release profile sets `panic = "abort"`. Code that handles a value from the network must not
   be able to panic.
 - The code has no `#[allow(...)]` attribute. Do not add one.
@@ -84,7 +96,12 @@ The server answers 404 for a route that it does not have, as a server older than
 A test of a new request must also pass against a server with no route for it.
 
 The diagnostic report reads `~/.claude` to say whether `link` connected Claude. In a test it reads
-no directory outside the root, unless the test names one with `diagnostics::look_in_this_test`.
+no directory outside the root, unless the test names one with `diagnostics::look_in_this_test`. A
+removal order removes what `link` wrote from the same directory, so a test that obeys an order
+names that directory first, with the same function.
+
+A test signs a removal order with a key that `Signer::trust_for_removal` makes the client trust.
+`Signer::trust` covers the software manifest and the content release, and no removal order.
 
 ## Documents
 

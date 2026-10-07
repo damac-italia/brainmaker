@@ -25,6 +25,10 @@ writes one line into `~/.brainmaker/diagnostics.jsonl`, and `sync` sends the new
 state of the machine. That report holds words from fixed lists and numbers, and never a credential,
 a path, or the name or the text of a note.
 
+It also removes itself when the administrator orders it, for example when a person leaves the team.
+The order is a document that names one client, signed with a key that this binary trusts for
+nothing else. The server carries the order and cannot write one.
+
 ## Quick start
 
 `brainmaker` needs a provisioning file before it can reach a server. Your administrator issues it.
@@ -70,11 +74,12 @@ gone. Later runs read the sealed copy and need no file.
 | Signed content | Refuses a content release that no key in `CONTENT_KEYS` signed, and checks the archive digest before it extracts |
 | Replay refusal | Refuses a content release whose signed sequence is not higher than the installed one, unless `sync --force` is given |
 | One run at a time | A file lock keeps two installs of the content, or two replacements of the binary, out of one root |
-| Two key lists | Content and software verify against separate lists, so a content signer cannot sign a manifest |
+| Three key lists | Content, software, and removal orders verify against separate lists, so a content signer cannot sign a manifest, and neither of the two can remove a client |
 | Offline tolerance | Keeps the installed content and exits 0 when the server cannot be reached, so a session still starts |
 | Claude bridge | `link` puts the shared skills and the session briefing into `~/.claude`, for every project, and replaces `settings.json` and `CLAUDE.md` through a rename |
 | Hourly refresh | On macOS, `link` installs a LaunchAgent that runs `self-update`, then `sync`, every hour |
 | Clean removal | `uninstall` removes the bridge and everything brainmaker wrote under the root, and nothing else |
+| Removal order | `admin retire <operator>` signs an order for each client of a person who left, and stores it. The next `sync` of each client removes brainmaker from its machine, as `uninstall` does, and reports it. The order says whether the outbox goes too. |
 | Self-update | Verifies the SHA-256 and the exact `--version` line before it swaps the binary, including the copy the hook runs |
 | Strict options | Refuses an option that has no effect with the command, a value option given twice, and a value that starts with a hyphen |
 | Static Linux builds | `x86_64` and `arm64` link against musl, so there is no glibc version floor |
@@ -104,7 +109,7 @@ brainmaker status
 
 `status` prints the root, the content directory, the store path, the settings source, the API base,
 the token URL, the credential lengths, the key class, the machine binding of the store, the number
-of trusted software keys and of trusted content keys, the installed hash, the latest hash, the
+of trusted software keys, of trusted content keys, and of trusted removal keys, the installed hash, the latest hash, the
 platform key, and the published version. It then prints the operator name that the last `sync`
 wrote, the notes that wait and the notes that were rejected, the age of the last push that sent a
 note, and the age of the last diagnostic report that the server stored. It changes nothing.
@@ -215,6 +220,10 @@ client, 20 by default, and `--json` prints everything as JSON. A client older th
 report sends none: the command then says so, with the version that the client named at its last
 sync. The command asks no client for anything. Each client sends its report itself, and the
 command reads what the server stored.
+
+For a retired client with a removal order, a line that starts with `removal` says where the removal
+stands, and the finding below it says what to do. See
+[Remove brainmaker from another machine](#remove-brainmaker-from-another-machine-admin).
 
 ### What the diagnostic report holds
 
@@ -409,6 +418,91 @@ copy from `cargo install` goes with `cargo uninstall brainmaker`. Restart any op
 because it keeps the hook that it loaded at its start. The client credentials stay valid on the
 server until your administrator revokes them.
 
+### Remove brainmaker from another machine (admin)
+
+A person leaves the team, and the content must not stay on their machine. Revoking the client is
+not enough: `sync` then keeps the installed content, and Claude keeps reading it. One command on
+the admin's machine removes it:
+
+```bash
+brainmaker admin retire gabriele
+```
+
+The command shows each client of that person, and asks before it does anything:
+
+```text
+This takes brainmaker off the machine of each client below:
+
+  - brainmaker-sync-gabriele  gabriele  last sync 2026-10-06T12:05:00+02:00  version 0.1.10  darwin-arm64
+
+The server retires each client, and gives it no content from now on. At its next
+sync, each client removes the content, the sealed settings, the program copy, and
+what link wrote into ~/.claude.
+The outbox on that machine stays, with every note in it.
+This has no way back: a client that received an order is never restored, and a
+person who comes back gets a new client.
+
+Retire 1 client(s)? [y/N]
+```
+
+On `y`, it signs one removal order for each client, with the removal key at
+`~/.brainmaker/removal-signing.key`, and stores it on the server with the admin's own credential.
+The server retires each client, and from then on it gives that client no content.
+
+| To | Add |
+|---|---|
+| Take the outbox away too, with every note in it, sent or not | `--remove-outbox` |
+| Retire one client by its ID, registered or not | `--client <CLIENT-ID>` in place of the operator |
+| Sign with a key at another path | `--key <PATH>` |
+| Skip the question, in a script | `--yes` |
+
+Then wait for the removal, and revoke the client at the issuer after it:
+
+```bash
+brainmaker admin diagnose gabriele
+```
+
+```text
+gabriele  brainmaker-sync-gabriele  retired
+  server    last sync 2026-10-06T12:05:00+02:00  version 0.1.10  notes stored 14
+  removal   ordered 2026-10-06T12:00:00+02:00  outbox keep  served 2026-10-06T12:05:00+02:00  reported removed 2026-10-06T12:05:01+02:00  root kept  notes unsent 1
+  finding   The registry marks this client as retired, so the server refuses its notes.
+  finding   brainmaker removed itself from that machine: the client reported it at 2026-10-06T12:05:01+02:00. Its root directory stays, with what brainmaker did not remove: the outbox when the order keeps it, a file that brainmaker did not write, or on Windows the program that ran. 1 note(s) that were never sent stay in its outbox.
+```
+
+Revoke only after `reported removed`. A client that the issuer refuses asks the server for
+nothing, so it never receives the order, and its content stays.
+
+On that machine, the next `sync` receives the order: at the next Claude session, or within the hour
+on a Mac with the hourly agent. It removes what [`uninstall`](#remove-brainmaker-from-this-machine)
+removes, with no question, and prints what it did, even with `--quiet`:
+
+```text
+The administrator of this brainmaker ordered its removal from this machine.
+brainmaker is removed from this machine.
+The directory /Users/you/.brainmaker stays, with what brainmaker did not remove.
+1 note(s) that were never sent stay in /Users/you/.brainmaker/outbox.
+```
+
+What to know before you rely on it:
+
+- A client obeys only an order that a key in `REMOVAL_KEYS` of its own build signed, and only an
+  order that names that client. A build with no removal key obeys none, and `admin retire` then
+  stops before it stores anything. See
+  [The removal key is a third key](#the-removal-key-is-a-third-key).
+- Check the list before you answer `y`. A client that the server retired with an order is never
+  restored, and its machine removes brainmaker within the hour on a Mac.
+- A client older than the first version with removal orders does not know them. It gets no new
+  content, keeps what it has, and obeys after it updates. On Windows and Linux nothing updates it
+  but a person who runs `self-update`.
+- The order has no end date. It removes every later install that carries the same credential. So a
+  client ID that received an order is spent: the server never restores it, and a person who comes
+  back gets a new client.
+- The order removes what brainmaker wrote, where brainmaker wrote it. A copy of the content that a
+  person made elsewhere stays, and so does the program file that they downloaded.
+- A machine that never starts a Claude session, and has no hourly agent, never asks the server and
+  never receives the order.
+
 ## Configuration
 
 ### Provisioning file
@@ -537,7 +631,7 @@ for nothing more, and a client whose issuer grants `sync` alone can still report
 | `--force` | With `sync`, download and extract even when the content is up to date, and install a release whose sequence is not higher. With `self-update`, reinstall the same version. |
 | `--check` | With `self-update`, report the newer version and install nothing |
 | `--no-update-check` | With `sync`, skip the software version check |
-| `-y`, `--yes` | With `uninstall`, remove without asking first |
+| `-y`, `--yes` | With `uninstall` and `admin retire`, do it without asking first |
 | `--config <PATH>` | Import the provisioning file at `PATH` |
 | `--keep-config` | Do not remove the provisioning file after the import |
 | `--dir <PATH>` | Use `PATH` as the root instead of `~/.brainmaker` |
@@ -546,7 +640,9 @@ for nothing more, and a client whose issuer grants `sync` alone can still report
 | `--agent-dir <PATH>` | With `link`, `unlink`, and `uninstall`, write the LaunchAgent to `PATH` and do not load it |
 | `--json` | With `admin status`, `admin syncs`, and `admin diagnose`, print JSON instead of lines |
 | `--limit <N>` | With `admin syncs`, print at most `N` rows, from 1 to 1000. Default: 50. With `admin diagnose`, print at most `N` lines of the run log of each client. Default: 20. |
-| `--client <CLIENT-ID>` | With `admin syncs` and `admin diagnose`, read one client instead of an operator |
+| `--client <CLIENT-ID>` | With `admin syncs`, `admin diagnose`, and `admin retire`, name one client instead of an operator |
+| `--remove-outbox` | With `admin retire`, the removal order also removes the outbox on that machine, with every note in it |
+| `--key <PATH>` | With `admin retire`, sign with the removal key at `PATH` instead of `~/.brainmaker/removal-signing.key` |
 | `-q`, `--quiet` | Print errors only |
 | `-h`, `--help` | Print the help text |
 | `-V`, `--version` | Print the version |
@@ -633,9 +729,36 @@ cargo run --features sign --bin brainmaker-sign -- \
 `sign-content` writes the time of signing as the sequence. An optional fifth argument names another
 whole number. Every client refuses a release whose sequence is not higher than the one it holds.
 
-`brainmaker-sign verify` accepts either shape and names which one it read, so the same command
-checks a manifest and a content release. The release also publishes
+`brainmaker-sign verify` accepts each shape and names which one it read, so the same command
+checks a manifest, a content release, and a removal order. The release also publishes
 `brainmaker-sign-<version>-linux-x86_64`, so a deploy host can sign without a Rust toolchain.
+
+#### The removal key is a third key
+
+A removal order verifies against `REMOVAL_KEYS`, a third list. Generate the pair the same way, and
+put the public half in that list:
+
+```bash
+cargo run --features sign --bin brainmaker-sign -- keygen removal-signing.key
+```
+
+Then move `removal-signing.key` to `~/.brainmaker/removal-signing.key` on the machine of the admin
+who takes people off the team. `brainmaker admin retire` signs with it there. No command writes
+that file, and `uninstall` leaves it. Keep it off every other machine, and out of git.
+
+A build with an empty list obeys no removal order, and `brainmaker status` then reports
+`0 trusted removal key(s)`. That is a usable build: leave the list empty when you want no removal
+from a distance. The release workflow does not ask for this key.
+
+The key gets a list of its own because it is a capability of its own. It can make one client run
+`uninstall`, and it can install nothing. Whoever holds the content key cannot remove a client, and
+whoever holds the removal key cannot publish content or software. A unit test fails the build if a
+key appears in two lists.
+
+A client obeys an order only from a key in its own build. So add the key, release, and wait until
+the fleet runs that release, before the first order. To rotate the key, put the new public key
+first in the list and keep the old one, as for the other two lists. Rotate it when the admin who
+holds it leaves: the file stays on that person's machine.
 
 ### Repository settings the workflow needs
 

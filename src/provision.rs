@@ -64,7 +64,7 @@ pub const KEY_OUTBOX_PATH: &str = "BRAINMAKER_OUTBOX_PATH";
 pub const KEY_WHOAMI_PATH: &str = "BRAINMAKER_WHOAMI_PATH";
 
 /// Route that receives the diagnostic report of this client, relative to
-/// [`KEY_API_BASE`].
+/// [`KEY_API_BASE`]. The removal report is `/removal` under it.
 pub const KEY_DIAGNOSTICS_PATH: &str = "BRAINMAKER_DIAGNOSTICS_PATH";
 
 /// Route of the notes that wait for the admin, relative to [`KEY_API_BASE`].
@@ -73,8 +73,9 @@ pub const KEY_DIAGNOSTICS_PATH: &str = "BRAINMAKER_DIAGNOSTICS_PATH";
 pub const KEY_ADMIN_OUTBOX_PATH: &str = "BRAINMAKER_ADMIN_OUTBOX_PATH";
 
 /// Route of the fleet view, relative to [`KEY_API_BASE`]. The sync log of one
-/// client is `/<client_id>/syncs` under it, and its diagnostics are
-/// `/<client_id>/diagnostics`. An admin copy alone reads it.
+/// client is `/<client_id>/syncs` under it, its diagnostics are
+/// `/<client_id>/diagnostics`, and its removal is `/<client_id>/removal`. An
+/// admin copy alone reads it.
 pub const KEY_ADMIN_CLIENTS_PATH: &str = "BRAINMAKER_ADMIN_CLIENTS_PATH";
 
 /// Keys that an earlier version read, each with the key that replaces it.

@@ -79,8 +79,11 @@ KEY-FILE:
     A path holding the PKCS#8 key as hexadecimal. Pass - to read the key from
     the environment variable BRAINMAKER_SIGNING_KEY instead.
 
-The printed public key goes into PUBLIC_KEYS in src/signature.rs. Keep the
-private key off every machine that serves the API.
+The printed public key goes into one list in src/signature.rs: PUBLIC_KEYS
+for the key that signs the software manifest, CONTENT_KEYS for the key that
+signs a content release, and REMOVAL_KEYS for the key that brainmaker admin
+retire signs with. Use one key for one list. Keep each private key off every
+machine that serves the API.
 ";
 
 /// The body that `GET {base}/software/brainmaker` returns.
@@ -153,7 +156,9 @@ fn keygen(key_file: &Path) -> Result<()> {
 
     println!("Wrote the private key to {}.", key_file.display());
     println!();
-    println!("Add this line to PUBLIC_KEYS in src/signature.rs:");
+    println!("Add this line to the one list that the key is for, in src/signature.rs:");
+    println!("PUBLIC_KEYS for software, CONTENT_KEYS for content, or REMOVAL_KEYS for");
+    println!("the key that brainmaker admin retire signs with.");
     println!("    \"{}\",", hex(pair.public_key().as_ref()));
     println!();
     println!(

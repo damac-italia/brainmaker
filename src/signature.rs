@@ -24,6 +24,13 @@
 //! The key is public, so it lives in this repository, unlike the configuration
 //! key. A build with no key in [`PUBLIC_KEYS`] refuses every manifest, which
 //! fails closed.
+//!
+//! # Three documents, three lists
+//!
+//! The same check reads two more documents, each against a list of its own:
+//! a content release against [`CONTENT_KEYS`], and a removal order against
+//! [`REMOVAL_KEYS`]. A key signs one kind of document and no other, so each
+//! holder has one capability.
 
 use anyhow::{Context, Result, bail};
 use ring::signature::{self, UnparsedPublicKey};
@@ -77,6 +84,28 @@ pub const CONTENT_KEYS: &[&str] = &[
     "382972259033ae361706b404e7c42bad2a017b5a4f63bfc2aeec9374e5213c05",
 ];
 
+/// Keys that may sign a removal order, newest first.
+///
+/// A third list, for the reason that the first two are separate. A removal
+/// order makes one client remove brainmaker from its machine, and the admin
+/// signs one each time that a person leaves. The software key signs once for
+/// each release, and the content key lives on the deploy host. With a list of
+/// its own, the admin holds a key that can remove a client and can do nothing
+/// else, and neither of the other two keys can remove one.
+///
+/// An empty list means this build obeys no removal order. That is a usable
+/// build: a team that wants no removal from a distance leaves the list empty.
+/// Generate a pair with:
+///
+/// ```text
+/// cargo run --features sign --bin brainmaker-sign -- keygen removal-signing.key
+/// ```
+// Kept one key per line, as the two lists above are.
+#[rustfmt::skip]
+pub const REMOVAL_KEYS: &[&str] = &[
+    "1ed291cf73008a7f176a70ebbb0ef6111c96368e42957987b2a0d19a29172a1a",
+];
+
 /// Number of software signing keys this binary trusts. `status` prints it.
 pub fn key_count() -> usize {
     PUBLIC_KEYS.len()
@@ -85,6 +114,11 @@ pub fn key_count() -> usize {
 /// Number of content signing keys this binary trusts. `status` prints it.
 pub fn content_key_count() -> usize {
     CONTENT_KEYS.len()
+}
+
+/// Number of removal signing keys this binary trusts. `status` prints it.
+pub fn removal_key_count() -> usize {
+    REMOVAL_KEYS.len()
 }
 
 #[cfg(test)]
@@ -96,12 +130,25 @@ thread_local! {
     /// exists in no other build.
     static TEST_KEYS: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Keys that a test trusts for a removal order, in place of
+    /// [`REMOVAL_KEYS`]. The slot is separate, so a test can show that a key
+    /// for content or for software signs no removal order.
+    static TEST_REMOVAL_KEYS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Makes this thread trust `keys` for both documents.
+/// Makes this thread trust `keys` for the software manifest and for the
+/// content release.
 #[cfg(test)]
 pub fn trust_in_this_test(keys: &[String]) {
     TEST_KEYS.with(|slot| *slot.borrow_mut() = Some(keys.to_vec()));
+}
+
+/// Makes this thread trust `keys` for a removal order.
+#[cfg(test)]
+pub fn trust_for_removal_in_this_test(keys: &[String]) {
+    TEST_REMOVAL_KEYS.with(|slot| *slot.borrow_mut() = Some(keys.to_vec()));
 }
 
 /// The keys for one check: the list `compiled`, or a test's own keys.
@@ -127,6 +174,22 @@ pub fn verify_content(payload: &[u8], signature: &str) -> Result<()> {
     verify_with(&listed, payload, signature).context("the content release")
 }
 
+/// The removal keys for one check: [`REMOVAL_KEYS`], or a test's own keys.
+fn trusted_for_removal() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(keys) = TEST_REMOVAL_KEYS.with(|slot| slot.borrow().clone()) {
+        return keys;
+    }
+    REMOVAL_KEYS.iter().map(|key| key.to_string()).collect()
+}
+
+/// Checks `signature` against `payload`, using the removal keys.
+pub fn verify_removal(payload: &[u8], signature: &str) -> Result<()> {
+    let keys = trusted_for_removal();
+    let listed: Vec<&str> = keys.iter().map(String::as_str).collect();
+    verify_with(&listed, payload, signature).context("the removal order")
+}
+
 /// Checks `signature` against `payload`, using `keys`.
 ///
 /// The function returns `Ok` as soon as one key accepts the signature. Every
@@ -135,8 +198,8 @@ fn verify_with(keys: &[&str], payload: &[u8], signature: &str) -> Result<()> {
     if keys.is_empty() {
         return Err(untrusted(
             "this build trusts no signing key for this document, so it cannot check it and \
-             will install nothing. Add the public key to PUBLIC_KEYS or CONTENT_KEYS in \
-             src/signature.rs and build again.",
+             will not act on it. Add the public key to PUBLIC_KEYS, CONTENT_KEYS, or \
+             REMOVAL_KEYS in src/signature.rs and build again.",
         ));
     }
 
@@ -305,16 +368,51 @@ mod tests {
     }
 
     #[test]
-    fn the_two_key_lists_share_no_key() {
-        // A key in both lists would let whoever signs content sign a software
-        // manifest, and publishing content would become the power to replace
-        // every binary on every machine.
-        for key in CONTENT_KEYS {
-            assert!(
-                !PUBLIC_KEYS.contains(key),
-                "{key} signs both content and software"
-            );
+    fn the_key_lists_share_no_key() {
+        // A key in two lists would join two capabilities. Whoever signs
+        // content could sign a software manifest, and replace every binary on
+        // every machine. Whoever signs a removal order could publish content.
+        let lists = [
+            ("software", PUBLIC_KEYS),
+            ("content", CONTENT_KEYS),
+            ("removal", REMOVAL_KEYS),
+        ];
+        for (index, (name, list)) in lists.iter().enumerate() {
+            for (other_name, other) in &lists[index + 1..] {
+                for key in *list {
+                    assert!(
+                        !other.contains(key),
+                        "{key} signs both {name} and {other_name}"
+                    );
+                }
+            }
         }
+    }
+
+    #[test]
+    fn removal_verification_uses_the_removal_list() {
+        let pair = key_pair();
+        let public = hex(pair.public_key().as_ref());
+        let payload = br#"{"order":"remove"}"#;
+        let signature = hex(pair.sign(payload).as_ref());
+
+        // A key that this thread trusts for content and for software signs no
+        // removal order.
+        trust_in_this_test(std::slice::from_ref(&public));
+        verify(payload, &signature).unwrap();
+        verify_content(payload, &signature).unwrap();
+        trust_for_removal_in_this_test(&[]);
+        let error = format!("{:#}", verify_removal(payload, &signature).unwrap_err());
+        assert!(error.contains("the removal order"), "got {error}");
+        assert!(error.contains("trusts no signing key"), "got {error}");
+
+        // And a key for removal orders signs neither of the other documents.
+        let other = hex(key_pair().public_key().as_ref());
+        trust_in_this_test(std::slice::from_ref(&other));
+        trust_for_removal_in_this_test(std::slice::from_ref(&public));
+        verify_removal(payload, &signature).unwrap();
+        assert!(verify(payload, &signature).is_err());
+        assert!(verify_content(payload, &signature).is_err());
     }
 
     #[test]

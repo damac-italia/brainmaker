@@ -31,6 +31,7 @@ mod lock;
 mod outbox;
 mod provision;
 mod remote;
+mod removal;
 mod schedule;
 mod secretstore;
 mod selfupdate;
@@ -160,6 +161,7 @@ fn run(args: &Args) -> Result<()> {
         Command::AdminStatus => admin_status(&config, args),
         Command::AdminSyncs => admin_syncs(&config, args),
         Command::AdminDiagnose => admin_diagnose(&config, args),
+        Command::AdminRetire => admin_retire(&config, args, &log),
     }
 }
 
@@ -245,15 +247,86 @@ fn admin_diagnose(config: &Config, args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// `admin retire <OPERATOR>` and `admin retire --client <CLIENT-ID>`: signs
+/// one removal order for each client, and stores it on the server.
+///
+/// The question prints past `--quiet`, as the one of `uninstall` does. With
+/// no terminal to ask on, only `--yes` lets the command run.
+fn admin_retire(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> {
+    let selector = match (&args.client, &args.target) {
+        (Some(client), _) => admin::Selector::Client(client.clone()),
+        (None, Some(operator)) => admin::Selector::Operator(operator.clone()),
+        (None, None) => bail!("admin retire needs an operator, or --client <CLIENT-ID>"),
+    };
+    let plan = admin::retire_plan(config, &selector)?;
+    for (client_id, ordered_at) in &plan.ordered {
+        log(&format!(
+            "{client_id} already holds a removal order, stored at {ordered_at}."
+        ));
+    }
+    if plan.targets.is_empty() {
+        log("Nothing to store. Read where each removal stands with admin diagnose.");
+        return Ok(());
+    }
+
+    // Before the question: a key that cannot sign must not cost an answer.
+    let key = args
+        .key
+        .clone()
+        .unwrap_or_else(|| config.removal_key_file());
+    let signer = removal::Signer::load(&key)?;
+    let outbox = match args.remove_outbox {
+        true => removal::Outbox::Remove,
+        false => removal::Outbox::Keep,
+    };
+
+    if !args.yes {
+        let stdin = std::io::stdin();
+        if !stdin.is_terminal() {
+            bail!(
+                "admin retire asks before it stores a removal order, and stdin is not a \
+                 terminal; pass --yes to store without asking"
+            );
+        }
+        print!("{}", admin::retire_question(&plan, outbox));
+        std::io::stdout()
+            .flush()
+            .context("cannot print the question")?;
+        let mut answer = String::new();
+        stdin
+            .read_line(&mut answer)
+            .context("cannot read the answer")?;
+        if !uninstall::is_yes(&answer) {
+            log("Nothing was stored.");
+            return Ok(());
+        }
+    }
+
+    admin::retire(config, &signer, &plan.targets, outbox, log)?;
+    log(
+        "Each client removes brainmaker at its next sync. Read where each removal stands with admin diagnose.",
+    );
+    log(
+        "Revoke a client at the issuer only after it reported the removal: a client that the issuer refuses never receives the order.",
+    );
+    Ok(())
+}
+
 /// `sync`: the content step, then the outbox steps, then the diagnostic
 /// report, then the software check.
 ///
 /// The content result waits until the outbox steps and the report ran,
 /// because a failed content step does not stop them. It is returned after
 /// them.
+///
+/// A removal order in place of a release ends the run there: brainmaker
+/// removes itself, and no later step has anything left to work on.
 fn sync_command(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> {
     let mut run = diagnostics::Run::new(diagnostics::Command::Sync);
     let result = sync::sync(config, args.force, log);
+    if let Ok(sync::Outcome::Removal(order)) = &result {
+        return remove_on_order(config, order, log);
+    }
     if let Ok(outcome) = &result {
         report(config, outcome, args.quiet);
     }
@@ -263,6 +336,46 @@ fn sync_command(config: &Config, args: &Args, log: &dyn Fn(&str)) -> Result<()> 
     result?;
     if !args.no_update_check {
         report_software_check(config, args.quiet);
+    }
+    Ok(())
+}
+
+/// Obeys a removal order: removes brainmaker from this machine, and tells the
+/// server.
+///
+/// The lines that say so print past `--quiet`. The hook and the agent run
+/// `sync --quiet`, and the person at the machine must be able to learn why the
+/// program is gone. `log` takes the line for each path, as `uninstall` prints
+/// it.
+fn remove_on_order(config: &Config, order: &removal::Order, log: &dyn Fn(&str)) -> Result<()> {
+    println!("The administrator of this brainmaker ordered its removal from this machine.");
+    match removal::obey(config, order, log)? {
+        removal::Done::Waiting => println!(
+            "Another brainmaker run is installing content, so nothing was removed. The next \
+             sync removes brainmaker."
+        ),
+        removal::Done::Removed {
+            root_removed,
+            unsent,
+        } => {
+            println!("brainmaker is removed from this machine.");
+            if !root_removed {
+                println!(
+                    "The directory {} stays, with what brainmaker did not remove.",
+                    config.root().display()
+                );
+            }
+            match (order.outbox, unsent) {
+                (_, 0) => {}
+                (removal::Outbox::Keep, unsent) => println!(
+                    "{unsent} note(s) that were never sent stay in {}.",
+                    config.outbox_dir().display()
+                ),
+                (removal::Outbox::Remove, unsent) => {
+                    println!("{unsent} note(s) that were never sent were removed with the outbox.");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -430,9 +543,11 @@ fn status(config: &Config) -> Result<()> {
     // "content" already names the content directory above, while any longer
     // label would not fit the column every other value starts at.
     println!(
-        "signing   {} trusted software key(s), {} trusted content key(s)",
+        "signing   {} trusted software key(s), {} trusted content key(s), {} trusted removal \
+         key(s)",
         signature::key_count(),
-        signature::content_key_count()
+        signature::content_key_count(),
+        signature::removal_key_count()
     );
     println!(
         "installed {}",
@@ -449,7 +564,15 @@ fn status(config: &Config) -> Result<()> {
     // `status` changes nothing, so an unreachable server is a value here, not
     // an exit. The software rows below take the same view.
     match remote::latest_release(config, &outbox::report_headers(config)) {
-        Ok(release) => {
+        // `status` changes nothing, so it only says that the order waits.
+        Ok(remote::Latest::Removal(_)) => {
+            println!("latest    <none>");
+            println!(
+                "state     the administrator ordered the removal of brainmaker; the next sync \
+                 removes it from this machine"
+            );
+        }
+        Ok(remote::Latest::Release(release)) => {
             let latest = release.hash;
             println!("latest    {latest}");
             println!(
@@ -585,7 +708,14 @@ fn uninstall(args: &Args, log: &dyn Fn(&str)) -> Result<()> {
         }
     }
 
-    uninstall::uninstall(&layout, &claude, agents.as_ref(), log)?;
+    // The outbox stays: only a removal order can take it.
+    uninstall::uninstall(
+        &layout,
+        &claude,
+        agents.as_ref(),
+        uninstall::Notes::Keep,
+        log,
+    )?;
     Ok(())
 }
 
@@ -730,6 +860,8 @@ fn report(config: &Config, outcome: &sync::Outcome, quiet: bool) {
                 config.content_dir().display()
             );
         }
+        // `sync_command` obeys the order before it reports an outcome.
+        sync::Outcome::Removal(_) => {}
     }
 }
 
@@ -1095,6 +1227,156 @@ mod tests {
         assert!(format!("{error:#}").contains("404"), "got {error:#}");
         assert!(!config.operator_file().exists(), "null deletes the file");
         assert_eq!(outbox::counts(&config).waiting, 0, "the note was sent");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The body of a `410 Gone` answer with a removal order for the client
+    /// of the test credentials, signed by `signer`.
+    fn gone_with_order(signer: &Signer, outbox: &str) -> String {
+        let order = serde_json::json!({
+            "order": "remove",
+            "client_id": "the-client-id",
+            "outbox": outbox,
+            "issued_at": 1_791_300_000u64,
+        });
+        format!(
+            r#"{{"error":"this client is retired","removal":{}}}"#,
+            signer.envelope(&order.to_string())
+        )
+    }
+
+    /// The routes of a server that offers one release to the first content
+    /// check, and a removal order to every later one.
+    fn release_then_order(signer: &Signer, order_signer: &Signer, outbox: &str) -> Vec<Route> {
+        let mut routes = outbox_routes();
+        for route in release(signer) {
+            if route.path == "/content/latest" {
+                routes.push(route.then(410, gone_with_order(order_signer, outbox)));
+            } else {
+                routes.push(route);
+            }
+        }
+        routes.push(Route::post("/diagnostics", r#"{"stored":0,"dropped":0}"#));
+        routes.push(Route::post("/diagnostics/removal", "{}"));
+        routes
+    }
+
+    #[test]
+    fn sync_obeys_a_removal_order_and_tells_the_server() {
+        let signer = Signer::new();
+        signer.trust();
+        let admin = Signer::new();
+        admin.trust_for_removal();
+        let server = Server::start(release_then_order(&signer, &admin, "keep"));
+        let dir = temp_dir("main-sync-removal");
+        let root = dir.join("root");
+        let claude = dir.join("claude");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(
+            claude.join("CLAUDE.md"),
+            "# Mine\n\n<!-- brainmaker-link: start -->\nShared.\n<!-- brainmaker-link: end -->\n",
+        )
+        .unwrap();
+        diagnostics::look_in_this_test(&claude, None);
+        let config = Config::for_test_with_credentials(&root, &server.base(), &server.base());
+
+        // The first sync installs the content, as on any other day.
+        sync_command(&config, &args(), &quiet).unwrap();
+        assert!(config.content_dir().join("CLAUDE.md").is_file());
+        fs::write(config.outbox_dir().join("2026-10-06-b.md"), NOTE).unwrap();
+        let before = paths(&server).len();
+
+        // The second one receives the order.
+        sync_command(&config, &args(), &quiet).unwrap();
+
+        assert!(!config.content_dir().exists(), "the content is gone");
+        assert!(!config.state_file().exists());
+        assert!(!config.run_log_file().exists());
+        assert!(!config.operator_file().exists());
+        assert_eq!(
+            fs::read_to_string(claude.join("CLAUDE.md")).unwrap(),
+            "# Mine\n",
+            "the block that link wrote is gone, and the rest stays"
+        );
+        // The order says keep, so the note that was never sent stays.
+        assert!(config.outbox_dir().join("2026-10-06-b.md").is_file());
+
+        // After the order, the run asks nothing but the removal report: no
+        // whoami, no note, and no diagnostic report.
+        let after: Vec<String> = paths(&server).split_off(before);
+        assert_eq!(after, ["/content/latest", "/diagnostics/removal"]);
+        let report = server.received().pop().unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&report.body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "schema": 1,
+                "outcome": "removed",
+                "root": "kept",
+                "notes_unsent": 1,
+            })
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_removal_order_can_take_the_outbox_and_the_root() {
+        let signer = Signer::new();
+        signer.trust();
+        let admin = Signer::new();
+        admin.trust_for_removal();
+        let server = Server::start(release_then_order(&signer, &admin, "remove"));
+        let dir = temp_dir("main-sync-removal-outbox");
+        let root = dir.join("root");
+        diagnostics::look_in_this_test(&dir.join("claude"), None);
+        let config = Config::for_test_with_credentials(&root, &server.base(), &server.base());
+        settled_note(&config, "2026-09-30-a.md");
+
+        // The first sync installs the content and sends the note.
+        sync_command(&config, &args(), &quiet).unwrap();
+        assert_eq!(outbox::sent_count(&config, 10), 1);
+
+        sync_command(&config, &args(), &quiet).unwrap();
+
+        assert!(!root.exists(), "nothing of brainmaker is left");
+        let report = server.received().pop().unwrap();
+        assert_eq!(report.path, "/diagnostics/removal");
+        let body: serde_json::Value = serde_json::from_slice(&report.body).unwrap();
+        assert_eq!(body["root"], "removed");
+        assert_eq!(body["notes_unsent"], 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_keeps_everything_when_it_does_not_trust_the_order() {
+        // The content key signs the order. It is not a removal key, so a
+        // server that holds the content key removes no client.
+        let signer = Signer::new();
+        signer.trust();
+        signature::trust_for_removal_in_this_test(&[]);
+        let server = Server::start(release_then_order(&signer, &signer, "remove"));
+        let dir = temp_dir("main-sync-removal-untrusted");
+        let root = dir.join("root");
+        diagnostics::look_in_this_test(&dir.join("claude"), None);
+        let config = Config::for_test_with_credentials(&root, &server.base(), &server.base());
+
+        sync_command(&config, &args(), &quiet).unwrap();
+        // The check fails, the content stays, and the run exits 0, as it
+        // does when the server cannot be reached.
+        sync_command(&config, &args(), &quiet).unwrap();
+
+        assert!(config.content_dir().join("CLAUDE.md").is_file());
+        assert!(config.state_file().is_file());
+        assert!(!paths(&server).iter().any(|p| p == "/diagnostics/removal"));
+        // The run log names the status and the cause, for `admin diagnose`.
+        let last = fs::read_to_string(config.run_log_file())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .rfind(|line| line["code"] == "content.unreachable")
+            .expect("the failed check left a line");
+        assert_eq!(last["cause"], "signature");
+        assert_eq!(last["status"], 410);
         fs::remove_dir_all(&dir).unwrap();
     }
 

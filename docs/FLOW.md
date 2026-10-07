@@ -1,16 +1,18 @@
 # Flow
 
-Nine runtime paths matter: loading the settings, getting an access token, the `sync` command, the
+Ten runtime paths matter: loading the settings, getting an access token, the `sync` command, the
 push of the outbox, the diagnostic report, the `self-update` command, `link` with its hourly agent,
-the `uninstall` command, and the admin commands. `status` reuses
+the `uninstall` command, the removal order, and the admin commands. `status` reuses
 the first two paths and then reads both remote endpoints without writing anything. Because it
 writes nothing, an endpoint it cannot reach becomes a value it prints rather than a reason to exit:
-[`main.rs:465`](../src/main.rs) prints `latest    <unknown>` and `state     cannot check: <reason>`.
+[`main.rs:588`](../src/main.rs) prints `latest    <unknown>` and `state     cannot check: <reason>`.
+A removal order is a value too: [`main.rs:568`](../src/main.rs) prints that the order waits, and
+`status` removes nothing.
 
 ## Settings load
 
 Every command but `uninstall` starts here. `Config::load` runs before the dispatch in
-[`main.rs:114`](../src/main.rs).
+[`main.rs:115`](../src/main.rs).
 
 ```mermaid
 sequenceDiagram
@@ -41,41 +43,41 @@ sequenceDiagram
 
 Steps:
 
-1. [`config.rs:449`](../src/config.rs) resolves the root through
-   [`config.rs:296`](../src/config.rs): `--dir` made absolute, else `~/.brainmaker`.
-2. [`provision.rs:347`](../src/provision.rs) searches up to four locations in order and returns the
+1. [`config.rs:464`](../src/config.rs) resolves the root through
+   [`config.rs:304`](../src/config.rs): `--dir` made absolute, else `~/.brainmaker`.
+2. [`provision.rs:348`](../src/provision.rs) searches up to four locations in order and returns the
    first hit. A `--config` or `$BRAINMAKER_CONFIG` path that is not a file fails the run. The fourth
    location, the working directory, is searched only while `config.enc` does not yet exist.
-3. On a hit, [`config.rs:456`](../src/config.rs) reads the file, and
-   [`config.rs:457`](../src/config.rs) checks the credential values and the ten routes through
-   [`config.rs:271`](../src/config.rs). A file that fails here changes nothing: the previous store
+3. On a hit, [`config.rs:471`](../src/config.rs) reads the file, and
+   [`config.rs:472`](../src/config.rs) checks the credential values and the ten routes through
+   [`config.rs:279`](../src/config.rs). A file that fails here changes nothing: the previous store
    and the file itself stay in place.
-4. [`config.rs:459`](../src/config.rs) seals the parsed settings, and
-   [`config.rs:460`](../src/config.rs) writes `confidential/config.enc` with mode `0600` inside a
+4. [`config.rs:474`](../src/config.rs) seals the parsed settings, and
+   [`config.rs:475`](../src/config.rs) writes `confidential/config.enc` with mode `0600` inside a
    `0700` directory.
-5. [`config.rs:466`](../src/config.rs) logs a warning when the system gives no machine identifier,
+5. [`config.rs:481`](../src/config.rs) logs a warning when the system gives no machine identifier,
    because the store is then bound to the home directory path or to nothing.
-6. [`config.rs:478`](../src/config.rs) removes the plain file. A failed removal logs a warning and
+6. [`config.rs:493`](../src/config.rs) removes the plain file. A failed removal logs a warning and
    the run continues, because the settings are already stored.
-7. With no hit and an existing store, [`config.rs:507`](../src/config.rs) decrypts it. A store from
+7. With no hit and an existing store, [`config.rs:522`](../src/config.rs) decrypts it. A store from
    another machine or another build fails here with a message that tells you to reimport.
-8. [`config.rs:521`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
+8. [`config.rs:536`](../src/config.rs) lets `BRAINMAKER_API_BASE`, `SWETSI_JWT_ENDPOINT`,
    `SWETSI_CLIENT_ID`, and `SWETSI_CLIENT_SECRET` override the stored values, and
-   [`config.rs:532`](../src/config.rs) lets `--url` override the base URL again.
-9. [`config.rs:536`](../src/config.rs) and [`config.rs:548`](../src/config.rs) fail when no source
+   [`config.rs:547`](../src/config.rs) lets `--url` override the base URL again.
+9. [`config.rs:551`](../src/config.rs) and [`config.rs:563`](../src/config.rs) fail when no source
    supplied a base URL.
-10. [`config.rs:556`](../src/config.rs) fails when the base URL is not `https://`, unless its host
+10. [`config.rs:571`](../src/config.rs) fails when the base URL is not `https://`, unless its host
     is this machine.
-11. [`config.rs:560`](../src/config.rs) checks the merged credential set. Three keys, or none of
+11. [`config.rs:575`](../src/config.rs) checks the merged credential set. Three keys, or none of
     them, passes. Any other count fails and names the missing keys. A configuration that still
     carries `SWETSI_TOKEN` and none of the three fails here.
-12. [`config.rs:572`](../src/config.rs) builds the `Credentials`. It applies the TLS rule to
+12. [`config.rs:587`](../src/config.rs) builds the `Credentials`. It applies the TLS rule to
     `SWETSI_JWT_ENDPOINT`, and it refuses a credential value that cannot go into a header.
-13. [`config.rs:579`](../src/config.rs) reads the ten routes, and the environment overrides one
+13. [`config.rs:594`](../src/config.rs) reads the ten routes, and the environment overrides one
     route at a time. Each absent key takes its default. A route that holds `://`, a `..` segment,
     or a space fails here, because it would leave the base URL.
 
-[`config.rs:516`](../src/config.rs) runs before steps 8 to 13 and fails when a configuration still
+[`config.rs:531`](../src/config.rs) runs before steps 8 to 13 and fails when a configuration still
 carries a key under its old name, such as `SWETSI_API_BASE`.
 
 ## Access token
@@ -151,8 +153,10 @@ sequenceDiagram
     sync->>remote: latest_release(config, report headers)
     remote->>API: GET {base}/{latest hash route}
     API-->>remote: {"payload": "...", "signature": "..."}
-    remote-->>sync: ContentRelease
-    alt the request failed, content/ exists and not --force
+    remote-->>sync: Latest: a release, or a removal order
+    alt the answer was 410 with a removal order that this client trusts
+        sync-->>main: Removal
+    else the request failed, content/ exists and not --force
         sync-->>main: Unreachable
     else hash matches state.json and content/ exists and not --force
         sync-->>main: UpToDate
@@ -175,57 +179,62 @@ sequenceDiagram
 
 Steps:
 
-1. [`sync.rs:77`](../src/sync.rs) creates the root directory.
-2. [`sync.rs:80`](../src/sync.rs) restores content that a stopped run left in `.trash/`, through
-   [`sync.rs:284`](../src/sync.rs). It acts only when `content/` is missing, `.trash/` is a
+1. [`sync.rs:87`](../src/sync.rs) creates the root directory.
+2. [`sync.rs:90`](../src/sync.rs) restores content that a stopped run left in `.trash/`, through
+   [`sync.rs:295`](../src/sync.rs). It acts only when `content/` is missing, `.trash/` is a
    directory, and the install lock is free at once.
-3. [`sync.rs:89`](../src/sync.rs) reads the signed content release, with the three headers that
+3. [`sync.rs:99`](../src/sync.rs) reads the signed content release, with the three headers that
    [`outbox.rs:452`](../src/outbox.rs) builds: the platform, the installed hash or `none`, and the
    count of notes that wait. `remote::latest_release` checks
    the Ed25519 signature against `signature::CONTENT_KEYS`, and runs `config::validate_hash` on the
    hash from the signed payload, so an out-of-range value fails before it reaches a URL or a path.
-4. [`sync.rs:92`](../src/sync.rs) turns a failed request into `Unreachable` when `state.json` names
+4. [`sync.rs:103`](../src/sync.rs) turns a failed request into `Unreachable` when `state.json` names
    a hash, `content/` is a directory, and `--force` was not given. With nothing installed, or with
    `--force`, the error is returned instead.
-5. [`sync.rs:104`](../src/sync.rs) returns `UpToDate` when the local hash matches, `content/` is a
+   A `410` answer with a removal order that this client trusts is no failure:
+   [`sync.rs:101`](../src/sync.rs) returns `Removal`, whatever is installed and whatever `--force`
+   says, and `sync` removes nothing itself. [Removal order](#removal-order) describes the rest. An
+   order that this client does not trust is a failed request like any other.
+5. [`sync.rs:115`](../src/sync.rs) returns `UpToDate` when the local hash matches, `content/` is a
    directory, and `--force` was not given. No archive is downloaded.
-6. [`sync.rs:114`](../src/sync.rs) applies the order rule of [`sync.rs:161`](../src/sync.rs) when
+6. [`sync.rs:125`](../src/sync.rs) applies the order rule of [`sync.rs:172`](../src/sync.rs) when
    the offered hash differs from the installed hash and `--force` was not given. The run fails when
    the installed release has a sequence and the offered one is not higher, or has none.
-7. [`sync.rs:119`](../src/sync.rs) takes the exclusive lock on `.lock`, and waits up to 30 seconds
-   for another run to release it. When the lock is still held, [`sync.rs:121`](../src/sync.rs)
+7. [`sync.rs:130`](../src/sync.rs) takes the exclusive lock on `.lock`, and waits up to 30 seconds
+   for another run to release it. When the lock is still held, [`sync.rs:132`](../src/sync.rs)
    returns `Busy` if content is installed and `--force` was not given, and an error otherwise.
-8. [`sync.rs:133`](../src/sync.rs) reads `state.json` again, because the run that held the lock may
-   have installed a release. [`sync.rs:134`](../src/sync.rs) returns `UpToDate` when it installed
-   this one, and [`sync.rs:137`](../src/sync.rs) applies the order rule again to the state as it
+8. [`sync.rs:144`](../src/sync.rs) reads `state.json` again, because the run that held the lock may
+   have installed a release. [`sync.rs:145`](../src/sync.rs) returns `UpToDate` when it installed
+   this one, and [`sync.rs:148`](../src/sync.rs) applies the order rule again to the state as it
    stands now.
-9. [`sync.rs:142`](../src/sync.rs) picks the sequence to record. A reinstall of the installed hash
+9. [`sync.rs:153`](../src/sync.rs) picks the sequence to record. A reinstall of the installed hash
    keeps the higher of the installed and the offered sequence.
-10. [`sync.rs:202`](../src/sync.rs) clears `.staging`, `.trash`, and `.download.zip` left by a run
+10. [`sync.rs:213`](../src/sync.rs) clears `.staging`, `.trash`, and `.download.zip` left by a run
     that failed between steps.
-11. [`sync.rs:207`](../src/sync.rs) streams the archive to `.download.zip`, stopping at 512 MiB.
-12. [`sync.rs:213`](../src/sync.rs) compares the byte count, and
-    [`sync.rs:220`](../src/sync.rs) the SHA-256, against the signed release, before the extractor
+11. [`sync.rs:218`](../src/sync.rs) streams the archive to `.download.zip`, stopping at 512 MiB.
+12. [`sync.rs:224`](../src/sync.rs) compares the byte count, and
+    [`sync.rs:231`](../src/sync.rs) the SHA-256, against the signed release, before the extractor
     opens the file.
-13. [`sync.rs:223`](../src/sync.rs) extracts to `.staging`. Rejected entries are counted, not fatal;
+13. [`sync.rs:234`](../src/sync.rs) extracts to `.staging`. Rejected entries are counted, not fatal;
     the log line reads `Skipped N unsafe archive entries.`
-14. [`sync.rs:235`](../src/sync.rs) swaps the directories.
-15. [`sync.rs:240`](../src/sync.rs) removes the three temporary paths, on success and on failure
+14. [`sync.rs:246`](../src/sync.rs) swaps the directories.
+15. [`sync.rs:251`](../src/sync.rs) removes the three temporary paths, on success and on failure
     alike.
-16. [`sync.rs:246`](../src/sync.rs) writes `state.json` with the hash and the sequence, only after
+16. [`sync.rs:257`](../src/sync.rs) writes `state.json` with the hash and the sequence, only after
     the swap succeeded. The lock is released when `sync` returns.
-17. [`main.rs:256`](../src/main.rs) keeps the result of the content step, and
-    [`main.rs:261`](../src/main.rs) runs the outbox
+17. [`main.rs:326`](../src/main.rs) keeps the result of the content step. When it is a removal
+    order, [`main.rs:327`](../src/main.rs) obeys it and ends the run there. Otherwise
+    [`main.rs:334`](../src/main.rs) runs the outbox
     steps, which [Push](#push) describes.
-    [`main.rs:262`](../src/main.rs) then writes the lines of this
+    [`main.rs:335`](../src/main.rs) then writes the lines of this
     run to the run log, and sends the diagnostic report when one is due, which
     [Diagnostic report](#diagnostic-report) describes. Only then does
-    [`main.rs:263`](../src/main.rs) return a content error.
-18. [`main.rs:264`](../src/main.rs) runs the software check unless `--no-update-check` was given.
+    [`main.rs:336`](../src/main.rs) return a content error.
+18. [`main.rs:337`](../src/main.rs) runs the software check unless `--no-update-check` was given.
 
 ### The swap and its rollback
 
-[`sync.rs:257`](../src/sync.rs):
+[`sync.rs:268`](../src/sync.rs):
 
 1. Rename `content/` to `.trash/`, when `content/` exists.
 2. Rename `.staging/` to `content/`.
@@ -241,6 +250,8 @@ A run that is killed between steps 1 and 2 leaves no `content/`. Step 2 of the n
 | The server cannot be reached, and content is installed | Two `notice:` lines go to stderr and the exit code stays 0 |
 | The server cannot be reached, and no content is installed | The run fails; nothing on disk changed |
 | The content release fails the `CONTENT_KEYS` signature check | The run fails; nothing on disk changed |
+| The server answers `410` with a removal order that this client does not trust, and content is installed | Two `notice:` lines go to stderr and the exit code stays 0. The run log holds the status `410` and the cause. |
+| The server answers `410` with no removal order | The same as a server that cannot be reached |
 | The response is not a signed envelope | The run fails; nothing on disk changed |
 | The hash is not 8 ASCII alphanumeric characters | The run fails before any URL is built |
 | The offered sequence is not higher than the installed one | The run fails; nothing on disk changed. `--force` installs it. |
@@ -287,16 +298,16 @@ sequenceDiagram
 
 Steps:
 
-1. [`main.rs:285`](../src/main.rs) creates `outbox/` with mode `0700` through
+1. [`main.rs:398`](../src/main.rs) creates `outbox/` with mode `0700` through
    [`outbox.rs:331`](../src/outbox.rs), because a Mac that linked before the outbox existed never
    runs `link` again.
-2. [`main.rs:288`](../src/main.rs) stops the steps when this run received no `sync` token. The
+2. [`main.rs:401`](../src/main.rs) stops the steps when this run received no `sync` token. The
    issuer then did not answer, and a further request would only wait.
-3. [`main.rs:291`](../src/main.rs) asks `whoami`.
+3. [`main.rs:404`](../src/main.rs) asks `whoami`.
    [`outbox.rs:480`](../src/outbox.rs) writes a name
    that matches the operator rule to `operator`, and deletes the file on `null`. A failure prints a
    notice and leaves the file.
-4. [`main.rs:298`](../src/main.rs) runs the push.
+4. [`main.rs:411`](../src/main.rs) runs the push.
    [`outbox.rs:593`](../src/outbox.rs) takes
    `.outbox.lock` without waiting, and a run that finds it held sends nothing.
 5. [`outbox.rs:600`](../src/outbox.rs) checks each `.md` entry through
@@ -313,7 +324,7 @@ Steps:
    run with a notice, and every note stays.
 8. [`outbox.rs:635`](../src/outbox.rs) orders the notes oldest first, and
    [`outbox.rs:638`](../src/outbox.rs) sends each one through
-   [`remote.rs:303`](../src/remote.rs).
+   [`remote.rs:366`](../src/remote.rs).
 9. A `201` or a `200` moves the note to `sent/<YYYY-MM>/` at [`outbox.rs:650`](../src/outbox.rs).
    The month comes from `received_at`, and [`outbox.rs:798`](../src/outbox.rs) gives `unknown` for
    any other shape. A `400` or a `413` moves it to `rejected/` at
@@ -325,7 +336,7 @@ Steps:
 
 Under `sync`, each failure of these steps prints one `notice:` line, which `--quiet` hides, and the
 exit code stays as the content step decided. `push` alone exits 1 at
-[`main.rs:384`](../src/main.rs) when a note had to stay.
+[`main.rs:497`](../src/main.rs) when a note had to stay.
 
 ## Diagnostic report
 
@@ -360,47 +371,47 @@ Steps:
 1. Each step of a command gives its result to a `Run`.
    [`diagnostics.rs:428`](../src/diagnostics.rs)
    turns the content step into one line, and
-   [`diagnostics.rs:453`](../src/diagnostics.rs)
+   [`diagnostics.rs:456`](../src/diagnostics.rs)
    turns the push into one line for the notes sent, one for each rule that a note broke, one for
    the notes that wait, and one for a stop. A failure enters a line as the word that
    [`cause.rs:91`](../src/cause.rs) reads from the
    error, never as its text.
-2. [`main.rs:319`](../src/main.rs) saves the run.
-   [`diagnostics.rs:515`](../src/diagnostics.rs) refuses a
+2. [`main.rs:432`](../src/main.rs) saves the run.
+   [`diagnostics.rs:518`](../src/diagnostics.rs) refuses a
    log that is not a regular file, and appends the lines in one write.
-   [`diagnostics.rs:538`](../src/diagnostics.rs) cuts a log of more than 256 KiB
+   [`diagnostics.rs:541`](../src/diagnostics.rs) cuts a log of more than 256 KiB
    to its newest 128 KiB, at the start of a line.
-3. [`diagnostics.rs:865`](../src/diagnostics.rs) stops
+3. [`diagnostics.rs:870`](../src/diagnostics.rs) stops
    when this run received no `sync` token: the issuer did not answer, so no request is made.
-4. [`diagnostics.rs:869`](../src/diagnostics.rs)
+4. [`diagnostics.rs:874`](../src/diagnostics.rs)
    stops when the last try is younger than 30 minutes. A `link` or an `unlink` that worked cuts
-   that wait to 90 seconds through [`diagnostics.rs:804`](../src/diagnostics.rs),
+   that wait to 90 seconds through [`diagnostics.rs:809`](../src/diagnostics.rs),
    so a `sync` soon after it reports what it changed.
-5. [`diagnostics.rs:872`](../src/diagnostics.rs)
+5. [`diagnostics.rs:877`](../src/diagnostics.rs)
    takes `.diagnostics.lock` without waiting. A run that finds it held sends nothing.
-6. [`diagnostics.rs:567`](../src/diagnostics.rs) reads the
-   run log. [`diagnostics.rs:568`](../src/diagnostics.rs)
+6. [`diagnostics.rs:570`](../src/diagnostics.rs) reads the
+   run log. [`diagnostics.rs:571`](../src/diagnostics.rs)
    refuses a symbolic link and anything that is not a regular file.
-   [`diagnostics.rs:591`](../src/diagnostics.rs)
+   [`diagnostics.rs:594`](../src/diagnostics.rs)
    keeps a line only when it parses as an event, and
    [`diagnostics.rs:337`](../src/diagnostics.rs) checks every value
    of it.
-7. [`diagnostics.rs:601`](../src/diagnostics.rs)
+7. [`diagnostics.rs:604`](../src/diagnostics.rs)
    takes the lines after the last one that the server holds, the oldest first, and 200 at most.
-8. [`diagnostics.rs:710`](../src/diagnostics.rs) reads the
+8. [`diagnostics.rs:715`](../src/diagnostics.rs) reads the
    state from local files. [`link.rs:937`](../src/link.rs)
    reads which pieces of the bridge are in `~/.claude`, and changes nothing there.
    [`outbox.rs:404`](../src/outbox.rs) counts the entries in the outbox that
    push does not read as a note, such as a file with another ending than `.md`, or a folder.
-9. [`diagnostics.rs:825`](../src/diagnostics.rs) writes
+9. [`diagnostics.rs:830`](../src/diagnostics.rs) writes
    the report from those values, and takes fewer lines until it fits in 64 KiB.
-10. [`diagnostics.rs:890`](../src/diagnostics.rs)
-    sends it through [`remote.rs:354`](../src/remote.rs), with the `sync`
+10. [`diagnostics.rs:895`](../src/diagnostics.rs)
+    sends it through [`remote.rs:417`](../src/remote.rs), with the `sync`
     token of the run and 10 seconds in all.
-11. On a `2xx` answer, [`diagnostics.rs:895`](../src/diagnostics.rs)
+11. On a `2xx` answer, [`diagnostics.rs:900`](../src/diagnostics.rs)
     records the newest line that the server holds. On every other answer, and on no answer, the
     lines stay for the next report.
-    [`diagnostics.rs:898`](../src/diagnostics.rs) writes
+    [`diagnostics.rs:903`](../src/diagnostics.rs) writes
     `diagnostics.json` in both cases, so the next try waits 30 minutes too.
 
 No step here prints a failure or returns one. `sync` prints one line when the server stored the
@@ -513,7 +524,7 @@ sequenceDiagram
 
 Steps:
 
-1. [`main.rs:123`](../src/main.rs) resolves the agent location through
+1. [`main.rs:124`](../src/main.rs) resolves the agent location through
    [`schedule.rs:63`](../src/schedule.rs). `--agent-dir` names a directory that is never loaded.
    Without it, [`schedule.rs:67`](../src/schedule.rs) returns no agent on a system other than
    macOS, or when `--claude-dir` was given.
@@ -550,9 +561,9 @@ Steps:
     [`schedule.rs:133`](../src/schedule.rs) loads the new one. A load failure prints a `notice:`
     line, and `link` still exits 0.
 11. launchd then runs `/bin/sh -c` with the script that
-    [`schedule.rs:166`](../src/schedule.rs) renders: `self-update --quiet`, then
+    [`schedule.rs:193`](../src/schedule.rs) renders: `self-update --quiet`, then
     `sync --quiet --no-update-check`, joined by `;`, with the output in `<root>/agent.log`. The
-    admin's agent runs `self-update --quiet` alone ([`schedule.rs:171`](../src/schedule.rs)).
+    admin's agent runs `self-update --quiet` alone ([`schedule.rs:198`](../src/schedule.rs)).
 
 `unlink` runs the same resolve step, then `link::remove_bridge`, which unloads and removes the
 agent before it removes the skill links, the hook entries, and the block. It removes each hook
@@ -567,7 +578,7 @@ sequenceDiagram
     participant link
     participant disk as root directory
     main->>main: ask the question, unless --yes
-    main->>uninstall: uninstall(layout, claude, agents, log)
+    main->>uninstall: uninstall(layout, claude, agents, Keep, log)
     alt the root exists and holds neither mark
         uninstall-->>main: Report, unrecognised
     else
@@ -581,36 +592,183 @@ sequenceDiagram
 
 Steps:
 
-1. [`main.rs:104`](../src/main.rs) sends `uninstall` down its own path before `Config::load`, so no
+1. [`main.rs:105`](../src/main.rs) sends `uninstall` down its own path before `Config::load`, so no
    setting is read and no provisioning file is imported.
-2. [`main.rs:563`](../src/main.rs) fails when stdin is not a terminal and `--yes` was not given.
+2. [`main.rs:686`](../src/main.rs) fails when stdin is not a terminal and `--yes` was not given.
    Otherwise the question prints past `--quiet`, and any answer but `y` or `yes` exits 0 with
    `Nothing was removed.`
-3. [`uninstall.rs:127`](../src/uninstall.rs) stops the run with nothing changed when the root
+3. [`uninstall.rs:146`](../src/uninstall.rs) stops the run with nothing changed when the root
    exists and holds neither a parsable `state.json` nor a sealed `confidential/config.enc`.
-4. [`uninstall.rs:139`](../src/uninstall.rs) resolves the running program before any file goes,
+4. [`uninstall.rs:158`](../src/uninstall.rs) resolves the running program before any file goes,
    so it can later say whether that program was the copy under the root.
-5. [`uninstall.rs:144`](../src/uninstall.rs) removes the bridge through `link::remove_bridge`, the
+5. [`uninstall.rs:163`](../src/uninstall.rs) removes the bridge through `link::remove_bridge`, the
    code that `unlink` runs. The LaunchAgent goes first, before the program copy it runs.
-6. [`uninstall.rs:200`](../src/uninstall.rs) lists `content/`, `.staging/`, `.trash/`,
+6. [`uninstall.rs:225`](../src/uninstall.rs) lists `content/`, `.staging/`, `.trash/`,
    `.download.zip`, `.lock`, `.update.lock`, `.outbox.lock`, `.admin.lock`, `.diagnostics.lock`,
    `agent.log`, `operator`, `push.json`, `diagnostics.jsonl`, and `diagnostics.json` with their
    temporary files, the program copy and every
    `bin/.brainmaker*` file, then the two temporary files and the two marks, in that order.
-   `outbox/` is not in the list.
-7. [`uninstall.rs:228`](../src/uninstall.rs) removes each path that exists. A symbolic link goes
+   `outbox/` is not in the list. Before the list, [`uninstall.rs:222`](../src/uninstall.rs) counts
+   the notes in `outbox/` that were never sent. Only a removal order adds `outbox/` to the list,
+   at [`uninstall.rs:245`](../src/uninstall.rs).
+7. [`uninstall.rs:256`](../src/uninstall.rs) removes each path that exists. A symbolic link goes
    without its target. On Windows, a program copy that is running now yields a `notice:` line
-   instead of an error. Then [`uninstall.rs:248`](../src/uninstall.rs) counts the notes in
-   `outbox/` that were never sent, and says how many.
-8. [`uninstall.rs:259`](../src/uninstall.rs) removes `bin/`, `confidential/`, and the root when
+   instead of an error. A path that another run removed first is no error
+   ([`uninstall.rs:367`](../src/uninstall.rs)). Then [`uninstall.rs:275`](../src/uninstall.rs) says
+   how many notes were never sent, and whether they stay.
+8. [`uninstall.rs:293`](../src/uninstall.rs) removes `bin/`, `confidential/`, and the root when
    each one is empty, and names what the root still holds otherwise.
-9. [`uninstall.rs:155`](../src/uninstall.rs) prints the path of the program that ran, unless it
-   was the copy under the root, and [`uninstall.rs:161`](../src/uninstall.rs) asks you to restart
+9. [`uninstall.rs:174`](../src/uninstall.rs) prints the path of the program that ran, unless it
+   was the copy under the root, and [`uninstall.rs:180`](../src/uninstall.rs) asks you to restart
    any open Claude session when the hook was removed.
 
 A removal that fails part-way returns the error, and the run exits 1. The marks go last, so the
 next run still recognises the root and removes the rest. `uninstall` takes no lock, so do not run
 it while a `sync` or a `self-update` runs.
+
+## Removal order
+
+The administrator signs a removal order for one client and stores it on the server, with
+`admin retire`. The next `sync` of that client receives it in place of a release.
+
+### The admin retires a person
+
+```mermaid
+sequenceDiagram
+    participant main
+    participant admin
+    participant removal
+    participant API
+    main->>admin: retire_plan(config, selector)
+    admin->>API: GET {base}/{admin clients route}
+    admin->>API: GET {base}/{admin clients route}/<client_id>/removal, for each retired client
+    admin-->>main: the clients that get an order, and the ones that hold one
+    main->>removal: Signer::load(key file)
+    removal->>removal: sign a probe, check it against REMOVAL_KEYS
+    main->>main: ask the question, unless --yes
+    main->>admin: retire(config, signer, targets, outbox, log)
+    loop each client
+        admin->>removal: order(client ID, outbox)
+        admin->>API: PUT {base}/{admin clients route}/<client_id>/removal
+        API-->>admin: the removal, as the server stored it
+    end
+```
+
+Steps:
+
+1. [`main.rs:255`](../src/main.rs) takes the operator, or the client ID of `--client`, and
+   [`main.rs:261`](../src/main.rs) asks for the plan. [`admin.rs:1139`](../src/admin.rs) reads the
+   fleet view through [`admin.rs:1257`](../src/admin.rs), which fails when it names no client for
+   the selector.
+2. For a retired client alone, [`admin.rs:1145`](../src/admin.rs) reads the removal that the server
+   holds. A client that holds an order gets no second one, and `main.rs` says so. With no client
+   left, the run prints `Nothing to store.` and exits 0.
+3. [`main.rs:277`](../src/main.rs) loads the removal key, before the question, from `--key` or from
+   `removal-signing.key` under the root. [`removal.rs:212`](../src/removal.rs) reads the file as a
+   PKCS#8 Ed25519 key in hexadecimal, and [`removal.rs:233`](../src/removal.rs) stops the run when
+   `REMOVAL_KEYS` of this build does not hold the key.
+4. [`main.rs:291`](../src/main.rs) prints the question that [`admin.rs:1168`](../src/admin.rs)
+   builds: each client with its last sync, its version, and its platform, and what goes. With no
+   terminal on stdin and no `--yes`, the run fails before it. Any answer but `y` or `yes` prints
+   `Nothing was stored.` and exits 0.
+5. [`main.rs:305`](../src/main.rs) runs [`admin.rs:1216`](../src/admin.rs). For each client,
+   [`removal.rs:247`](../src/removal.rs) signs an order with the time now, and
+   [`admin.rs:1229`](../src/admin.rs) sends it with the `outbox:read` token, through
+   [`remote.rs:209`](../src/remote.rs).
+6. [`admin.rs:1232`](../src/admin.rs) parses the answer as the removal of that client, with the
+   checks that `admin diagnose` applies, and fails when it holds no order. The run stops at the
+   first client that the server refuses. The orders before it are stored, and the next run finds
+   them in step 2.
+
+### The client obeys
+
+```mermaid
+sequenceDiagram
+    participant main
+    participant sync
+    participant remote
+    participant removal
+    participant API
+    participant uninstall
+    main->>sync: sync(config, force, log)
+    sync->>remote: latest_release(config, report headers)
+    remote->>API: GET {base}/{latest hash route}
+    API-->>remote: 410, {"error": "...", "removal": {"payload": "...", "signature": "..."}}
+    remote->>removal: read(config, envelope)
+    alt the signature, the shape, or the client ID fails
+        removal-->>remote: error, with the status 410 and a cause
+        remote-->>sync: error
+        sync-->>main: Unreachable, or the error
+    else
+        removal-->>remote: Order
+        remote-->>sync: Latest::Removal
+        sync-->>main: Removal
+        main->>removal: obey(config, order, log)
+        removal->>removal: wait for the install lock, then release it
+        removal->>uninstall: uninstall(layout, claude, no agent, Keep or Remove, log)
+        removal->>API: POST {base}/{diagnostics route}/removal
+        removal->>removal: on a Mac, delete the list of the hourly agent, then unload the agent
+        removal-->>main: Removed
+    end
+```
+
+Steps:
+
+1. [`remote.rs:117`](../src/remote.rs) takes a `410` answer to the content check apart from every
+   other status, and reads its body once. [`remote.rs:126`](../src/remote.rs) looks for a
+   `removal` object in it. With none, the answer is an error like any other status.
+2. [`removal.rs:159`](../src/removal.rs) checks the signature over the payload bytes against
+   `signature::REMOVAL_KEYS`, before anything parses the payload. A failure carries the cause
+   `signature` and the status `410`.
+3. [`removal.rs:162`](../src/removal.rs) parses the payload into a type that refuses a field it
+   does not know. [`removal.rs:164`](../src/removal.rs) refuses any order but `remove`, and
+   [`removal.rs:177`](../src/removal.rs) compares the signed client ID with the identifier of this
+   client. Each of these failures carries the cause `other` and the status `410`.
+4. An order that fails a check is a failed content check. Steps 4 to 18 of [Sync](#sync) then run
+   as for a server that cannot be reached, and the run log gets the line `content.unreachable`
+   with the status and the cause.
+5. [`sync.rs:101`](../src/sync.rs) returns the order that passed, and
+   [`main.rs:327`](../src/main.rs) hands it to [`main.rs:350`](../src/main.rs). No outbox step and
+   no diagnostic report runs after it. [`main.rs:351`](../src/main.rs) prints that the
+   administrator ordered the removal, past `--quiet`.
+6. [`removal.rs:329`](../src/removal.rs) takes the Claude directory and the agent location: the
+   default ones, as `uninstall` takes them with no `--claude-dir`.
+7. [`removal.rs:341`](../src/removal.rs) waits up to 30 seconds for the install lock, so that a run
+   that installs content ends first, and releases it at once, because `.lock` is one of the files
+   that go. When the lock stays held, the run removes nothing and returns `Waiting`. The hook and
+   the agent are still there, so the next `sync` obeys.
+8. [`removal.rs:352`](../src/removal.rs) runs the steps of [Uninstall](#uninstall) from step 3, with
+   no question, and with no agent location: the hourly agent stays for step 11. The order says
+   whether `outbox/` joins the list of step 6.
+9. [`removal.rs:372`](../src/removal.rs) sends the removal report through
+   [`removal.rs:443`](../src/removal.rs): the outcome, whether the root stays, and the count of
+   notes that were never sent. It goes only when the run received a `sync` token, with that token,
+   to [`remote.rs:427`](../src/remote.rs). Nothing reads the answer.
+10. [`removal.rs:374`](../src/removal.rs) returns an error when the removal stopped part-way, after
+    the report said `failed`. The hourly agent of a Mac is then still there, and its next run
+    tries again.
+11. Last of all, [`removal.rs:388`](../src/removal.rs) removes the hourly agent of a Mac through
+    [`schedule.rs:168`](../src/schedule.rs). The property list goes first
+    ([`schedule.rs:175`](../src/schedule.rs)), so no later login loads the agent again, and then
+    the agent is unloaded by its label ([`schedule.rs:180`](../src/schedule.rs)). The order is the
+    reverse of `unlink`, and it comes after the report, for one reason: the hourly agent is the
+    usual caller of this `sync`, and launchd stops the processes of a job when it unloads the
+    job. Nothing is left to do when that happens.
+12. [`main.rs:361`](../src/main.rs) prints that brainmaker is removed, and what stays. A run that
+    its own agent started can end in step 11, before these lines.
+
+Failure paths:
+
+| Failure | Result |
+|---|---|
+| No removal key signed the order, or the build holds no removal key | The content stays, and the exit code stays 0. The run log names the cause `signature`. |
+| The order names another client, or holds a field or an order that this build does not know | The content stays, and the exit code stays 0. The run log names the cause `other`. |
+| Another run holds the install lock for 30 seconds | Nothing is removed, and the exit code is 0. The next `sync` obeys. |
+| The root carries no mark of brainmaker | Nothing is removed, the report says `failed`, and the run exits 1 |
+| A path cannot be removed | The run stops there, the report says `failed`, and the run exits 1. The hook can be gone by then. On a Mac the hourly agent stays, and its next run tries again while the program copy is there. Elsewhere nothing runs `sync` again. |
+| The property list of the hourly agent cannot be removed | A `notice:` line. The removal is done and reported, and the agent then fails each hour on a program that is gone. |
+| The removal report cannot be sent | Nothing changes: the removal is done, and the exit code is 0 |
+| The home directory is unknown | Nothing is removed, and the run exits 1 |
 
 ## Admin commands
 
@@ -640,57 +798,61 @@ sequenceDiagram
 
 Steps of `admin pull-outbox`:
 
-1. [`main.rs:174`](../src/main.rs) runs the command with the directory that the parser took.
-2. [`admin.rs:254`](../src/admin.rs) refuses a directory that does not exist, before any request,
+1. [`main.rs:176`](../src/main.rs) runs the command with the directory that the parser took.
+2. [`admin.rs:255`](../src/admin.rs) refuses a directory that does not exist, before any request,
    so a wrong working directory writes nothing.
-3. [`admin.rs:261`](../src/admin.rs) takes `.admin.lock` without waiting, and then removes the temporary
+3. [`admin.rs:262`](../src/admin.rs) takes `.admin.lock` without waiting, and then removes the temporary
    files that a stopped run left in the directory.
-4. [`admin.rs:275`](../src/admin.rs) reads one page of 100 notes. `InvalidScope` becomes
-   `this credential cannot read the outbox` at [`admin.rs:192`](../src/admin.rs).
-5. [`admin.rs:352`](../src/admin.rs) checks the operator, the client ID, the name, `received_at`,
+4. [`admin.rs:276`](../src/admin.rs) reads one page of 100 notes. `InvalidScope` becomes
+   `this credential cannot read the outbox` at [`admin.rs:193`](../src/admin.rs).
+5. [`admin.rs:353`](../src/admin.rs) checks the operator, the client ID, the name, `received_at`,
    the kind, the domain, the flags, and the size again, and
-   [`admin.rs:376`](../src/admin.rs) compares the SHA-256 of the text with the one the server
+   [`admin.rs:377`](../src/admin.rs) compares the SHA-256 of the text with the one the server
    stored.
-6. [`admin.rs:382`](../src/admin.rs) takes the date from `received_at`, and
-   [`admin.rs:384`](../src/admin.rs) sets `author` and `review_flags` through
-   [`admin.rs:395`](../src/admin.rs).
-7. [`admin.rs:489`](../src/admin.rs) writes a flushed temporary file and hard-links it at
-   [`admin.rs:517`](../src/admin.rs). A name that holds the same bytes counts as written, and a
+6. [`admin.rs:383`](../src/admin.rs) takes the date from `received_at`, and
+   [`admin.rs:385`](../src/admin.rs) sets `author` and `review_flags` through
+   [`admin.rs:396`](../src/admin.rs).
+7. [`admin.rs:490`](../src/admin.rs) writes a flushed temporary file and hard-links it at
+   [`admin.rs:518`](../src/admin.rs). A name that holds the same bytes counts as written, and a
    name that holds other bytes gets a number.
-8. [`admin.rs:307`](../src/admin.rs) acknowledges the notes of the page that are on disk.
-   [`admin.rs:304`](../src/admin.rs) and [`admin.rs:308`](../src/admin.rs) stop the loop.
+8. [`admin.rs:308`](../src/admin.rs) acknowledges the notes of the page that are on disk.
+   [`admin.rs:305`](../src/admin.rs) and [`admin.rs:309`](../src/admin.rs) stop the loop.
 9. A note that could not be written stays unacknowledged, and the command exits 1.
 
-`admin status` reads the fleet view through [`admin.rs:594`](../src/admin.rs), which refuses any
-other shape at [`admin.rs:597`](../src/admin.rs) and [`admin.rs:603`](../src/admin.rs), and builds
+`admin status` reads the fleet view through [`admin.rs:595`](../src/admin.rs), which refuses any
+other shape at [`admin.rs:598`](../src/admin.rs) and [`admin.rs:604`](../src/admin.rs), and builds
 the admin's shape at
-[`admin.rs:691`](../src/admin.rs). `admin syncs` resolves an operator to its clients through the
+[`admin.rs:692`](../src/admin.rs). `admin syncs` resolves an operator to its clients through the
 same view, reads each client's log, and merges the rows newest first at
-[`admin.rs:878`](../src/admin.rs), by the instant that each time names
-([`admin.rs:102`](../src/admin.rs)).
+[`admin.rs:879`](../src/admin.rs), by the instant that each time names
+([`admin.rs:103`](../src/admin.rs)).
 
 Steps of `admin diagnose`:
 
-1. [`main.rs:225`](../src/main.rs) runs the command with the operator, or with
+1. [`main.rs:227`](../src/main.rs) runs the command with the operator, or with
    the client of `--client`, and with 20 lines of the run log unless `--limit` names another
    number.
-2. [`admin.rs:1053`](../src/admin.rs)
+2. [`admin.rs:1316`](../src/admin.rs)
    reads the fleet view, and keeps the clients of the operator, or the one client. The view gives
    what the server saw of each one: the last sync, the version in its `User-Agent`, and the notes
    that the server holds.
-3. [`admin.rs:1079`](../src/admin.rs)
+3. [`admin.rs:1321`](../src/admin.rs)
    reads the diagnostics of each client. A `404` gets the hint of
-   [`admin.rs:1101`](../src/admin.rs): a
+   [`admin.rs:1355`](../src/admin.rs): a
    server older than this route answers `404` too.
 4. The body parses into types that refuse a field or a word they do not know.
-   [`admin.rs:1113`](../src/admin.rs)
+   [`admin.rs:1367`](../src/admin.rs)
    then checks that the answer is for the client that was asked for, and checks each time, each
    version, and each content hash.
-5. [`admin.rs:1182`](../src/admin.rs)
+5. For a retired client alone, [`admin.rs:1330`](../src/admin.rs) reads what the server holds
+   about its removal, through [`admin.rs:1076`](../src/admin.rs). A `404` there reads as no order:
+   a server older than this route answers `404` too.
+6. [`admin.rs:1436`](../src/admin.rs)
    names each cause that the two sources show: a client too old for push, a missing hook, notes
    that broke a rule, notes that wait, entries in the outbox that are not notes, and an outbox
-   that never held a note.
-6. [`admin.rs:1383`](../src/admin.rs)
+   that never held a note. For a client with a removal order, [`admin.rs:1595`](../src/admin.rs)
+   says where the removal stands, and it is the one finding after the retirement.
+7. [`admin.rs:1739`](../src/admin.rs)
    builds the lines that `main.rs` prints. With `--json`, `main.rs` prints the same values as
    JSON.
 

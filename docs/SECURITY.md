@@ -10,10 +10,11 @@ exist, and how to report a vulnerability.
 |---|---|
 | The holder of the manifest signing key | Which binary `brainmaker` installs over itself |
 | The holder of the content signing key | Which archive lands in `content/`, and so what runs at every session start |
+| The holder of the removal signing key | Which client removes `brainmaker` from its machine, and whether the outbox there goes too. Nothing else: the key signs no content and no software. |
 | The administrator who issues the provisioning file | The endpoints and the client credentials |
 | The employee who runs the binary | Nothing beyond their own account; they already hold the binary |
-| The server | Which operator a credential belongs to, and so the name on each note. The client never names it. The server also receives and stores the diagnostic report. It is not trusted to ask for one: no answer of the server makes the client send, read, or run anything. |
-| The admin's copy | Collecting the notes, and reading what each client reports about itself. It is an install like every other, in `~/.brainmaker`, and its issuer client holds `sync` and `outbox:read`, never `publish`. `link` connects nothing to Claude for a credential that reads the outbox and cannot send notes. The admin commands grant nothing by themselves: the server decides what the token may read. |
+| The server | Which operator a credential belongs to, and so the name on each note. The client never names it. The server also receives and stores the diagnostic report. It is not trusted to ask for one: no answer of the server makes the client send, read, or run anything. The server also carries a removal order to its client. It is not trusted to write one: an order that no removal key signed, or that names another client, is refused. The server can keep an order from a client, as it can keep a content release from one. |
+| The admin's copy | Collecting the notes, reading what each client reports about itself, and storing a removal order, which retires its client on the server. It is an install like every other, in `~/.brainmaker`, and its issuer client holds `sync` and `outbox:read`, never `publish`. `link` connects nothing to Claude for a credential that reads the outbox and cannot send notes. The admin commands grant nothing by themselves: the server decides what the token may read. |
 
 The two paths have different anchors.
 
@@ -30,15 +31,21 @@ numeric core.
 **The content path** is anchored the same way, on a separate key. `content/latest` returns an
 envelope whose `payload` carries the hash, the size, the SHA-256, and a sequence, and
 `signature::CONTENT_KEYS` verifies it before anything is parsed. The API host is therefore not
-trusted for either path. The two key lists are disjoint, and a unit test fails the build if a key
-appears in both.
+trusted for either path.
+
+**The removal path** is the third anchor. A removal order is an envelope like the other two, and
+`signature::REMOVAL_KEYS` verifies it before anything is parsed. The API host is not trusted for
+it either: it carries the order, and it cannot write one. [The removal order](#the-removal-order)
+gives the checks.
+
+The three key lists are disjoint, and a unit test fails the build if a key appears in two.
 
 A signature proves who made a release, and not when, so the payload also carries a sequence.
 `brainmaker-sign` writes the time of signing, and the client refuses a release whose sequence is not
 higher than the installed one. A replayed older release therefore installs nothing, as a replayed
 older manifest installs nothing.
 
-Neither anchor is TLS. TLS still runs, and it protects the credential in transit, but a host that
+No anchor is TLS. TLS still runs, and it protects the credential in transit, but a host that
 serves altered bytes is caught by the signature rather than by the transport.
 
 ### What the sealed store protects, and what it does not
@@ -88,6 +95,11 @@ token already issued stays valid for the rest of its lifetime, which the server 
 | Content API to the terminal and the dashboard | The fleet view and the sync log | Typed parse that refuses a field it does not know; the client ID rule, the operator rule, and the time shape; control characters removed from every value the lines print |
 | Content API to the terminal and the dashboard | The diagnostics of a client, for `admin diagnose` | Typed parse that refuses a field or a word it does not know; the client ID must be the one that was asked for; the time shape, the version rule, and the content hash rule; control characters removed from every value the lines print |
 | Content API to the client | The answer to a diagnostic report | The client reads the status and no field of the body. Nothing in the answer changes what the client sends, when it sends, or what it runs. |
+| Content API to the whole install | A removal order, in the body of a `410` answer to the content check | Ed25519 signature over the served bytes against `REMOVAL_KEYS`, checked before the parse; then a typed parse that refuses a field it does not know, the one order word `remove`, a time of signing between 2000 and 2099, and the signed client ID against the identifier of this client. An order that fails any check removes nothing, and the installed content stays. |
+| Content API to the client | The answer to a removal report | The client reads nothing of it, the status included |
+| Disk to the signer | The removal key file that `admin retire` reads | Hexadecimal, then a PKCS#8 Ed25519 parse. A probe that the key signs must verify against `REMOVAL_KEYS`, or the run stops before it stores anything. The key is never printed, logged, or sent. |
+| Content API to the terminal | The answer to a stored removal order | The same typed parse as for the removal that `admin diagnose` reads, and the order must be there, for the client that was asked for |
+| Content API to the terminal and the dashboard | The removal of a client, for `admin diagnose` | Typed parse that refuses a field or a word it does not know; the client ID must be the one that was asked for; the time shape |
 | Token endpoint to a header | The access token | Length cap, printable-ASCII rule, and a `token_type` that must read `Bearer` when the response carries one |
 | Token endpoint to the clock | `expires_in` | Cut to one hour before it is added to a clock reading; a sum that the clock cannot hold caches nothing |
 | Store to the process | `config.enc` | AES-256-GCM authenticates the header and the ciphertext before any byte is used |
@@ -247,6 +259,19 @@ The removal stays inside what `brainmaker` wrote. It acts only on a root that ho
 not even the hook in `~/.claude`. It removes named paths rather than the whole root. A symbolic link
 that it removes goes without the target it names.
 
+A removal that the administrator orders runs the same code, with the same limits. See
+[The removal order](#the-removal-order). To take a person off the team, do the three steps in this
+order:
+
+1. Run `brainmaker admin retire <operator>` on the admin's machine. It signs a removal order for
+   each client of that person, and stores it. From then on the server gives those clients no
+   content.
+2. Wait until the client reports the removal. `brainmaker admin diagnose <operator>` shows it.
+3. Revoke the client at the issuer.
+
+A client that the issuer refuses gets no token, asks the server for nothing, and so never receives
+the order. Its content then stays on the machine, as it does today.
+
 ## Input validation
 
 ### Content hash
@@ -341,10 +366,11 @@ a release anyway, for a deliberate rollback on one machine. The rule has one lim
 `state.json` holds no sequence has nothing to compare against, so it accepts an older signed
 release, and the rule holds from the first install of a release that carries a sequence.
 
-### Two signing keys, held by different parties
+### Three signing keys, held by different parties
 
-`PUBLIC_KEYS` verifies a software manifest. `CONTENT_KEYS` verifies a content release. A key in one
-list cannot sign for the other, and a unit test fails the build if a key appears in both.
+`PUBLIC_KEYS` verifies a software manifest. `CONTENT_KEYS` verifies a content release.
+`REMOVAL_KEYS` verifies a removal order. A key in one list cannot sign for another, and a unit test
+fails the build if a key appears in two.
 
 The separation is what makes it acceptable for a deploy host to hold a signing key at all. Content
 changes whenever the shared material does, so publishing must be automatic, so the key must sit on
@@ -353,8 +379,19 @@ and replace every binary in the fleet. With two, a compromise there yields what 
 already yields, and no more.
 
 The release workflow reads each block on its own for the same reason. A single grep over the file
-would collect both lists, and verification passes when any key given accepts, so a manifest signed
+would collect every list, and verification passes when any key given accepts, so a manifest signed
 with the content key would have passed the check that exists to catch exactly that.
+
+The removal key is the admin's. The admin signs an order each time that a person leaves, so the key
+sits on the admin's own machine, in `~/.brainmaker/removal-signing.key`. A list of its own keeps
+that routine away from the other two keys: the removal key can make one client run `uninstall`, and
+it can install nothing. A compromise of it removes `brainmaker` from machines, which a new install
+puts right. It cannot change what a machine runs.
+
+`brainmaker admin retire` reads that file, and no command writes it, prints it, or sends it. A
+removal on the admin's own machine leaves it too, because `brainmaker` did not write it. So rotate
+the removal key when the admin who holds it leaves: put a new key first in `REMOVAL_KEYS`, release,
+and drop the old key once the fleet runs that release.
 
 ### Content is code, once it is linked
 
@@ -447,6 +484,63 @@ makes no request for it, and a request has 10 seconds in all.
 
 What the server keeps, and for how long, is the server's rule: see the documents of the server.
 
+### The removal order
+
+The removal order is the one thing that `brainmaker` does on the word of another. It exists so that
+an admin can remove the content from the machine of a person who left the team. These properties
+bound it.
+
+**It takes the key and the admin's credential.** `admin retire` signs with the removal key, and
+stores the order with the admin's `outbox:read` token. A person with the key and no credential has
+an order that no server carries. A person with the credential and no key can make the server retire
+a client and stop its content, and can remove nothing: the order that they store is one that the
+client refuses. Before it stores anything, `admin retire` checks its key against `REMOVAL_KEYS` of
+its own build, and asks the admin to confirm the clients by name.
+
+**The holder of a removal key decides, and nobody else.** `sync` obeys an order only after
+`signature::verify_removal` accepted the signature over the exact bytes that the server sent, with
+the keys that are compiled into this binary. The server carries the order in the body of a `410`
+answer to the content check, and it holds no key. A server that an attacker controls can therefore
+remove no client. A build with an empty `REMOVAL_KEYS` obeys no order at all, and
+`brainmaker status` prints the count.
+
+**An order names one client.** The signed payload holds a client ID, and the client compares it
+with its own identifier. So the server cannot give the order of one person to the machine of
+another, and one signature cannot remove a fleet. A client with no credential obeys no order.
+
+**An order can do one thing.** It makes the client remove what `uninstall` removes: the bridge in
+`~/.claude`, and what `brainmaker` wrote under a recognised root. It names no path and no command.
+Its one choice is whether `outbox/` goes too, and that choice is inside the signed payload. A
+payload with a field that this build does not know is refused, because a removal has no way back,
+and a field that a later version adds must not pass unread.
+
+**It is not silent.** `sync` prints that the administrator ordered the removal, and what stays,
+even with `--quiet`. The help text of the binary says that the order exists.
+
+**It has no end, on purpose.** A signature proves who signed, and not when, and a client that
+removed itself keeps no record. The same order therefore removes a later install that carries the
+same credential. Treat a client ID that received an order as spent, and never issue it again. The
+server refuses to restore such a client.
+
+**A refused order changes nothing.** An order that fails a check is a failed content check: the
+installed content stays, the run exits 0, and the run log holds a line with the status `410` and a
+cause, which `admin diagnose` reads. The cause is `signature` when no removal key signed the order.
+
+**The report holds no text.** After the removal, the client tells the server whether it ran to its
+end, whether the root directory stays, and how many notes were never sent. Each value is a word
+from a fixed list or a bounded number, as in the diagnostic report. The client reads nothing of the
+answer.
+
+What the order does not do:
+
+- It does not reach a machine that never asks for content, or a client that the issuer refuses.
+- It does not remove a copy of `content/` that a person made elsewhere, or the program file that a
+  person keeps outside the root.
+- It does not revoke the client. Revoke it at the issuer, after the removal is reported.
+
+So the order is a cleanup for the usual case, and no guarantee. Treat the content as known to
+every person who received it.
+
 ### Size caps
 
 | Input | Cap |
@@ -457,7 +551,8 @@ What the server keeps, and for how long, is the server's rule: see the documents
 | One diagnostic report | 64 KiB, and 200 lines of the run log |
 | The run log on the disk | 256 KiB. Past that size it is cut to its newest 128 KiB. |
 | One line of the run log | 512 bytes. A longer line is skipped. |
-| The diagnostics of one client, for `admin diagnose` | 4 MiB |
+| The diagnostics of one client, and the removal of one client, for `admin diagnose` | 4 MiB each |
+| The `410` answer that carries a removal order | 64 KiB |
 | One page of notes for `admin pull-outbox` | 8 MiB |
 | The fleet view, and one client's sync log | 4 MiB |
 | Content manifest and software manifest | 1 MiB |

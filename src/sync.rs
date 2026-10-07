@@ -13,6 +13,7 @@ use crate::cause::{self, Cause, Failure};
 use crate::config::{Config, validate_hash};
 use crate::lock;
 use crate::remote;
+use crate::removal;
 use crate::state::{self, State};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +37,10 @@ pub enum Outcome {
         hash: String,
         stats: archive::Stats,
     },
+    /// The server holds no release for this client. It holds a removal order
+    /// that this client trusts, and nothing was installed. See
+    /// [`crate::removal`].
+    Removal(removal::Order),
 }
 
 /// How long a run waits for another run's install to end.
@@ -43,14 +48,14 @@ pub enum Outcome {
 /// The hook allows `sync` 60 seconds in all, and the check of the latest
 /// version can take 20 of them.
 #[cfg(not(test))]
-const LOCK_WAIT: Duration = Duration::from_secs(30);
+pub const LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// The same wait in a test build. It stays short, because a test that holds
 /// the lock on purpose waits for all of it. It is one second and no less,
 /// because a test that frees the lock from a second thread needs room on a
 /// slow machine.
 #[cfg(test)]
-const LOCK_WAIT: Duration = Duration::from_secs(1);
+pub const LOCK_WAIT: Duration = Duration::from_secs(1);
 
 /// Brings `content/` to the latest remote version.
 ///
@@ -73,6 +78,11 @@ const LOCK_WAIT: Duration = Duration::from_secs(1);
 /// A run that still finds the lock held keeps the installed content and
 /// reports [`Outcome::Busy`]. With nothing installed, or with `force`, it
 /// returns an error instead, as it does for a server that cannot be reached.
+///
+/// A server that answers with a removal order in place of a release gives
+/// [`Outcome::Removal`], whatever is installed and whatever `force` says. The
+/// function removes nothing itself. An order that this client does not trust
+/// is a failed check like any other, and the installed content stays.
 pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome> {
     fs::create_dir_all(config.root())
         .with_context(|| format!("cannot create the directory {}", config.root().display()))?;
@@ -87,7 +97,8 @@ pub fn sync(config: &Config, force: bool, log: &dyn Fn(&str)) -> Result<Outcome>
 
     log("Checking the latest content version.");
     let release = match remote::latest_release(config, &crate::outbox::report_headers(config)) {
-        Ok(release) => release,
+        Ok(remote::Latest::Release(release)) => release,
+        Ok(remote::Latest::Removal(order)) => return Ok(Outcome::Removal(order)),
         Err(error) => {
             return match installed {
                 Some(hash) if content_present && !force => Ok(Outcome::Unreachable {

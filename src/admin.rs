@@ -51,6 +51,7 @@ use crate::link::Presence;
 use crate::lock;
 use crate::outbox::{self, Rule};
 use crate::remote;
+use crate::removal;
 use crate::selfupdate;
 use crate::version;
 
@@ -1019,6 +1020,264 @@ pub struct LoggedEvent {
     pub version: Option<String>,
 }
 
+/// The first version of this program that obeys a removal order. An older
+/// client reads the answer that carries the order as a failed content check,
+/// and keeps what it holds.
+const FIRST_VERSION_WITH_REMOVAL: &str = "0.1.10";
+
+/// Body of `GET {base}/admin/clients/<client_id>/removal`. Any other shape
+/// fails the command, as for the fleet view.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemovalView {
+    client_id: String,
+    removal: Option<Removal>,
+}
+
+/// What the server holds about the removal of one client: the order that the
+/// admin stored, and what the client said that it did.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Removal {
+    /// When the server stored the order.
+    pub ordered_at: String,
+    /// The admin's client that stored it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ordered_by: Option<String>,
+    /// What the order says about the outbox on that machine.
+    pub outbox: removal::Outbox,
+    /// When the server first gave the order to the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_at: Option<String>,
+    /// The removal report of the client. Nothing verified it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<RemovalReport>,
+}
+
+/// What a client said about its own removal. A value is absent when the
+/// report held none, or when it broke its rule on the server.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemovalReport {
+    /// When the server received the report.
+    pub received_at: String,
+    pub outcome: removal::Outcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<removal::Root>,
+    /// Notes on that machine that were never sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes_unsent: Option<u64>,
+}
+
+/// Reads what the server holds about the removal of one client.
+///
+/// A server older than the removal order has no such route, and answers 404.
+/// That reads as no order, so `diagnose` works against it as before.
+fn removal_of(config: &Config, client_id: &str) -> Result<Option<Removal>> {
+    let url = config.admin_removal_url(client_id);
+    let body = match remote::fetch_admin(config, &url, MAX_REPORT_BYTES) {
+        Ok(body) => body,
+        Err(error) if cause::of(&error).status == Some(404) => return Ok(None),
+        Err(error) => return Err(with_scope_hint(error)),
+    };
+    checked_removal(&body, &url, client_id)
+}
+
+/// Parses the removal of `client_id` from the body that `url` answered, and
+/// checks the client and each time.
+fn checked_removal(body: &str, url: &str, client_id: &str) -> Result<Option<Removal>> {
+    let view: RemovalView = serde_json::from_str(body)
+        .with_context(|| format!("{url} did not return the expected removal"))?;
+    if view.client_id != client_id {
+        bail!("the server answered with the removal of another client than {client_id}");
+    }
+    if let Some(removal) = &view.removal {
+        check_time(&removal.ordered_at, "removal.ordered_at")?;
+        if let Some(by) = &removal.ordered_by {
+            check_client_id(by)?;
+        }
+        if let Some(time) = &removal.served_at {
+            check_time(time, "removal.served_at")?;
+        }
+        if let Some(report) = &removal.report {
+            check_time(&report.received_at, "removal.report.received_at")?;
+        }
+    }
+    Ok(view.removal)
+}
+
+// --------------------------------------------------------------- retire ---
+
+/// One client that `admin retire` gives a removal order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retiring {
+    pub client_id: String,
+    pub operator: Option<String>,
+    pub last_sync_at: Option<String>,
+    pub brainmaker_version: Option<String>,
+    pub platform: Option<String>,
+    /// True when the last sync named a version older than the first one with
+    /// removal orders. Such a client obeys after it updates.
+    pub too_old: bool,
+}
+
+/// What `admin retire` is about to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetirePlan {
+    /// The clients that get a removal order.
+    pub targets: Vec<Retiring>,
+    /// The clients that already hold one: the client ID, and when the server
+    /// stored the order. They get no second one.
+    pub ordered: Vec<(String, String)>,
+}
+
+/// Finds the clients that `selector` names, and sorts them into the ones
+/// that get a removal order and the ones that already hold one.
+///
+/// An operator names every client of that person: one order names one client,
+/// and a person who left must keep none.
+pub fn retire_plan(config: &Config, selector: &Selector) -> Result<RetirePlan> {
+    let mut plan = RetirePlan::default();
+    for client in selected(config, selector)? {
+        // Only a retired client can hold an order, so the others cost no
+        // request.
+        let held = match client.retired {
+            true => removal_of(config, &client.client_id)?,
+            false => None,
+        };
+        match held {
+            Some(removal) => plan.ordered.push((client.client_id, removal.ordered_at)),
+            None => plan.targets.push(Retiring {
+                too_old: client
+                    .brainmaker_version
+                    .as_deref()
+                    .is_some_and(|named| version::is_newer(FIRST_VERSION_WITH_REMOVAL, named)),
+                client_id: client.client_id,
+                operator: client.operator,
+                last_sync_at: client.last_seen_at,
+                brainmaker_version: client.brainmaker_version,
+                platform: client.platform,
+            }),
+        }
+    }
+    Ok(plan)
+}
+
+/// The question that `admin retire` asks before it stores an order. Every
+/// value from the server loses its control characters.
+pub fn retire_question(plan: &RetirePlan, outbox: removal::Outbox) -> String {
+    let value = |text: &Option<String>| {
+        text.as_deref()
+            .map(remote::printable)
+            .unwrap_or_else(|| "-".to_string())
+    };
+    let mut text = String::from("This takes brainmaker off the machine of each client below:\n\n");
+    for target in &plan.targets {
+        text.push_str(&format!(
+            "  - {}  {}  last sync {}  version {}  {}\n",
+            target.client_id,
+            target.operator.as_deref().unwrap_or("unregistered"),
+            value(&target.last_sync_at),
+            value(&target.brainmaker_version),
+            value(&target.platform)
+        ));
+    }
+    text.push_str(
+        "\nThe server retires each client, and gives it no content from now on. At its next\n\
+         sync, each client removes the content, the sealed settings, the program copy, and\n\
+         what link wrote into ~/.claude.\n",
+    );
+    text.push_str(match outbox {
+        removal::Outbox::Keep => "The outbox on that machine stays, with every note in it.\n",
+        removal::Outbox::Remove => {
+            "The outbox on that machine goes too, with every note in it, sent or not.\n"
+        }
+    });
+    if plan.targets.iter().any(|target| target.too_old) {
+        text.push_str(&format!(
+            "A client that runs a version older than {FIRST_VERSION_WITH_REMOVAL} does not know \
+             removal orders. It keeps\nits content until it updates, and obeys at the first \
+             sync after that.\n"
+        ));
+    }
+    text.push_str(&format!(
+        "This has no way back: a client that received an order is never restored, and a\n\
+         person who comes back gets a new client.\n\nRetire {} client(s)? [y/N] ",
+        plan.targets.len()
+    ));
+    text
+}
+
+/// Signs one removal order for each target, and stores it on the server.
+/// Returns what the server stored, in the order of the targets.
+///
+/// The run stops at the first order that the server does not take. The
+/// orders before it are stored, and the next run finds them and skips them.
+pub fn retire(
+    config: &Config,
+    signer: &removal::Signer,
+    targets: &[Retiring],
+    outbox: removal::Outbox,
+    log: &dyn Fn(&str),
+) -> Result<Vec<Removal>> {
+    let mut stored = Vec::new();
+    for target in targets {
+        check_client_id(&target.client_id)?;
+        let envelope = signer.order(&target.client_id, outbox)?;
+        let body = serde_json::to_string(&envelope).context("cannot write the removal order")?;
+        let url = config.admin_removal_url(&target.client_id);
+        let answer = remote::put_admin(config, &url, &body, MAX_REPORT_BYTES)
+            .map_err(with_scope_hint)
+            .map_err(with_removal_hint)?;
+        let removal = checked_removal(&answer, &url, &target.client_id)?
+            .with_context(|| format!("{url} stored no removal order"))?;
+        log(&format!(
+            "Stored the removal order for {}. The server retired the client, and gives it no \
+             content.",
+            target.client_id
+        ));
+        stored.push(removal);
+    }
+    Ok(stored)
+}
+
+/// Says that a server older than the removal order answers 404 too.
+fn with_removal_hint(error: anyhow::Error) -> anyhow::Error {
+    if cause::of(&error).status == Some(404) {
+        return error.context(
+            "the server did not take the removal order; a server older than the removal order \
+             answers 404 too",
+        );
+    }
+    error
+}
+
+/// The clients that `selector` names, from the fleet view. It fails when the
+/// fleet holds none.
+fn selected(config: &Config, selector: &Selector) -> Result<Vec<Client>> {
+    match selector {
+        Selector::Client(client_id) => check_client_id(client_id)?,
+        Selector::Operator(operator) => check_operator(operator)?,
+    }
+    let clients: Vec<Client> = fleet(config)?
+        .clients
+        .into_iter()
+        .filter(|client| match selector {
+            Selector::Client(client_id) => &client.client_id == client_id,
+            Selector::Operator(operator) => client.operator.as_deref() == Some(operator.as_str()),
+        })
+        .collect();
+    if clients.is_empty() {
+        match selector {
+            Selector::Client(client_id) => {
+                bail!("the server knows no client with the ID {client_id}")
+            }
+            Selector::Operator(operator) => bail!("the server registers no client to {operator}"),
+        }
+    }
+    Ok(clients)
+}
+
 /// What the admin reads of one client: what the server saw, what the client
 /// reported, why no note arrives, and the newest lines of the run log.
 #[derive(Debug, Serialize)]
@@ -1027,6 +1286,10 @@ pub struct Diagnosis {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
     pub retired: bool,
+    /// The removal order of this client and what came of it, when the server
+    /// holds one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removal: Option<Removal>,
     /// The last sync that the server saw.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sync_at: Option<String>,
@@ -1051,28 +1314,7 @@ pub struct Diagnosis {
 /// of each one. The client sent the rest itself: this command asks no client
 /// for anything.
 pub fn diagnose(config: &Config, selector: &Selector, limit: u32) -> Result<Vec<Diagnosis>> {
-    match selector {
-        Selector::Client(client_id) => check_client_id(client_id)?,
-        Selector::Operator(operator) => check_operator(operator)?,
-    }
-    let clients: Vec<Client> = fleet(config)?
-        .clients
-        .into_iter()
-        .filter(|client| match selector {
-            Selector::Client(client_id) => &client.client_id == client_id,
-            Selector::Operator(operator) => client.operator.as_deref() == Some(operator.as_str()),
-        })
-        .collect();
-    if clients.is_empty() {
-        match selector {
-            Selector::Client(client_id) => {
-                bail!("the server knows no client with the ID {client_id}")
-            }
-            Selector::Operator(operator) => bail!("the server registers no client to {operator}"),
-        }
-    }
-
-    clients
+    selected(config, selector)?
         .into_iter()
         .map(|client| {
             let url = config.admin_diagnostics_url(&client.client_id, limit);
@@ -1082,11 +1324,23 @@ pub fn diagnose(config: &Config, selector: &Selector, limit: u32) -> Result<Vec<
             let found: Diagnostics = serde_json::from_str(&body)
                 .with_context(|| format!("{url} did not return the expected diagnostics"))?;
             check_diagnostics(&found, &client.client_id)?;
+            // Only a retired client can have a removal order, so the others
+            // cost no request.
+            let removal = match client.retired {
+                true => removal_of(config, &client.client_id)?,
+                false => None,
+            };
             Ok(Diagnosis {
-                findings: findings(&client, found.report.as_ref(), &found.events),
+                findings: findings(
+                    &client,
+                    removal.as_ref(),
+                    found.report.as_ref(),
+                    &found.events,
+                ),
                 client_id: client.client_id,
                 operator: client.operator,
                 retired: client.retired,
+                removal,
                 last_sync_at: client.last_seen_at,
                 brainmaker_version: client.brainmaker_version,
                 notes_stored: client.notes_pushed_total,
@@ -1179,13 +1433,26 @@ const COWORK_HINT: &str = "Cowork does not run the SessionStart hook. For an ope
 /// The four causes that the server alone cannot see come first to mind: the
 /// client is too old, `link` never connected Claude, every note broke a rule
 /// on the machine, or no note was written at all.
-fn findings(client: &Client, report: Option<&Report>, events: &[LoggedEvent]) -> Vec<String> {
+fn findings(
+    client: &Client,
+    removal: Option<&Removal>,
+    report: Option<&Report>,
+    events: &[LoggedEvent],
+) -> Vec<String> {
     let mut found = Vec::new();
     if client.retired {
         found.push(
             "The registry marks this client as retired, so the server refuses its notes."
                 .to_string(),
         );
+        if let Some(removal) = removal {
+            // A client under a removal order sends no more notes, so what the
+            // report says about its hook and its outbox names no cause. The
+            // report is older than the removal, and it stays in the lines
+            // above for the admin to read.
+            found.push(removal_finding(client, removal, events));
+            return found;
+        }
     } else if client.operator.is_none() {
         found.push(
             "The registry names no operator for this client, so the server refuses its notes. \
@@ -1322,6 +1589,95 @@ fn findings(client: &Client, report: Option<&Report>, events: &[LoggedEvent]) ->
     found
 }
 
+/// Says where the removal of a client stands: the order waits, the client
+/// has it and did not obey, the removal stopped part-way, or brainmaker is
+/// gone from that machine.
+fn removal_finding(client: &Client, removal: &Removal, events: &[LoggedEvent]) -> String {
+    if let Some(report) = &removal.report {
+        return match report.outcome {
+            removal::Outcome::Removed => {
+                let mut text = format!(
+                    "brainmaker removed itself from that machine: the client reported it at {}.",
+                    report.received_at
+                );
+                if report.root == Some(removal::Root::Kept) {
+                    text.push_str(
+                        " Its root directory stays, with what brainmaker did not remove: the \
+                         outbox when the order keeps it, a file that brainmaker did not write, \
+                         or on Windows the program that ran.",
+                    );
+                }
+                match (removal.outbox, report.notes_unsent) {
+                    (_, None | Some(0)) => {}
+                    (removal::Outbox::Keep, Some(notes)) => text.push_str(&format!(
+                        " {notes} note(s) that were never sent stay in its outbox."
+                    )),
+                    (removal::Outbox::Remove, Some(notes)) => text.push_str(&format!(
+                        " {notes} note(s) that were never sent went with its outbox."
+                    )),
+                }
+                text
+            }
+            removal::Outcome::Failed => format!(
+                "The client obeyed the removal order, and the removal stopped part-way: it \
+                 reported the failure at {}. Files of brainmaker can remain on that machine, \
+                 and nothing there runs sync again.",
+                report.received_at
+            ),
+        };
+    }
+
+    let Some(served_at) = &removal.served_at else {
+        return format!(
+            "A removal order waits for this client since {}. The client asked for no content \
+             since then, so it does not have the order. A client that the issuer no longer \
+             accepts never receives it.",
+            removal.ordered_at
+        );
+    };
+    let mut text = format!(
+        "The server gave the removal order to this client at {served_at}, and the client \
+         reported no removal."
+    );
+    let too_old = client
+        .brainmaker_version
+        .as_deref()
+        .is_some_and(|named| version::is_newer(FIRST_VERSION_WITH_REMOVAL, named));
+    // The newest line of the run log that an answer with the order left.
+    let refusal = events.iter().find(|event| {
+        matches!(event.code, Code::ContentUnreachable | Code::ContentFailed)
+            && event.status == Some(removal::GONE)
+    });
+    if too_old {
+        text.push_str(&format!(
+            " It runs brainmaker {}, and removal orders came with \
+             {FIRST_VERSION_WITH_REMOVAL}. It keeps its content until it updates, and it obeys \
+             the order at the first sync after that.",
+            remote::printable(client.brainmaker_version.as_deref().unwrap_or("-"))
+        ));
+    } else {
+        text.push_str(match refusal.and_then(|event| event.cause) {
+            Some(Cause::Signature) => {
+                " Its run log says that no removal key of that build signed the order. Sign \
+                 the order with a key that is in REMOVAL_KEYS of the build on that machine."
+            }
+            Some(Cause::Http) => {
+                " Its run log says that it read the answer as a failed content check, as a \
+                 build with no removal order does."
+            }
+            Some(_) => {
+                " Its run log says that it refused the order: the order names another client, \
+                 or it has a shape that this build does not know."
+            }
+            None => {
+                " The removal can be running now, or the report did not arrive. Look at the \
+                 run log below, and at the next sync of the client."
+            }
+        });
+    }
+    text
+}
+
 /// Each rule that the run log names for a rejected note, with its count:
 /// `kind (2)`.
 fn broken_rules(events: &[LoggedEvent]) -> Vec<String> {
@@ -1408,6 +1764,25 @@ pub fn diagnosis_lines(diagnosis: &Diagnosis) -> Vec<String> {
         value(&diagnosis.brainmaker_version),
         diagnosis.notes_stored
     ));
+    if let Some(removal) = &diagnosis.removal {
+        let mut line = format!(
+            "  removal   ordered {}  outbox {}  served {}",
+            removal.ordered_at,
+            word(&removal.outbox),
+            value(&removal.served_at)
+        );
+        match &removal.report {
+            None => line.push_str("  reported -"),
+            Some(report) => line.push_str(&format!(
+                "  reported {} {}  root {}  notes unsent {}",
+                word(&report.outcome),
+                report.received_at,
+                named(&report.root),
+                number(report.notes_unsent)
+            )),
+        }
+        lines.push(line);
+    }
     match &diagnosis.report {
         None => lines.push("  report    none".to_string()),
         Some(report) => {
@@ -2196,7 +2571,570 @@ mod tests {
             .into_iter()
             .map(|event| serde_json::from_value(event).unwrap())
             .collect();
-        findings(client, report.as_ref(), &events)
+        findings(client, None, report.as_ref(), &events)
+    }
+
+    /// What the server holds about a removal: the order, and `report`.
+    fn removal_of_gabriele(
+        outbox: &str,
+        served_at: Option<&str>,
+        report: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        json!({
+            "ordered_at": "2026-10-06T12:00:00+02:00",
+            "ordered_by": "brainmaker-admin-matteo",
+            "outbox": outbox,
+            "served_at": served_at,
+            "report": report,
+        })
+    }
+
+    /// The removal finding for a retired client of gabriele that named
+    /// `version` at its last sync.
+    fn removal_found(
+        version: &str,
+        removal: serde_json::Value,
+        events: Vec<serde_json::Value>,
+    ) -> String {
+        let mut row = client(
+            GABRIELE,
+            Some("gabriele"),
+            true,
+            Some("2026-10-06T12:05:00+02:00"),
+        );
+        row["brainmaker_version"] = json!(version);
+        let client: Client = serde_json::from_value(row).unwrap();
+        let removal: Removal = serde_json::from_value(removal).unwrap();
+        let events: Vec<LoggedEvent> = events
+            .into_iter()
+            .map(|event| serde_json::from_value(event).unwrap())
+            .collect();
+        // The last report of the machine says that its hook is gone. Under a
+        // removal order that names no cause, so the removal is the one
+        // finding after the retirement.
+        let mut report = healthy();
+        report["link"]["hook"] = json!("absent");
+        let report: Report = serde_json::from_value(report).unwrap();
+        let found = findings(&client, Some(&removal), Some(&report), &events);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(found[0].contains("retired"), "{found:?}");
+        found[1].clone()
+    }
+
+    #[test]
+    fn the_diagnosis_says_where_a_removal_stands() {
+        // The order waits: the client did not ask for content since.
+        let waits = removal_found(
+            "0.1.10",
+            removal_of_gabriele("keep", None, None),
+            Vec::new(),
+        );
+        assert!(waits.contains("A removal order waits"), "{waits}");
+        assert!(waits.contains("2026-10-06T12:00:00+02:00"), "{waits}");
+
+        // The client has the order, and it is too old to know one.
+        let served = Some("2026-10-06T12:05:00+02:00");
+        let old = removal_found(
+            "0.1.9",
+            removal_of_gabriele("keep", served, None),
+            Vec::new(),
+        );
+        assert!(old.contains("reported no removal"), "{old}");
+        assert!(old.contains("runs brainmaker 0.1.9"), "{old}");
+        assert!(old.contains("came with 0.1.10"), "{old}");
+
+        // The client knows orders, and no key of its build signed this one.
+        let mut refused = logged(4, "sync", "content.unreachable");
+        refused["cause"] = json!("signature");
+        refused["status"] = json!(410);
+        let untrusted = removal_found(
+            "0.1.10",
+            removal_of_gabriele("keep", served, None),
+            vec![refused.clone()],
+        );
+        assert!(
+            untrusted.contains("no removal key of that build"),
+            "{untrusted}"
+        );
+
+        // It refused the order for another reason.
+        refused["cause"] = json!("other");
+        let other = removal_found(
+            "0.1.10",
+            removal_of_gabriele("keep", served, None),
+            vec![refused],
+        );
+        assert!(other.contains("names another client"), "{other}");
+
+        // No line of the run log says why.
+        let silent = removal_found(
+            "0.1.10",
+            removal_of_gabriele("keep", served, None),
+            Vec::new(),
+        );
+        assert!(silent.contains("can be running now"), "{silent}");
+    }
+
+    #[test]
+    fn the_diagnosis_says_what_a_removal_did() {
+        let served = Some("2026-10-06T12:05:00+02:00");
+        let report = |outcome: &str, root: Option<&str>, notes: Option<u64>| {
+            json!({
+                "received_at": "2026-10-06T12:05:01+02:00",
+                "outcome": outcome,
+                "root": root,
+                "notes_unsent": notes,
+            })
+        };
+
+        let gone = removal_found(
+            "0.1.10",
+            removal_of_gabriele(
+                "remove",
+                served,
+                Some(report("removed", Some("removed"), Some(0))),
+            ),
+            Vec::new(),
+        );
+        assert_eq!(
+            gone,
+            "brainmaker removed itself from that machine: the client reported it at \
+             2026-10-06T12:05:01+02:00."
+        );
+
+        let kept = removal_found(
+            "0.1.10",
+            removal_of_gabriele(
+                "keep",
+                served,
+                Some(report("removed", Some("kept"), Some(2))),
+            ),
+            Vec::new(),
+        );
+        assert!(kept.contains("Its root directory stays"), "{kept}");
+        assert!(
+            kept.contains("2 note(s) that were never sent stay"),
+            "{kept}"
+        );
+
+        let taken = removal_found(
+            "0.1.10",
+            removal_of_gabriele(
+                "remove",
+                served,
+                Some(report("removed", Some("removed"), Some(3))),
+            ),
+            Vec::new(),
+        );
+        assert!(
+            taken.contains("3 note(s) that were never sent went with"),
+            "{taken}"
+        );
+
+        let failed = removal_found(
+            "0.1.10",
+            removal_of_gabriele("keep", served, Some(report("failed", None, None))),
+            Vec::new(),
+        );
+        assert!(failed.contains("stopped part-way"), "{failed}");
+        assert!(
+            failed.contains("Files of brainmaker can remain"),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn diagnose_reads_the_removal_of_a_retired_client() {
+        let removal = removal_of_gabriele(
+            "keep",
+            Some("2026-10-06T12:05:00+02:00"),
+            Some(json!({
+                "received_at": "2026-10-06T12:05:01+02:00",
+                "outcome": "removed",
+                "root": "kept",
+                "notes_unsent": 2,
+            })),
+        );
+        let server = Server::start(vec![
+            Route::token("outbox:read", r#"{"access_token":"r"}"#),
+            Route::get(
+                "/admin/clients",
+                fleet_body(&[
+                    client(
+                        "brainmaker-sync-a",
+                        Some("gabriele"),
+                        false,
+                        Some("2026-10-05T10:00:03+02:00"),
+                    ),
+                    client(
+                        "brainmaker-sync-b",
+                        Some("gabriele"),
+                        true,
+                        Some("2026-10-06T12:05:00+02:00"),
+                    ),
+                ]),
+            ),
+            Route::get(
+                "/admin/clients/brainmaker-sync-a/diagnostics?limit=5",
+                diagnostics_body("brainmaker-sync-a", None, Vec::new()),
+            ),
+            Route::get(
+                "/admin/clients/brainmaker-sync-b/diagnostics?limit=5",
+                diagnostics_body("brainmaker-sync-b", None, Vec::new()),
+            ),
+            Route::get(
+                "/admin/clients/brainmaker-sync-b/removal",
+                json!({ "client_id": "brainmaker-sync-b", "removal": removal }).to_string(),
+            ),
+        ]);
+        let dir = temp_dir("admin-diagnose-removal");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let diagnoses = diagnose(&config, &Selector::Operator("gabriele".into()), 5).unwrap();
+
+        // The client that is not retired costs no request for a removal.
+        let asked: Vec<String> = server.received().into_iter().map(|r| r.path).collect();
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|path| path.ends_with("/removal"))
+                .count(),
+            1,
+            "{asked:?}"
+        );
+        assert!(diagnoses[0].removal.is_none());
+        let lines = diagnosis_lines(&diagnoses[1]);
+        assert_eq!(lines[0], "gabriele  brainmaker-sync-b  retired");
+        assert_eq!(
+            lines[2],
+            "  removal   ordered 2026-10-06T12:00:00+02:00  outbox keep  served \
+             2026-10-06T12:05:00+02:00  reported removed 2026-10-06T12:05:01+02:00  root kept  \
+             notes unsent 2"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("removed itself from that machine")),
+            "{lines:?}"
+        );
+        let json = serde_json::to_value(&diagnoses).unwrap();
+        assert!(json[0].get("removal").is_none());
+        assert_eq!(json[1]["removal"]["report"]["outcome"], "removed");
+
+        // A removal of another shape, or of another client, is refused.
+        for body in [
+            json!({ "client_id": "brainmaker-sync-x", "removal": null }).to_string(),
+            json!({ "client_id": "brainmaker-sync-b", "removal": null, "wipe": true }).to_string(),
+            json!({ "client_id": "brainmaker-sync-b", "removal": { "ordered_at": "soon", "outbox": "keep" } }).to_string(),
+        ] {
+            let server = Server::start(vec![
+                Route::token("outbox:read", r#"{"access_token":"r"}"#),
+                Route::get("/admin/clients/brainmaker-sync-b/removal", body.clone()),
+            ]);
+            let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+            assert!(removal_of(&config, "brainmaker-sync-b").is_err(), "{body}");
+        }
+
+        // A server with no such route holds no order, as far as this command
+        // can tell.
+        let old = Server::start(vec![Route::token("outbox:read", r#"{"access_token":"r"}"#)]);
+        let config = Config::for_test_with_credentials(&dir, &old.base(), &old.base());
+        assert!(removal_of(&config, "brainmaker-sync-b").unwrap().is_none());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --------------------------------------------------------------- retire ---
+
+    /// Writes a new removal key under `dir` as `brainmaker-sign keygen` does,
+    /// makes this thread trust it, and loads it.
+    fn removal_signer(dir: &Path) -> removal::Signer {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let path = dir.join("removal-signing.key");
+        fs::write(&path, hex(pkcs8.as_ref())).unwrap();
+        crate::signature::trust_for_removal_in_this_test(&[hex(pair.public_key().as_ref())]);
+        removal::Signer::load(&path).unwrap()
+    }
+
+    /// What the server answers when it stored an order.
+    fn stored_removal(client_id: &str, outbox: &str) -> String {
+        json!({
+            "client_id": client_id,
+            "removal": removal_of_gabriele(outbox, None, None),
+        })
+        .to_string()
+    }
+
+    /// A fleet of gabriele with three clients, and one client of anna:
+    /// `a` works, `b` is retired and holds an order, `c` is retired with none.
+    fn retire_server() -> Server {
+        let mut a = client(
+            "brainmaker-sync-a",
+            Some("gabriele"),
+            false,
+            Some("2026-10-05T10:00:03+02:00"),
+        );
+        a["brainmaker_version"] = json!("0.1.9");
+        let mut c = client("brainmaker-sync-c", Some("gabriele"), true, None);
+        c["brainmaker_version"] = json!("0.1.10");
+        Server::start(vec![
+            Route::token("outbox:read", r#"{"access_token":"r"}"#),
+            Route::get(
+                "/admin/clients",
+                fleet_body(&[
+                    a,
+                    client("brainmaker-sync-b", Some("gabriele"), true, None),
+                    c,
+                    client("brainmaker-sync-x", Some("anna"), false, None),
+                ]),
+            ),
+            Route::get(
+                "/admin/clients/brainmaker-sync-b/removal",
+                json!({
+                    "client_id": "brainmaker-sync-b",
+                    "removal": removal_of_gabriele("keep", None, None),
+                })
+                .to_string(),
+            ),
+            Route::get(
+                "/admin/clients/brainmaker-sync-c/removal",
+                json!({ "client_id": "brainmaker-sync-c", "removal": null }).to_string(),
+            ),
+            Route::put(
+                "/admin/clients/brainmaker-sync-a/removal",
+                stored_removal("brainmaker-sync-a", "remove"),
+            ),
+            Route::put(
+                "/admin/clients/brainmaker-sync-c/removal",
+                stored_removal("brainmaker-sync-c", "remove"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn retire_plans_every_client_of_the_operator_that_holds_no_order() {
+        let server = retire_server();
+        let dir = temp_dir("admin-retire-plan");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+
+        let plan = retire_plan(&config, &Selector::Operator("gabriele".into())).unwrap();
+
+        let ids: Vec<&str> = plan.targets.iter().map(|t| t.client_id.as_str()).collect();
+        assert_eq!(ids, ["brainmaker-sync-a", "brainmaker-sync-c"]);
+        assert!(
+            plan.targets[0].too_old,
+            "0.1.9 does not know removal orders"
+        );
+        assert!(!plan.targets[1].too_old);
+        assert_eq!(
+            plan.ordered,
+            [(
+                "brainmaker-sync-b".to_string(),
+                "2026-10-06T12:00:00+02:00".to_string()
+            )]
+        );
+        // The plan stores nothing, and asks for a removal only where a client
+        // is retired.
+        let asked: Vec<(String, String)> = server
+            .received()
+            .into_iter()
+            .map(|r| (r.method, r.path))
+            .collect();
+        assert!(asked.iter().all(|(method, _)| method != "PUT"), "{asked:?}");
+        assert!(
+            !asked
+                .iter()
+                .any(|(_, path)| path == "/admin/clients/brainmaker-sync-a/removal"),
+            "{asked:?}"
+        );
+
+        // One client by its ID, and the two errors of a selector that names
+        // nobody.
+        let plan = retire_plan(&config, &Selector::Client("brainmaker-sync-x".into())).unwrap();
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].operator.as_deref(), Some("anna"));
+        let error = retire_plan(&config, &Selector::Operator("nobody".into())).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no client to nobody"),
+            "{error:#}"
+        );
+        assert!(retire_plan(&config, &Selector::Client("../admin".into())).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retire_signs_one_order_for_each_client_and_stores_it() {
+        let server = retire_server();
+        let dir = temp_dir("admin-retire");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+        let signer = removal_signer(&dir);
+        let plan = retire_plan(&config, &Selector::Operator("gabriele".into())).unwrap();
+
+        let lines = std::cell::RefCell::new(Vec::new());
+        let log = |line: &str| lines.borrow_mut().push(line.to_string());
+        let stored = retire(
+            &config,
+            &signer,
+            &plan.targets,
+            removal::Outbox::Remove,
+            &log,
+        )
+        .unwrap();
+
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].outbox, removal::Outbox::Remove);
+        assert_eq!(lines.borrow().len(), 2, "{:?}", lines.borrow());
+        assert!(
+            lines.borrow()[0].starts_with("Stored the removal order for brainmaker-sync-a."),
+            "{:?}",
+            lines.borrow()
+        );
+
+        // Each request carries an order for its own client, with the admin's
+        // token, and each order is one that its client obeys.
+        let puts: Vec<_> = server
+            .received()
+            .into_iter()
+            .filter(|request| request.method == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 2);
+        for (request, client_id) in puts.iter().zip(["brainmaker-sync-a", "brainmaker-sync-c"]) {
+            assert_eq!(request.path, format!("/admin/clients/{client_id}/removal"));
+            assert_eq!(request.header("authorization"), Some("Bearer r"));
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let mut keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+            keys.sort();
+            assert_eq!(keys, ["payload", "signature"]);
+            let payload: serde_json::Value =
+                serde_json::from_str(body["payload"].as_str().unwrap()).unwrap();
+            assert_eq!(payload["order"], "remove");
+            assert_eq!(payload["client_id"], client_id);
+            assert_eq!(payload["outbox"], "remove");
+            crate::signature::verify_removal(
+                body["payload"].as_str().unwrap().as_bytes(),
+                body["signature"].as_str().unwrap(),
+            )
+            .unwrap();
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn retire_stops_at_a_server_that_takes_no_order() {
+        // A server older than the removal order: it has the fleet view, and no
+        // route for an order.
+        let server = Server::start(vec![
+            Route::token("outbox:read", r#"{"access_token":"r"}"#),
+            Route::get(
+                "/admin/clients",
+                fleet_body(&[client("brainmaker-sync-a", Some("gabriele"), false, None)]),
+            ),
+        ]);
+        let dir = temp_dir("admin-retire-old-server");
+        let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+        let signer = removal_signer(&dir);
+        let plan = retire_plan(&config, &Selector::Operator("gabriele".into())).unwrap();
+
+        let error = retire(
+            &config,
+            &signer,
+            &plan.targets,
+            removal::Outbox::Keep,
+            &|_| {},
+        )
+        .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("did not take the removal order"),
+            "got {text}"
+        );
+        assert!(text.contains("404"), "got {text}");
+
+        // An answer for another client, or of another shape, is refused too.
+        for body in [
+            stored_removal("brainmaker-sync-x", "keep"),
+            json!({ "client_id": "brainmaker-sync-a", "removal": null }).to_string(),
+            json!({ "stored": true }).to_string(),
+        ] {
+            let server = Server::start(vec![
+                Route::token("outbox:read", r#"{"access_token":"r"}"#),
+                Route::put("/admin/clients/brainmaker-sync-a/removal", body.clone()),
+            ]);
+            let config = Config::for_test_with_credentials(&dir, &server.base(), &server.base());
+            assert!(
+                retire(
+                    &config,
+                    &signer,
+                    &plan.targets,
+                    removal::Outbox::Keep,
+                    &|_| {}
+                )
+                .is_err(),
+                "{body}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_retire_question_names_each_client_and_what_goes() {
+        let target = |client_id: &str, version: &str, too_old: bool| Retiring {
+            client_id: client_id.to_string(),
+            operator: Some("gabriele".to_string()),
+            last_sync_at: Some("2026-10-05T10:00:03+02:00".to_string()),
+            brainmaker_version: Some(version.to_string()),
+            platform: Some("darwin-arm64".to_string()),
+            too_old,
+        };
+        let plan = RetirePlan {
+            targets: vec![
+                target("brainmaker-sync-a", "0.1.10", false),
+                target("brainmaker-sync-c", "0.1.10", false),
+            ],
+            ordered: Vec::new(),
+        };
+
+        let text = retire_question(&plan, removal::Outbox::Keep);
+        assert!(
+            text.contains(
+                "  - brainmaker-sync-a  gabriele  last sync 2026-10-05T10:00:03+02:00  version \
+                 0.1.10  darwin-arm64\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("  - brainmaker-sync-c  gabriele"), "{text}");
+        assert!(text.contains("The outbox on that machine stays"), "{text}");
+        assert!(text.contains("never restored"), "{text}");
+        assert!(!text.contains("older than"), "{text}");
+        assert!(text.ends_with("Retire 2 client(s)? [y/N] "), "{text}");
+
+        let old = RetirePlan {
+            targets: vec![target("brainmaker-sync-a", "0.1.9", true)],
+            ordered: Vec::new(),
+        };
+        let text = retire_question(&old, removal::Outbox::Remove);
+        assert!(
+            text.contains("The outbox on that machine goes too"),
+            "{text}"
+        );
+        assert!(text.contains("older than 0.1.10"), "{text}");
+        assert!(text.ends_with("Retire 1 client(s)? [y/N] "), "{text}");
+
+        // A value from the server cannot move the cursor of the terminal.
+        let mut odd = target("brainmaker-sync-a", "0.1.10\u{1b}[2J", false);
+        odd.last_sync_at = None;
+        let text = retire_question(
+            &RetirePlan {
+                targets: vec![odd],
+                ordered: Vec::new(),
+            },
+            removal::Outbox::Keep,
+        );
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("last sync -"), "{text}");
     }
 
     // The four causes of the operators who synced and sent no note. Each one

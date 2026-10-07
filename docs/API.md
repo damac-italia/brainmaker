@@ -13,7 +13,7 @@ brainmaker [COMMAND] [OPTIONS]
 
 | Command | Effect | Writes |
 |---|---|---|
-| `sync` | Update the content when the server has a newer version. The default when no command is given. Then ask the server for the operator name, send the notes in the outbox, and send the diagnostic report when one is due. | `content/`, `state.json`, `operator`, `outbox/`, `push.json`, `diagnostics.json` |
+| `sync` | Update the content when the server has a newer version. The default when no command is given. Then ask the server for the operator name, send the notes in the outbox, and send the diagnostic report when one is due. When the server answers with a removal order for this client, remove brainmaker from this machine instead: see [The removal order](#the-removal-order). | `content/`, `state.json`, `operator`, `outbox/`, `push.json`, `diagnostics.json` |
 | `status` | Print the installed hash, the latest hash, both software versions, the operator, and the notes in the outbox | nothing |
 | `push` | Send the notes in the outbox now | `outbox/`, `push.json` |
 | `admin pull-outbox <DIR>` | Write each note that waits on the server into `DIR`, and mark it as collected | files in `DIR` |
@@ -22,6 +22,8 @@ brainmaker [COMMAND] [OPTIONS]
 | `admin syncs --client <CLIENT-ID>` | Print the syncs of one client, newest first | nothing |
 | `admin diagnose <OPERATOR>` | Print, for every client of `OPERATOR`, what the server saw of it, the state that it last reported, why no note arrives, and the newest lines of its run log | nothing |
 | `admin diagnose --client <CLIENT-ID>` | Print the same for one client | nothing |
+| `admin retire <OPERATOR>` | Take brainmaker off the machines of a person who left: sign one removal order for each client of `OPERATOR`, and store it on the server. It asks first. | nothing on this machine |
+| `admin retire --client <CLIENT-ID>` | The same for one client | nothing on this machine |
 | `self-update` | Replace this binary with the newest build for this platform | the binary |
 | `link` | Bridge the synced content into `~/.claude`, and create the outbox. On macOS, also install and load the hourly LaunchAgent. For the admin's credential, write the LaunchAgent alone, and remove the rest. | `~/.claude/skills`, `settings.json`, `CLAUDE.md`, `~/Library/LaunchAgents/it.damac.brainmaker.plist`, `outbox/` |
 | `unlink` | Remove what `link` wrote, and nothing else | the same four |
@@ -29,8 +31,9 @@ brainmaker [COMMAND] [OPTIONS]
 | `session-context` | Print the `SessionStart` JSON the linked hook returns | nothing |
 
 The parser accepts one command. A second command is an error, and so is any unrecognised argument.
-`admin` takes one subcommand, `pull-outbox`, `status`, `syncs`, or `diagnose`. `pull-outbox`,
-`syncs`, and `diagnose` take one value after it. `brainmaker admin --help` prints the admin help.
+`admin` takes one subcommand, `pull-outbox`, `status`, `syncs`, `diagnose`, or `retire`.
+`pull-outbox`, `syncs`, `diagnose`, and `retire` take one value after it. `brainmaker admin --help`
+prints the admin help.
 
 `sync`, `push`, `self-update`, `link`, and `unlink` also append to the run log,
 `diagnostics.jsonl`. [The diagnostic report](#the-diagnostic-report) describes it.
@@ -58,7 +61,7 @@ the bridge. When a token request fails for a reason other than `invalid_scope`, 
 | `--force` | none | `sync`, `self-update` | With `sync`, download and extract even when the content is up to date, and install a release whose sequence is not higher than the installed one. With `self-update`, reinstall the same version. |
 | `--check` | none | `self-update` | Report the newer version and install nothing |
 | `--no-update-check` | none | `sync` | Skip the software version check |
-| `-y`, `--yes` | none | `uninstall` | Remove without asking first |
+| `-y`, `--yes` | none | `uninstall`, `admin retire` | Do it without asking first |
 | `--config` | `<PATH>` | all but `uninstall`, which rejects it | Import the provisioning file at `PATH` |
 | `--keep-config` | none | all but `uninstall`, which rejects it | Do not remove the provisioning file after the import |
 | `--dir` | `<PATH>` | all | Use `PATH` as the root instead of `~/.brainmaker` |
@@ -67,7 +70,9 @@ the bridge. When a token request fails for a reason other than `invalid_scope`, 
 | `--agent-dir` | `<PATH>` | `link`, `unlink`, `uninstall` | Write the LaunchAgent to `PATH` instead of `~/Library/LaunchAgents`, and do not load it |
 | `--json` | none | `admin status`, `admin syncs`, `admin diagnose` | Print JSON on stdout. Every other line goes to stderr. |
 | `--limit` | `<N>` | `admin syncs`, `admin diagnose` | With `admin syncs`, print at most `N` rows, from 1 to 1000. Default: 50. With `admin diagnose`, print at most `N` lines of the run log of each client. Default: 20. |
-| `--client` | `<CLIENT-ID>` | `admin syncs`, `admin diagnose` | Read one client instead of an operator |
+| `--client` | `<CLIENT-ID>` | `admin syncs`, `admin diagnose`, `admin retire` | Name one client instead of an operator |
+| `--remove-outbox` | none | `admin retire` | The removal order also removes the outbox on that machine, with every note in it, sent or not |
+| `--key` | `<PATH>` | `admin retire` | Sign with the removal key at `PATH` instead of `removal-signing.key` under the root |
 | `-q`, `--quiet` | none | all | Print errors only |
 | `-h`, `--help` | none | any | Print the help text and exit 0 |
 | `-V`, `--version` | none | any | Print `brainmaker <version>` and exit 0 |
@@ -75,8 +80,8 @@ the bridge. When a token request fails for a reason other than `invalid_scope`, 
 The parser enforces the "Applies to" column. An option given with another command exits 1 with
 `<flag> has no effect with <command>; run brainmaker --help`.
 
-`--config`, `--dir`, `--url`, `--claude-dir`, `--agent-dir`, `--limit`, and `--client` take a value,
-and each one fails:
+`--config`, `--dir`, `--url`, `--claude-dir`, `--agent-dir`, `--limit`, `--client`, and `--key` take
+a value, and each one fails:
 
 - when the value is absent, with `<flag> needs a path` or `<flag> needs a URL`;
 - when the value starts with a hyphen, because that is the next option. For a path, the message
@@ -120,6 +125,10 @@ A server that `sync` cannot reach is treated the same way while content is insta
 prints `notice: cannot check the latest content version: ...` and
 `notice: the installed content <hash> stays in place.` to stderr, and exits 0. With nothing
 installed, or with `--force`, the failure exits 1.
+
+A `sync` that obeys a removal order exits 0 when the removal ran to its end, and 1 when it stopped
+part-way. A removal order that this client does not trust is a server that it cannot reach: the
+content stays, and the exit code is 0.
 
 A `sync` that waits 30 seconds for the install lock of another run, and still finds it held, is
 treated the same way while content is installed: `brainmaker` prints
@@ -190,6 +199,12 @@ the link, and the directory it names stays, empty. The program that runs `uninst
 `bin/brainmaker`, and the run prints its path. Windows cannot remove a running program, so there
 the run prints a notice and the path to delete after the command exits.
 
+A `sync` that obeys a removal order runs these five steps too, with no question, with one change:
+the LaunchAgent of step 1 goes last, after everything else. When the order
+says `remove` for the outbox, step 2 also removes `outbox/`, with every note in it, and the root
+then goes in step 5 when nothing else is in it. `uninstall` itself never removes the outbox. See
+[The removal order](#the-removal-order).
+
 ### `status` output
 
 `status` prints one `key value` pair per line:
@@ -205,11 +220,11 @@ the run prints a notice and the path to delete after the command exits.
 | `auth` | `absent`, or `client-credentials grant, scope sync, outbox:write for the outbox, and outbox:read for the admin commands, client id N characters, secret N characters`. Never a credential itself. |
 | `key` | `release` or `development`, naming which build key this binary carries |
 | `binding` | What ties the sealed store to this machine: `machine identifier`, `home directory path (weak)`, or `none (weak)`. A `(weak)` value means a copy of `config.enc` opens on another machine. |
-| `signing` | Both key counts, as `N trusted software key(s), N trusted content key(s)`. `0` software keys means it installs no update; `0` content keys means it installs no content. |
+| `signing` | The three key counts, as `N trusted software key(s), N trusted content key(s), N trusted removal key(s)`. `0` software keys means it installs no update; `0` content keys means it installs no content; `0` removal keys means it obeys no removal order. |
 | `installed` | The hash in `state.json`, or `<none>` |
 | `present` | `yes` when `content/` is a directory |
-| `latest` | The hash the server reports, or `<unknown>` when it cannot be reached |
-| `state` | `up to date`, `stale`, `not installed`, or `cannot check: <reason>` |
+| `latest` | The hash the server reports, `<unknown>` when it cannot be reached, or `<none>` when it answers with a removal order |
+| `state` | `up to date`, `stale`, `not installed`, or `cannot check: <reason>`. With a removal order that this client trusts: `the administrator ordered the removal of brainmaker; the next sync removes it from this machine`. `status` itself removes nothing. |
 | `software` | This binary's version |
 | `platform` | This machine's manifest key, for example `darwin-arm64` |
 | `published` | The manifest version, or `<unknown>` |
@@ -397,9 +412,128 @@ rename:
 no answer, the client changes `last_attempt_at_unix` and no other value. The lines stay for the
 next report, and the next try waits 30 minutes too.
 
+### The removal order
+
+The administrator can order the removal of brainmaker from one machine, for example when a person
+leaves the team, with [`admin retire`](#admin-retire). The order is a signed document that names
+one client. The server stores it and gives it to that client in place of the content:
+`GET {base}/{latest hash route}` answers `410 Gone` with the order in the body.
+
+```json
+{"order":"remove","client_id":"the-client-id","outbox":"keep","issued_at":1791300000}
+```
+
+| Field | Rule |
+|---|---|
+| `order` | `remove`. The client knows no other order. |
+| `client_id` | The client that must obey. The client compares it with its own identifier. |
+| `outbox` | `keep` leaves `outbox/` in place, with every note in it. `remove` takes it away, sent notes and unsent notes alike. |
+| `issued_at` | The time of signing, in seconds since the Unix epoch. A record for the admin. Nothing acts on it. |
+
+`sync` obeys an order only when all of these are true. Otherwise the content check fails as it does
+for a server that cannot be reached: the installed content stays, and the run goes on.
+
+| Check | Refusal in the run log |
+|---|---|
+| A key in `REMOVAL_KEYS` signed the exact bytes of the payload | `content.unreachable`, cause `signature`, status `410` |
+| The payload holds the four fields above and no other one | `content.unreachable`, cause `other`, status `410` |
+| `order` is `remove`, and `issued_at` is a time between 2000 and 2099 | the same |
+| `client_id` is the identifier of this client | the same |
+
+A build with no key in `REMOVAL_KEYS` refuses every order. A content key and a software key sign no
+order. The order has no end date: a client obeys it at every `sync`, on every machine that still
+holds its credential. So a client ID that received an order is spent.
+
+When `sync` obeys, it does these steps and nothing after them. It asks no operator name, sends no
+note, and sends no diagnostic report.
+
+1. It prints `The administrator of this brainmaker ordered its removal from this machine.` to
+   stdout, past `--quiet`.
+2. It waits up to 30 seconds for the install lock, so that a run that installs content ends first.
+   When the lock stays held, it removes nothing, prints
+   `Another brainmaker run is installing content, so nothing was removed. The next sync removes brainmaker.`,
+   and exits 0. The hook and the agent are still there, so the next `sync` obeys.
+3. It removes what [`uninstall`](#uninstall-removal) removes, with no question, from the default
+   Claude directory: the skill links, the hook, the `CLAUDE.md` block, and everything under the
+   root. The hourly LaunchAgent of a Mac stays for step 5. The lines for each path follow
+   `--quiet`.
+4. It sends the removal report to `POST {base}/{diagnostics route}/removal`, with the `sync` token
+   that the run holds in memory. A report that fails changes nothing.
+5. On a Mac, it deletes `~/Library/LaunchAgents/it.damac.brainmaker.plist`, and then unloads the
+   agent with `launchctl bootout gui/<uid>/it.damac.brainmaker`. This step is the last one that
+   changes anything. The hourly agent is the usual caller of this `sync`, and launchd stops a run
+   when it unloads the agent that started it, so nothing may be left to do. A removal that failed
+   in step 3 never reaches this step: the agent stays, and its next run tries again.
+6. It prints `brainmaker is removed from this machine.`, then
+   `The directory <root> stays, with what brainmaker did not remove.` when the root stays, and
+   then how many notes that were never sent stay in the outbox, or went with it. A run that its
+   own agent started can end in step 5, before these lines.
+
+The removal report is JSON, and every value in it is a word from a fixed list or a bounded number:
+
+```json
+{"schema":1,"outcome":"removed","root":"kept","notes_unsent":2}
+```
+
+| Field | Value |
+|---|---|
+| `schema` | `1` |
+| `outcome` | `removed` when the removal ran to its end. `failed` when it stopped on an error, or when the root carries no mark of brainmaker. |
+| `root` | `removed` when the root directory is gone. `kept` when it stays: for the outbox, for a file that brainmaker did not write, or on Windows for the program that ran. Absent with `failed`. |
+| `notes_unsent` | The notes that waited and the notes that were rejected, at most 100000. They stayed with the outbox, or went with it. Absent with `failed`. |
+
+The hook runs `session-context` after `sync`. In the session start that obeys an order, that second
+command finds no program and fails once. A Claude session that is already open keeps the hook that
+it loaded, and the hook fails there too until the session restarts.
+
+The hourly agent of the admin's own Mac runs `self-update` alone, so that machine obeys an order
+only at a `sync` that a person runs.
+
+### `admin retire`
+
+`admin retire <OPERATOR>` takes brainmaker off every machine of one person. One order names one
+client, so the command signs one order for each client that the fleet view gives to `OPERATOR`.
+`admin retire --client <CLIENT-ID>` does the same for one client, registered or not. The command
+works in this order, and stores nothing before step 5:
+
+1. It reads the fleet view, and for each retired client the removal that the server holds. A client
+   that already holds an order gets no second one: the command prints
+   `<client ID> already holds a removal order, stored at <time>.` When every client holds one, it
+   prints `Nothing to store.` and exits 0.
+2. It reads the removal key: `--key <PATH>`, or `removal-signing.key` under the root, which is
+   `~/.brainmaker/removal-signing.key`. The file holds a PKCS#8 Ed25519 key as hexadecimal, as
+   `brainmaker-sign keygen` writes it. No command writes or removes that file.
+3. It signs a probe with the key, and checks it against `REMOVAL_KEYS`. A key that this build does
+   not trust stops the run, and the error names the public key: no client of this build would obey
+   an order from it.
+4. It prints each client with its last sync, its version, and its platform, says what goes, and
+   asks `Retire N client(s)? [y/N]`. Only `y` or `yes` goes on. With no terminal on stdin, the
+   command fails, unless `--yes` is given. The question prints past `--quiet`.
+5. For each client, it signs an order with the time now, and sends it to
+   `PUT {base}/{admin clients route}/<client_id>/removal` with its `outbox:read` token. It prints
+   `Stored the removal order for <client ID>. The server retired the client, and gives it no content.`
+6. It prints how to read where each removal stands, and when to revoke the client.
+
+`--remove-outbox` writes `"outbox":"remove"` into each order. Without it the order says `keep`.
+
+| Failure | Result |
+|---|---|
+| The key file is absent, is not hexadecimal, or is not a PKCS#8 Ed25519 key | The run exits 1, and nothing is stored |
+| `REMOVAL_KEYS` of this build does not hold the key | The same |
+| The server knows no client of that operator, or no client with that ID | The same |
+| The answer to the question is not `y` or `yes` | `Nothing was stored.`, and the run exits 0 |
+| The server refuses an order, or has no route for one | The run exits 1 at that client. The orders before it are stored, and the next run skips them. |
+| The issuer does not grant `outbox:read` | `this credential cannot read the outbox`, and the run exits 1 |
+
+The command changes nothing on the admin's machine. A client that the server retired is never
+restored, so check the list before you answer. Read where a removal stands with
+[`admin diagnose`](#admin-diagnose-output), and revoke the client at the issuer only after it
+reported the removal: a client that the issuer refuses never asks, and never receives the order.
+
 ### `admin diagnose` output
 
-The command reads the fleet view, and then the diagnostics of each selected client. Without
+The command reads the fleet view, and then the diagnostics of each selected client. For a retired
+client it also reads `GET {base}/{admin clients route}/<client_id>/removal`. Without
 `--json` it prints one block for each client. A value that the server does not know prints as `-`.
 
 ```text
@@ -419,6 +553,7 @@ gabriele  brainmaker-sync-gabriele
 |---|---|
 | The first line | The operator, or `unregistered`, the client ID, and `retired` for a retired client: the fleet view |
 | `server` | What the server saw: the last sync, the version in its `User-Agent`, and the notes of this client that the server holds |
+| `removal` | Only for a client with a removal order: when the server stored the order, what it says about the outbox, when the server first gave it to the client, and what the client reported: `removed` or `failed`, the time, `root removed` or `root kept`, and the notes that were never sent |
 | `report` | When the server received the last report, and the clock of the client when it read its state. `none` when the server holds no report. |
 | `software`, `content`, `link`, `outbox` | The state in that report |
 | `finding` | One line for each cause that the command found, or `none` |
@@ -438,6 +573,10 @@ The command names these causes:
 | Entries in the outbox are not notes | `outbox.ignored` is above 0. Something wrote a file with another ending than `.md`, or wrote into a folder. `push` never sends such an entry and never rejects it. |
 | No note was ever written | The hook is not absent, no note waits, none was rejected, none was sent, no entry is ignored, and the server holds none. The finding also says what to check for an operator who works in Cowork. |
 | The registry names no operator, or the client is retired | The fleet view says so. The server refuses the notes of such a client. |
+| A removal order waits | The server holds an order, and the client asked for no content since. A client that the issuer no longer accepts never receives the order. |
+| The client has the order and reported no removal | The server gave the order to the client. The finding names why: the last sync named a version older than 0.1.10, the first one with removal orders; or the run log holds a `410` line with the cause `signature`, so no removal key of that build signed the order; or with another cause, so the client refused the order for its shape or for its client ID. |
+| The removal stopped part-way | The client reported `failed`. Files of brainmaker can remain, and nothing on that machine runs `sync` again. |
+| brainmaker removed itself | The client reported `removed`. The finding says when, whether the root directory stays, and how many notes that were never sent stayed or went. |
 | That machine runs an older version | The reported version is older than the version of this program |
 | The server dropped lines | `events_dropped` is above 0 |
 
@@ -449,9 +588,13 @@ such instructions syncs, holds the hook, and sends no note: the report then read
 never held a note. So that finding, and the finding for an absent hook, end with what to check in
 Cowork.
 
+For a client with a removal order, the retirement and the removal are the only two findings. The
+report of that machine is older than its removal, so what it says about the hook and the outbox
+names no cause.
+
 With `--json`, the command prints an array with one object for each client. It holds `client_id`,
-`operator`, `retired`, `last_sync_at`, `brainmaker_version`, `notes_stored`, `report`, `findings`,
-and `events`, and a key without a value is left out.
+`operator`, `retired`, `removal`, `last_sync_at`, `brainmaker_version`, `notes_stored`, `report`,
+`findings`, and `events`, and a key without a value is left out.
 
 Every time passes through as the server sent it. The command refuses a body of another shape: a
 field or a word that it does not know, a time, a version, or a content hash of another shape, and
@@ -558,7 +701,7 @@ a security control.
 
 ## HTTP routes the server must serve
 
-Twelve routes sit under `BRAINMAKER_API_BASE`. One further route, the token endpoint, sits under
+Fifteen routes sit under `BRAINMAKER_API_BASE`. One further route, the token endpoint, sits under
 `SWETSI_JWT_ENDPOINT`. The two hosts may differ. Serve them all over TLS: `brainmaker` refuses a
 plain-HTTP URL unless its host is this machine. `brainmaker` sends `Authorization: Bearer <token>`
 on every request under the base URL when a credential is configured, and sends the `User-Agent`
@@ -576,9 +719,9 @@ can serve these requests at any path it likes:
 | Replacement binary | `BRAINMAKER_SOFTWARE_BINARY_PATH` | `software/brainmaker-{version}-{platform}{ext}` |
 | Note upload | `BRAINMAKER_OUTBOX_PATH` | `outbox`, then `/<note name>` |
 | Operator name | `BRAINMAKER_WHOAMI_PATH` | `whoami` |
-| Diagnostic report | `BRAINMAKER_DIAGNOSTICS_PATH` | `diagnostics` |
+| Diagnostic report, and the removal report | `BRAINMAKER_DIAGNOSTICS_PATH` | `diagnostics`, and `/removal` under it |
 | Notes for the admin, and their acknowledgement | `BRAINMAKER_ADMIN_OUTBOX_PATH` | `admin/outbox`, and `/ack` under it |
-| Fleet view, one client's sync log, and one client's diagnostics | `BRAINMAKER_ADMIN_CLIENTS_PATH` | `admin/clients`, and `/<client_id>/syncs` and `/<client_id>/diagnostics` under it |
+| Fleet view, one client's sync log, one client's diagnostics, and one client's removal, to store and to read | `BRAINMAKER_ADMIN_CLIENTS_PATH` | `admin/clients`, and `/<client_id>/syncs`, `/<client_id>/diagnostics`, and `/<client_id>/removal` under it |
 
 A laptop package never carries the two admin keys. Only the admin commands read them.
 
@@ -587,7 +730,7 @@ Windows and empty everywhere else. A route is a path under its base URL: a value
 `..` segment, or a space fails at load, and a leading `/` is stripped.
 
 Timeouts: 10 s to connect; 20 s total for a text request; 300 s total for a download; 10 s total
-for the diagnostic report.
+for the diagnostic report, and the same for the removal report.
 
 ### `POST {jwt_endpoint}/{token route}`
 
@@ -666,6 +809,26 @@ address from its own base URL, so a signed document cannot move the download to 
 
 The response body is read up to 1 MiB. Serve this route with `Cache-Control: no-store`; a cached
 response makes the client skip an update that is already published.
+
+For a client that holds a removal order, the server answers `410 Gone` in place of a release, with
+`Cache-Control: no-store`:
+
+```json
+{
+  "error": "a removal order is stored for this client, so the server gives it no content",
+  "removal": {
+    "payload": "{\"order\":\"remove\",\"client_id\":\"the-client-id\",\"outbox\":\"keep\",\"issued_at\":1791300000}",
+    "signature": "<128 hex>"
+  }
+}
+```
+
+The client reads that body up to 64 KiB, verifies `removal.signature` over the `removal.payload`
+bytes against `REMOVAL_KEYS` before it parses anything, and then applies the rules of
+[The removal order](#the-removal-order). A `410` with no `removal` object is an error like any
+other status. A client older than the order reads the `410` as a failed check, prints the `error`
+text in a notice, keeps its content, and exits 0. The server must serve the software routes to such
+a client, so that it can update and then obey.
 
 The request carries three headers in which the client reports itself. The server may record them.
 Nothing that the client does depends on them.
@@ -807,6 +970,24 @@ Nothing in the body names the client: the server takes it from the token.
 The client reads the answer up to 64 KiB, and reads its status alone. The server must apply the
 rules of the fields too, and must store no value that breaks one.
 
+### `POST {base}/{diagnostics route}/removal`
+
+Receives the removal report of the client that the token names, with the `sync` token. It is the
+last request of a client that obeyed its removal order. The body is JSON, with
+`Content-Type: application/json`:
+
+```json
+{"schema":1,"outcome":"removed","root":"kept","notes_unsent":2}
+```
+
+[The removal order](#the-removal-order) gives the rule of every field. Nothing in the body names
+the client. The route has no key of its own in the provisioning file: it is `/removal` under the
+diagnostics route.
+
+The client reads nothing of the answer, its status included: brainmaker is removed by then. A
+server older than this route answers 404, and the removal is the same. The server must store no
+value that breaks its rule, and a later report must never replace one that says `removed`.
+
 ### `GET {base}/{admin outbox route}?limit=<N>`
 
 Returns the notes that nobody acknowledged, oldest first, with an `outbox:read` token.
@@ -863,6 +1044,49 @@ the body up to 4 MiB.
 `report` is `null` for a client that sent none. Every time is in the time zone of the server's
 report, with its offset. A field that the client does not know fails the command, and so does a
 `command`, a `code`, a `cause`, a `rule`, or a link word that it does not know.
+
+### `PUT {base}/{admin clients route}/<client_id>/removal`
+
+Stores a signed removal order for one client, with an `outbox:read` token, and retires that
+client. `admin retire` sends it. The body is the envelope, as JSON:
+
+```json
+{
+  "payload": "{\"order\":\"remove\",\"client_id\":\"brainmaker-sync-gabriele\",\"outbox\":\"keep\",\"issued_at\":1791300000}",
+  "signature": "<128 hex>"
+}
+```
+
+The answer is the body that the `GET` on the same path returns, and the command reads it the same
+way: `removal` must be there, for the client that was asked for. The server must give that client
+no content from then on, and must give it the order with the next content check. It must store
+the payload byte for byte: the signature covers those bytes. A server older than this route
+answers 404, and the command then says that the server did not take the order.
+
+### `GET {base}/{admin clients route}/<client_id>/removal`
+
+Returns the removal order of one client and what came of it, with an `outbox:read` token.
+`admin diagnose` asks it for a retired client alone, and `admin retire` asks it to learn which
+clients already hold an order. The client checks the client ID before it becomes a path segment.
+
+```json
+{
+  "client_id": "brainmaker-sync-gabriele",
+  "removal": {
+    "ordered_at": "2026-10-06T12:00:00+02:00",
+    "ordered_by": "brainmaker-admin-matteo",
+    "outbox": "keep",
+    "served_at": "2026-10-06T12:05:00+02:00",
+    "report": { "received_at": "2026-10-06T12:05:01+02:00", "outcome": "removed", "root": "kept", "notes_unsent": 2 }
+  }
+}
+```
+
+`removal` is `null` for a client with no order. `served_at` is `null` until the server gave the
+order to the client, and `report` is `null` until the client reported. The answer never holds the
+signed document. A field or a word that the command does not know fails it, and so does the
+removal of another client than the one it asked for. A server older than this route answers 404,
+which `admin diagnose` reads as no order.
 
 ### Error responses
 
@@ -962,6 +1186,10 @@ with no platform, or one whose `sha256` is not 64 hexadecimal characters.
 `sign-content` refuses a hash that is not 8 alphanumeric ASCII characters, an empty archive, an
 archive of more than 512 MiB, and a `SEQUENCE` that is not a whole number. It signs no URL, because
 the client derives the download address itself.
+
+`keygen` also makes the removal key. The tool signs no removal order: `brainmaker admin retire`
+does, on the admin's machine, with the key file that `keygen` wrote. Put the public key that
+`keygen` prints into `REMOVAL_KEYS`.
 
 `verify` accepts either shape and names which it read. It tells them apart by field: a payload with
 `platforms` is a software manifest, and one with `sha256` is a content release. It then applies the

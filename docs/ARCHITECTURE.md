@@ -6,7 +6,9 @@ an install like everyone else's. One invocation loads settings, gets one access 
 that it needs, makes a bounded number of further HTTP requests, writes the filesystem, and exits.
 A `sync` makes at most three requests for the content and the software, one for the operator name,
 one for each note that is ready in the outbox, and one for the diagnostic report, at most once in
-30 minutes. `uninstall` is the exception: it loads no settings and opens no socket.
+30 minutes. `uninstall` is the exception: it loads no settings and opens no socket. A `sync` that
+receives a removal order stops after the content check, removes brainmaker from the machine, and
+makes one more request: the removal report.
 
 A second binary, `brainmaker-sign`, lives in [`tools/sign.rs`](../tools/sign.rs). It builds only
 under the `sign` feature and never ships.
@@ -22,22 +24,23 @@ under the `sign` feature and never ships.
 | [`src/url.rs`](../src/url.rs) | URL origin parsing, and the rule that a base URL must use TLS | none |
 | [`src/provision.rs`](../src/provision.rs) | Provisioning file discovery, parsing, validation | `url` |
 | [`src/secretstore.rs`](../src/secretstore.rs) | Seal and open the stored settings, report what binds them to the machine, restrict file modes | `ring` |
-| [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, the signed content release, the note upload, `whoami`, the upload of the diagnostic report, and the removal of control characters from server text | `auth`, `cause`, `config`, `digest`, `signature`, `ureq` |
+| [`src/remote.rs`](../src/remote.rs) | HTTP GET as text, streamed download to a file, the signed content release, the note upload, `whoami`, the upload of the diagnostic report and of the removal report, the removal order that a `410` answer to the content check carries, and the removal of control characters from server text | `auth`, `cause`, `config`, `digest`, `removal`, `signature`, `ureq` |
 | [`src/outbox.rs`](../src/outbox.rs) | The note rules and the word for each one, the checks of the upload path, push, the moves to `sent/` and `rejected/`, the counts, the report headers, and the operator file | `auth`, `cause`, `config`, `lock`, `remote`, `selfupdate`, `state` |
 | [`src/diagnostics.rs`](../src/diagnostics.rs) | The run log, the state of the machine, the words that a report may hold, the checks of the upload path, and the send with its interval and its record | `auth`, `cause`, `config`, `link`, `lock`, `outbox`, `remote`, `schedule`, `selfupdate`, `state`, `sync` |
 | [`src/cause.rs`](../src/cause.rs) | The cause of a failure as one word from a fixed list, carried by an error whose text does not change | `auth`, `ureq` |
-| [`src/admin.rs`](../src/admin.rs) | The admin commands: `pull-outbox` with its frontmatter stamp and its no-replace write, the fleet view and the admin's shape of it, the merged sync log, and `diagnose` with its findings | `auth`, `cause`, `config`, `diagnostics`, `link`, `lock`, `outbox`, `remote`, `selfupdate`, `version` |
-| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap | `archive`, `cause`, `config`, `digest`, `lock`, `outbox`, `remote`, `state` |
+| [`src/admin.rs`](../src/admin.rs) | The admin commands: `pull-outbox` with its frontmatter stamp and its no-replace write, the fleet view and the admin's shape of it, the merged sync log, `diagnose` with its findings and with the removal of a retired client, and `retire`, which signs a removal order for each client of a person and stores it | `auth`, `cause`, `config`, `diagnostics`, `link`, `lock`, `outbox`, `remote`, `removal`, `selfupdate`, `version` |
+| [`src/sync.rs`](../src/sync.rs) | Version compare, install, directory swap, and the removal order that it hands to `main` in place of an install | `archive`, `cause`, `config`, `digest`, `lock`, `outbox`, `remote`, `removal`, `state` |
 | [`src/archive.rs`](../src/archive.rs) | Zip extraction and its safety checks | `config`, `zip` |
 | [`src/state.rs`](../src/state.rs) | `state.json` read and atomic write | `serde_json` |
 | [`src/lock.rs`](../src/lock.rs) | The install lock and the update lock, which keep two runs out of one root | none |
 | [`src/selfupdate.rs`](../src/selfupdate.rs) | Envelope and manifest parse, checksum, binary swap | `config`, `digest`, `link`, `lock`, `remote`, `signature`, `version` |
-| [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest or a content release, and the two trusted key lists | `cause`, `ring` |
+| [`src/signature.rs`](../src/signature.rs) | Ed25519 check of a manifest, a content release, or a removal order, and the three trusted key lists | `cause`, `ring` |
 | [`src/digest.rs`](../src/digest.rs) | SHA-256 over a file, and the checked form of a digest string | `ring` |
 | [`src/link.rs`](../src/link.rs) | Bridge the synced content into `~/.claude`, the outbox directory, the session context, the shell quoting of the hook command, the binary copy under the root, the role check that leaves the admin's Claude unconnected, and the read of which pieces of the bridge are there | `auth`, `config`, `outbox`, `schedule`, `serde_json` |
 | [`src/schedule.rs`](../src/schedule.rs) | Write, load, unload, and remove the hourly macOS LaunchAgent | none |
 | [`src/version.rs`](../src/version.rs) | Version string comparison and validation | none |
-| [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root. The outbox stays. | `config`, `link`, `outbox`, `schedule`, `secretstore`, `state` |
+| [`src/uninstall.rs`](../src/uninstall.rs) | Remove the bridge, what `brainmaker` wrote under the root, and then the root. The outbox stays, unless a removal order says that it goes. | `config`, `link`, `outbox`, `schedule`, `secretstore`, `state` |
+| [`src/removal.rs`](../src/removal.rs) | The removal order: the checks that decide whether this client obeys one, the removal itself through `uninstall`, the removal report, and the signer that `admin retire` signs an order with | `auth`, `cause`, `config`, `diagnostics`, `lock`, `remote`, `signature`, `sync`, `uninstall`, `ring` |
 
 [`src/testutil.rs`](../src/testutil.rs) is built for tests alone; it holds a loopback HTTP server, a
 signer whose key a test trusts, and a zip builder. The server records the headers and the body of
@@ -58,6 +61,18 @@ graph LR
     main --> outbox
     main --> admin
     main --> diagnostics
+    main --> removal
+    removal --> auth
+    removal --> cause
+    removal --> diagnostics
+    removal --> lock
+    removal --> remote
+    removal --> signature
+    removal --> sync
+    removal --> uninstall
+    remote --> removal
+    sync --> removal
+    admin --> removal
     admin --> remote
     admin --> lock
     admin --> outbox
@@ -119,12 +134,16 @@ These boundaries separate the trusted code from data it does not control.
 | Network to disk | The notes that `admin pull-outbox` writes | `admin::place`, which checks every value again and the SHA-256 of the text; `admin::stamp`; `admin::write_new`, which never replaces a file |
 | Disk to network | The run log and the state of the machine, in the diagnostic report | `diagnostics::read_log`: a regular file and no symbolic link, each line parsed into an `Event` whose words come from fixed lists, and `Event::is_valid` on every value. `diagnostics::state` builds the state from typed values. No byte of a file goes into the report as it stands. |
 | Network to the terminal | The diagnostics that `admin diagnose` prints | A typed parse that refuses a field or a word it does not know, and `admin::check_diagnostics` on the client ID, each time, each version, and each content hash |
+| Network to disk | The removal order, which makes the client remove brainmaker from its machine | `removal::read`: `signature::verify_removal` over the served bytes, against `REMOVAL_KEYS`; a typed parse that refuses a field it does not know; the one order word; and the signed client ID against the identifier of this client |
+| Network to the terminal | The removal that `admin diagnose` prints | A typed parse that refuses a field or a word it does not know, and `admin::removal_of` on the client ID and on each time |
 | Network to a header | The access token | `auth::check_token`, which refuses a token that holds a control character |
 | Provisioning file to store | The endpoints and the client credentials | `provision::parse`, `Settings::validate`, `provision::check_credential_set`, `url::check_base_url`, `Credentials::new` |
 | Store to process | The sealed settings | `secretstore::open`, which authenticates the file before it returns bytes |
 
 Only `remote.rs` and `auth.rs` open a socket, and both build the agent through `remote::build_agent`,
-so one place sets the timeouts and the user agent. Only `secretstore.rs` holds key material. Only `url.rs` reads the
+so one place sets the timeouts and the user agent. Two places hold key material: `secretstore.rs`
+holds the key that seals the settings, and `removal::Signer` holds the admin's removal key, which
+it reads from a file and never writes. Only `url.rs` reads the
 scheme, host, and port of a URL, so both base-URL checks cannot drift apart.
 Only `main.rs` prints to `stdout`; every other module reports through `anyhow::Result` or through
 the injected `log` closure.
@@ -327,11 +346,11 @@ first HTTP 401.
 
 ### The admin commands live in the same binary
 
-`brainmaker admin pull-outbox`, `admin status`, `admin syncs`, and `admin diagnose` are commands of
-this binary, not of a second one. The crate has no library target, so a second binary would have to include `config`,
+`brainmaker admin pull-outbox`, `admin status`, `admin syncs`, `admin diagnose`, and `admin retire`
+are commands of this binary, not of a second one. The crate has no library target, so a second binary would have to include `config`,
 `auth`, `remote`, and more by path. The server enforces what a token may read, so the commands grant
 nothing by themselves. The admin's credential holds `sync` and `outbox:read`: `sync` lets it run
-`self-update`, and `outbox:read` lets it read the notes and the fleet.
+`self-update`, and `outbox:read` lets it read the notes and the fleet, and store a removal order.
 
 ### `link` asks the issuer for the role
 
@@ -501,10 +520,11 @@ so the comparison has nothing left to reject.
 The tradeoffs: the served file names must match the configured route, and moving the binaries to a
 different path means issuing a new provisioning file rather than editing one manifest.
 
-### The content key and the software key are two separate lists
+### Each signed document has a key list of its own
 
-`PUBLIC_KEYS` verifies a software manifest. `CONTENT_KEYS` verifies a content release. Both live in
-[`src/signature.rs`](../src/signature.rs), and both are checked by the same `verify_with`.
+`PUBLIC_KEYS` verifies a software manifest. `CONTENT_KEYS` verifies a content release.
+`REMOVAL_KEYS` verifies a removal order. All three live in
+[`src/signature.rs`](../src/signature.rs), and all three are checked by the same `verify_with`.
 
 They are separate because they protect different things and are held by different people. The
 software key signs what replaces the running executable, so it stays off every server and reaches
@@ -514,12 +534,22 @@ practice.
 
 One list would collapse those into a single capability: the machine that publishes a note could
 sign a manifest and replace every binary in the fleet. A unit test fails the build if a key ever
-appears in both lists, and the release workflow reads each block on its own so that a manifest
+appears in two lists, and the release workflow reads each block on its own so that a manifest
 signed with the content key cannot pass the manifest check.
 
-The tradeoff: two keys to generate, two to rotate, and two ways for a build to be inert. A build
-with an empty `PUBLIC_KEYS` installs no update; one with an empty `CONTENT_KEYS` installs no
-content. Both fail closed, and `brainmaker status` prints each count.
+The removal key is the third capability, and it gets the third list for the same reason. The admin
+signs a removal order each time that a person leaves, on the admin's own machine. With the software
+list, that routine would bring the key that can replace every binary onto a laptop. With the
+content list, the deploy host could remove every client. With a list of its own, the removal key
+can make one client run `uninstall`, and can do nothing else, and neither of the other keys can
+remove a client.
+
+The tradeoff: three keys to generate, three to rotate, and three ways for a build to be inert. A
+build with an empty `PUBLIC_KEYS` installs no update; one with an empty `CONTENT_KEYS` installs no
+content; one with an empty `REMOVAL_KEYS` obeys no removal order. All three fail closed, and
+`brainmaker status` prints each count. The release workflow refuses a build with an empty
+`PUBLIC_KEYS` or `CONTENT_KEYS`. It builds one with an empty `REMOVAL_KEYS`, because a team may
+want no removal from a distance.
 
 ### The content archive is checked before it is extracted
 
@@ -710,6 +740,81 @@ root and finishes.
 
 The tradeoff: a root whose `state.json` is corrupt and whose store is missing is not recognised,
 and you remove it by hand.
+
+### A removal order is the one word that a client obeys
+
+A person leaves the team, and the content stays on their machine. The admin can revoke the client at
+the issuer, and then `sync` keeps the installed content, because a refused credential reads as a
+server that cannot be reached. Only `uninstall` removes the content, and only the person at that
+machine can run it. So the admin had no way to remove a file.
+
+The removal order is that way, and it is the only thing that `brainmaker` does on the word of
+another. The word is not the server's. An order is a document that the admin signs with a key in
+`REMOVAL_KEYS`, and that names one client. The server stores it and hands it over, in the body of a
+`410 Gone` answer to the content check. [`src/removal.rs`](../src/removal.rs) verifies the signature
+over the served bytes before it parses anything, refuses a payload with a field that it does not
+know, and compares the signed client ID with the identifier of this client. A server that writes an
+order of its own writes one that every client refuses, and a server that gives the order of one
+person to the machine of another is refused too.
+
+The admin gives an order with one command, `admin retire <operator>`. It signs on the admin's
+machine, with the key file `removal-signing.key` under the root, and stores the order with the
+admin's own credential. So two things are needed to remove a client, and one person holds both: the
+removal key, which makes an order that a client obeys, and the `outbox:read` credential, which the
+server takes an order from. The signing code is in every copy of the binary, as the other admin
+commands are, and it does nothing without the key file. Before it signs for a client, the command
+signs a probe and checks it against `REMOVAL_KEYS` of its own build, so a wrong key stops the run
+before the server retires anyone. And it asks first: the server never restores a client that
+holds an order, so a wrong name costs that person a new client.
+
+The command stores with the admin's credential, and not with `publish`. The deploy host holds
+`publish`, and it has no part in taking a person off the team.
+
+The order rides on the content check for three reasons. The check is the first request of every
+`sync`, so the order costs no request of its own. The check comes before any download, so a client
+that must go installs nothing first. And a client older than the order reads `410` as a failed
+check: it keeps its content, exits 0, and asks again after it updates.
+
+An order can do one thing: make the client run `uninstall`. The one choice in it is whether the
+outbox goes too. The outbox holds every note of that person, sent or not, and whether those stay on
+the machine of a person who left is the admin's decision, so the signed payload carries it.
+`uninstall` by hand always keeps the outbox.
+
+`sync` prints what it did past `--quiet`. The hook and the agent run `sync --quiet`, and a program
+that removes itself from a person's machine must say so to that person.
+
+The client then tells the server, with the removal report: one request, with the `sync` token that
+the run holds in memory, because the sealed settings are gone by then. Without it the admin could
+not tell a removed client from a laptop that is switched off. The report follows the rule of the
+diagnostic report: fixed words and bounded numbers, and nothing in its answer is read.
+
+An order has no end date and no replay guard. A signature proves who signed, and not when, and the
+client keeps no record that outlives its own removal. So a client ID that received an order is
+spent: the same order removes a new install with that credential, on any machine. The server
+refuses to restore such a client, and a person who comes back gets a new client.
+
+The tradeoffs:
+
+- The order reaches a machine only when the client asks for content with a credential that the
+  issuer still accepts. Revoke the client after the removal is reported, not before.
+- A machine that never starts a Claude session, and has no hourly agent, never asks. Windows and
+  Linux have no agent.
+- A person who copied `content/` elsewhere keeps the copy. The order removes what `brainmaker`
+  wrote, where `brainmaker` wrote it.
+- Two runs can obey one order at the same time. `uninstall` treats a path that another run removed
+  first as removed, and the server keeps a report that says `removed` whatever arrives after it.
+- A run that is installing content would put the content back after the removal. `obey` waits up
+  to 30 seconds for the install lock first, and removes nothing when the lock stays held; the next
+  `sync` obeys. The lock is released before the removal, because the lock file is one of the files
+  that go.
+- The admin's own Mac runs `self-update` alone each hour, so it obeys an order only at a `sync`
+  that a person runs.
+- On a Mac the hourly agent is the usual caller of the `sync` that obeys, and launchd stops the
+  processes of a job when it unloads the job. `unlink` and `uninstall` unload the agent first,
+  because a person runs them from a terminal. An order takes the agent last: it removes
+  everything else, sends the report, deletes the property list, and only then unloads the agent.
+  The run can end at that unload, with nothing left to do. A removal that failed earlier leaves
+  the agent, so the next hour tries again.
 
 ### The stored settings are bound to the machine
 
