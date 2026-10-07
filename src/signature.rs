@@ -103,6 +103,7 @@ pub const CONTENT_KEYS: &[&str] = &[
 // Kept one key per line, as the two lists above are.
 #[rustfmt::skip]
 pub const REMOVAL_KEYS: &[&str] = &[
+    "1ed291cf73008a7f176a70ebbb0ef6111c96368e42957987b2a0d19a29172a1a",
 ];
 
 /// Number of software signing keys this binary trusts. `status` prints it.

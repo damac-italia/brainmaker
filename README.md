@@ -746,9 +746,9 @@ Then move `removal-signing.key` to `~/.brainmaker/removal-signing.key` on the ma
 who takes people off the team. `brainmaker admin retire` signs with it there. No command writes
 that file, and `uninstall` leaves it. Keep it off every other machine, and out of git.
 
-The list is empty in this repository. A build with an empty list obeys no removal order, and
-`brainmaker status` then reports `0 trusted removal key(s)`. That is a usable build: leave the list
-empty when you want no removal from a distance. The release workflow does not ask for this key.
+A build with an empty list obeys no removal order, and `brainmaker status` then reports
+`0 trusted removal key(s)`. That is a usable build: leave the list empty when you want no removal
+from a distance. The release workflow does not ask for this key.
 
 The key gets a list of its own because it is a capability of its own. It can make one client run
 `uninstall`, and it can install nothing. Whoever holds the content key cannot remove a client, and
