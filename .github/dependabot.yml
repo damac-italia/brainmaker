@@ -6,7 +6,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
     groups:
       # serde and serde_json bump together, and the derive feature ties them
       # to one another; group them so the whole pair resolves in one review.
@@ -17,6 +17,7 @@ updates:
   # Keep the GitHub Actions used in CI patched too. Every workflow pins its
   # actions by SHA, and dependabot updates the SHA and the version comment.
   - package-ecosystem: github-actions
+    open-pull-requests-limit: 0
     directory: /
     schedule:
       interval: weekly
